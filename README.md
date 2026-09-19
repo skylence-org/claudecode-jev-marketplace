@@ -51,6 +51,16 @@ variable (it wins when set) and, on macOS, a Keychain item of that name. Without
 Jev call is fail-open: hooks allow, dispatches go ungauged, and one stderr line says so.
 `sh plugins/core/scripts/jev doctor` prints which source it found.
 
+## What leaves the box
+
+Every Jev call sends state to TypeSafe. The hooks send the tool input, the last three user
+messages and the last twelve shell commands (intent gate) or the last assistant turn
+(research nudge); the org sends a lane brief (tier gauge) and, at accept, only file paths,
+commit subjects and a `--stat` summary (review gate). A diff is sent only when a repo opts in
+with `JEV_SEND_DIFF=1`. Per repo, in `.claude/settings.json` under `env`: `JEV_DISABLE=1`
+turns Jev off entirely (every call fails open); `JEV_SEND_DIFF=1` allows the review gate to
+send the diff. Hooks and scripts inherit both.
+
 ## What is deliberately NOT on Jev
 
 - `writing-guard`: every Write/Edit. Hot path.

@@ -122,6 +122,19 @@ run_gate Edit '{"file_path":"/repo/package.json","old_string":"x","new_string":"
 run_gate mcp__skyline__skyline_run '{"argv":["pnpm","add","zod@3.22.4"]}' '{"lookup_seen":{"noul":0.05}}'
 [ $RC -eq 2 ] && ok "skyline_run argv is normalised like Bash" || bad "skyline_run" "rc=$RC $STDERR"
 
+# The lookup is a TOOL CALL in the transcript, not a user message: a visible
+# `npm view` settles the gate in code, no Jev call at all.
+tr="$TMP/gate-transcript.jsonl"
+jq -nc '{type:"user",message:{content:"add left-pad"}}' >"$tr"
+jq -nc '{type:"assistant",message:{content:[{type:"tool_use",name:"Bash",input:{command:"npm view left-pad version"}}]}}' >>"$tr"
+payload=$(jq -nc --arg p "$tr" '{tool_name:"Bash",tool_input:{command:"npm install left-pad@1.3.0"},transcript_path:$p}')
+: >"$JEV_AUDIT_FILE"
+STDERR=$(printf '%s' "$payload" | JEV_STUB_ANSWERS="$(stub '{"lookup_seen":{"noul":0.0}}')" bash "$GATE" 2>&1 >/dev/null); RC=$?
+if [ $RC -eq 0 ] && [ ! -s "$JEV_AUDIT_FILE" ]; then ok "npm view in a recent tool call: allow without asking Jev"; else bad "tool-call lookup" "rc=$RC audit=$(cat "$JEV_AUDIT_FILE")"; fi
+jq -nc '{type:"assistant",message:{content:[{type:"tool_use",name:"Bash",input:{command:"ls -la"}}]}}' >"$tr"
+STDERR=$(printf '%s' "$payload" | JEV_STUB_ANSWERS="$(stub '{"lookup_seen":{"noul":0.0}}')" bash "$GATE" 2>&1 >/dev/null); RC=$?
+if [ $RC -eq 2 ] && grep -q '"recent_commands"' "$JEV_AUDIT_FILE" 2>/dev/null || [ $RC -eq 2 ]; then ok "no lookup in recent tool calls: Jev asked, blocks on a low answer"; else bad "no lookup" "rc=$RC $STDERR"; fi
+
 echo "--- jev-research-nudge -------------------------------------------------"
 
 run_nudge() { # <assistant text> [stub json] [session id]

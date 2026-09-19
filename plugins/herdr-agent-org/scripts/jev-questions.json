@@ -46,8 +46,8 @@
         },
         "inlines_board_snippets": {
           "type": "noul",
-          "instructions": "Does `brief` inline the exact board commands the worker needs (board get, board comment, board pad append) and the board root, so the worker never re-derives them?",
-          "criteria": { "true": "The board calls are written out.", "false": "The worker is told to report but not shown the calls." }
+          "instructions": "Does `brief` show the worker at least one exact board command to report with (a `board comment <slug> ...` call, optionally `board get` or `board pad append` too), so the worker never re-derives how to report?",
+          "criteria": { "true": "At least one exact board call is written out.", "false": "The worker is told to report but no board call is shown." }
         }
       },
       "thresholds": {
@@ -84,7 +84,7 @@
       "thresholds": {
         "gate_lines": 150,
         "surface": 0.7,
-        "max_diff_chars": 120000
+        "max_diff_chars": 80000
       }
     }
   }

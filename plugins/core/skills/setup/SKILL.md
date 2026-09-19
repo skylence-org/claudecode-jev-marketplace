@@ -123,8 +123,14 @@ jq '
 # startup but has had reliability bugs (anthropics/claude-code #5202, #8500,
 # #20112), and a shell export wins over it regardless, so also pin it in the
 # shell profile. Idempotent: a fenced block, replaced on re-run.
-PROFILE="$HOME/.zshrc"
-case "${SHELL:-}" in *bash) PROFILE="$HOME/.bashrc" ;; esac
+# The profile the LIVE shell reads: Git Bash on Windows reads ~/.bashrc and
+# never ~/.zshrc, and $SHELL is often unset inside a tool call, so decide by
+# OS first and by $SHELL second.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*|Linux) PROFILE="$HOME/.bashrc" ;;
+  *) PROFILE="$HOME/.zshrc" ;;
+esac
+case "${SHELL:-}" in *zsh) PROFILE="$HOME/.zshrc" ;; *bash) PROFILE="$HOME/.bashrc" ;; esac
 touch "$PROFILE"
 cp "$PROFILE" "$PROFILE.bak.$(date +%Y%m%d%H%M%S)"
 ptmp=$(mktemp)

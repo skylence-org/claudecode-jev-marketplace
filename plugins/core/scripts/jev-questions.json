@@ -34,7 +34,7 @@
         "lookup_seen": {
           "type": "noul",
           "instructions": {
-            "question": "Do `recent_user_messages` or `tool_input` show that the pinned package version was taken from a registry lookup or from the project's own lockfile or manifest, rather than recalled from memory?",
+            "question": "Do `recent_commands`, `recent_user_messages`, or `tool_input` show that the pinned package version was taken from a registry lookup or from the project's own lockfile or manifest, rather than recalled from memory?",
             "lookup_means": [
               "npm view <pkg> version, npm show <pkg>",
               "composer show <pkg>, composer show <pkg> --all",

@@ -203,9 +203,11 @@ case "$cmd" in
     resolve_key || { echo "jev: no API key (env TYPESAFE_API_KEY, $KEY_FILE, or macOS Keychain); no answer (fail-open)" >&2; exit 0; }
     need curl || { echo "jev: curl not found; no answer (fail-open)" >&2; exit 0; }
 
-    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+    # Private cache dir, and only trusted when it is ours: a pre-created
+    # directory owned by someone else could seed answers.
+    [ -d "$CACHE_DIR" ] || mkdir -m 700 -p "$CACHE_DIR" 2>/dev/null || true
     cache="$CACHE_DIR/$sum.json"
-    if [ -f "$cache" ] && jq -e 'type == "object"' "$cache" >/dev/null 2>&1; then
+    if [ -d "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ] && [ -O "$CACHE_DIR" ] && [ -f "$cache" ] && jq -e 'type == "object"' "$cache" >/dev/null 2>&1; then
       audit --arg set "$set_id" --arg model "$JEV_MODEL" --arg sum "$sum" --slurpfile answers "$cache" \
         '{ts: $ts, set: $set, model: $model, request_sum: $sum, cache: true, answers: $answers[0]}'
       cat "$cache"
@@ -235,7 +237,9 @@ case "$cmd" in
     esac
     [ -n "$answers" ] || { echo "jev: reply carried no answers; no answer (fail-open)" >&2; exit 0; }
 
-    printf '%s\n' "$answers" >"$cache.tmp.$$" 2>/dev/null && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
+    if [ -d "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ] && [ -O "$CACHE_DIR" ]; then
+      printf '%s\n' "$answers" >"$cache.tmp.$$" 2>/dev/null && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
+    fi
     audit --arg set "$set_id" --arg model "${served:-$JEV_MODEL}" --arg sum "$sum" --argjson ms "$ms" \
       --argjson tokens "${tokens:-0}" --argjson answers "$answers" \
       '{ts: $ts, set: $set, model: $model, request_sum: $sum, ms: $ms, input_tokens: $tokens, answers: $answers}'

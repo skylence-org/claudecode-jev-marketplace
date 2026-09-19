@@ -4,23 +4,26 @@
 # L10 makes a reviewer lane MANDATORY over ~150 changed lines OR when the
 # change touches release, auth, data-integrity, or parser-resolution
 # surfaces. The line count is arithmetic and stays in code. The surface
-# question is a judgment, and until now it was the orchestrator's memory of
-# the diff; this script asks Jev once, over the review package the
-# orchestrator already generated for the reviewer, and prints one line to
-# paste on the todo.
+# question is a judgment: one Jev request over the changed paths and commit
+# subjects (and, when the repo opts in, the diff itself), printing one line
+# to paste on the todo.
 #
-#   review-gate-check <slug> [--base REF] [--head REF] [--cwd PATH] [--package FILE]
+#   review-gate-check <slug> [--base REF] [--head REF] [--cwd PATH] [--package FILE] [--send-diff]
 #
-# Defaults: --cwd . ; --base origin/main ; --head HEAD ;
-#           --package /tmp/<slug>_review.diff when it exists (reviewer-brief
-#           line 3 tees it there), else the diff is generated here.
-# State sent to Jev: the diff itself when it fits thresholds.max_diff_chars,
-# otherwise only the changed paths, the commit subjects, and the stat.
+# Defaults: --cwd . ; --base origin/main ; --head HEAD. Both refs must
+# resolve or this exits 2: a failed diff is never a pass.
+#
+# WHAT LEAVES THE BOX. By default only file paths, commit subjects, and the
+# --stat summary are sent. The diff itself is sent only with --send-diff or
+# JEV_SEND_DIFF=1 (set it per repo in .claude/settings.json env when that
+# repo may share source with the vendor); then --package or
+# /tmp/<slug>_review.diff is used when it fits thresholds.max_diff_chars,
+# else the paths-only state. JEV_DISABLE=1 makes every Jev call fail open.
 #
 # stdout, exactly one line:
 #   MANDATORY-REVIEW: lines=<n> >= <gate> (L10)
-#   MANDATORY-REVIEW: <class>=<p>[,<class>=<p>] lines=<n> (L10, jev-1.13.0)
-#   WAIVABLE: lines=<n> auth=<p> release=<p> data=<p> parser=<p> (jev-1.13.0)
+#   MANDATORY-REVIEW: <class>=<p>[,<class>=<p>] lines=<n> (L10, jev-1.13.0, paths|diff)
+#   WAIVABLE: lines=<n> auth=<p> release=<p> data=<p> parser=<p> (jev-1.13.0, paths|diff)
 #   WAIVABLE-UNGAUGED: lines=<n> (Jev unavailable; judge the surfaces yourself)
 # Exit 3 on MANDATORY, 0 otherwise, 2 on usage error. WAIVABLE is never a
 # waiver: the [REVIEW-WAIVED] filing is still the orchestrator's (L10).
@@ -33,23 +36,28 @@ export JEV_QUESTIONS="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
 
 [ "$#" -ge 1 ] || { echo "review-gate-check: <slug> required" >&2; exit 2; }
 SLUG=$1; shift
-BASE=origin/main; HEAD=HEAD; CWD=.; PKG=""
+BASE=origin/main; HEAD=HEAD; CWD=.; PKG=""; SEND_DIFF="${JEV_SEND_DIFF:-0}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base) BASE=$2; shift 2 ;;
     --head) HEAD=$2; shift 2 ;;
     --cwd) CWD=$2; shift 2 ;;
     --package) PKG=$2; shift 2 ;;
-    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --send-diff) SEND_DIFF=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "review-gate-check: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 command -v jq >/dev/null 2>&1 || { echo "review-gate-check: jq required" >&2; exit 2; }
 command -v git >/dev/null 2>&1 || { echo "review-gate-check: git required" >&2; exit 2; }
-[ -n "$PKG" ] || { [ -f "/tmp/${SLUG}_review.diff" ] && PKG="/tmp/${SLUG}_review.diff"; }
+git -C "$CWD" rev-parse --git-dir >/dev/null 2>&1 || { echo "review-gate-check: $CWD is not a git tree" >&2; exit 2; }
+for ref in "$BASE" "$HEAD"; do
+  git -C "$CWD" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 \
+    || { echo "review-gate-check: ref '$ref' does not resolve in $CWD; a diff that cannot be computed is not a pass" >&2; exit 2; }
+done
 
 GATE=$($JEV threshold review-gate gate_lines); [ -n "$GATE" ] || GATE=150
-MAXC=$($JEV threshold review-gate max_diff_chars); [ -n "$MAXC" ] || MAXC=120000
+MAXC=$($JEV threshold review-gate max_diff_chars); [ -n "$MAXC" ] || MAXC=80000
 T=$($JEV threshold review-gate surface); [ -n "$T" ] || T=0.7
 MODEL_ID="${JEV_MODEL:-jev-1.13.0}"
 
@@ -63,11 +71,22 @@ fi
 PATHS=$(git -C "$CWD" diff --name-only "$BASE..$HEAD" 2>/dev/null | jq -R . | jq -sc .)
 SUBJ=$(git -C "$CWD" log --format=%s "$BASE..$HEAD" 2>/dev/null | jq -R . | jq -sc .)
 STAT=$(git -C "$CWD" diff --stat "$BASE..$HEAD" 2>/dev/null | tail -n 30)
-if [ -n "$PKG" ] && [ -f "$PKG" ]; then DIFF=$(cat "$PKG"); else DIFF=$(git -C "$CWD" diff -U3 "$BASE..$HEAD" 2>/dev/null); fi
-if [ "$(printf '%s' "$DIFF" | wc -c | tr -d ' ')" -le "$MAXC" ] && [ -n "$DIFF" ]; then
-  STATE=$(jq -nc --arg s "$SLUG" --arg d "$DIFF" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diff:$d}')
-else
-  STATE=$(jq -nc --arg s "$SLUG" --arg st "$STAT" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diffstat:$st}')
+if [ "$(printf '%s' "$PATHS" | jq 'length')" -eq 0 ]; then
+  echo "WAIVABLE: lines=0 (no changed files between $BASE and $HEAD)"
+  exit 0
+fi
+
+MODE=paths
+STATE=$(jq -nc --arg s "$SLUG" --arg st "$STAT" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diffstat:$st}')
+if [ "$SEND_DIFF" = 1 ]; then
+  [ -n "$PKG" ] || { [ -f "/tmp/${SLUG}_review.diff" ] && PKG="/tmp/${SLUG}_review.diff"; }
+  if [ -n "$PKG" ] && [ -f "$PKG" ]; then DIFF=$(cat "$PKG"); else DIFF=$(git -C "$CWD" diff -U3 "$BASE..$HEAD" 2>/dev/null); fi
+  if [ -n "$DIFF" ] && [ "$(printf '%s' "$DIFF" | wc -c | tr -d ' ')" -le "$MAXC" ]; then
+    MODE=diff
+    STATE=$(jq -nc --arg s "$SLUG" --arg d "$DIFF" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diff:$d}')
+  else
+    echo "review-gate-check: diff exceeds max_diff_chars ($MAXC); sending paths and subjects only" >&2
+  fi
 fi
 
 ANSWERS=$(printf '%s' "$STATE" | $JEV ask review-gate 2>/dev/null) || ANSWERS=""
@@ -85,8 +104,8 @@ ge "$AUTH" "$T"  && HIT="${HIT:+$HIT,}auth=$AUTH"
 ge "$DATA" "$T"  && HIT="${HIT:+$HIT,}data-integrity=$DATA"
 ge "$PARSE" "$T" && HIT="${HIT:+$HIT,}parser=$PARSE"
 if [ -n "$HIT" ]; then
-  echo "MANDATORY-REVIEW: $HIT lines=$LINES (L10, $MODEL_ID, bar $T)"
+  echo "MANDATORY-REVIEW: $HIT lines=$LINES (L10, $MODEL_ID, $MODE)"
   exit 3
 fi
-echo "WAIVABLE: lines=$LINES auth=$AUTH release=$REL data=$DATA parser=$PARSE ($MODEL_ID, bar $T)"
+echo "WAIVABLE: lines=$LINES auth=$AUTH release=$REL data=$DATA parser=$PARSE ($MODEL_ID, $MODE)"
 exit 0

@@ -74,19 +74,33 @@ case "$CLASS" in
 esac
 [ -n "$RULE" ] || exit 0
 
-# Recent operator intent, the last three user messages, as an array.
-CTX='[]'
+# Recent context from the transcript: the last three user messages, and the
+# last twelve shell commands the assistant ran. The registry lookup this rule
+# rewards (`npm view <pkg> version`, `composer show <pkg>`) is a TOOL CALL, so
+# it lives in the second list, never the first.
+CTX='[]'; CMDS='[]'
 if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
   CTX=$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -cs '
     [ .[] | select(.type == "user") | .message.content
       | if type == "string" then .
         else ((map(select(.type == "text") | .text) // []) | join("\n")) end
       | select(length > 0) ] | .[-3:] | map(.[-1500:])' 2>/dev/null) || CTX='[]'
-  [ -n "$CTX" ] || CTX='[]'
+  CMDS=$(tail -n 400 "$TRANSCRIPT" 2>/dev/null | jq -cs '
+    [ .[] | select(.type == "assistant") | (.message.content // [])[]?
+      | select(.type == "tool_use")
+      | (.input.command // ((.input.argv // []) | join(" ")))
+      | select(type == "string" and length > 0) ] | .[-12:] | map(.[:400])' 2>/dev/null) || CMDS='[]'
+  [ -n "$CTX" ] || CTX='[]'; [ -n "$CMDS" ] || CMDS='[]'
 fi
 
-STATE=$(jq -nc --arg tool "$RAW_TOOL" --argjson ti "$TOOL_INPUT_JSON" --argjson ctx "$CTX" \
-  '{tool: $tool, tool_input: $ti, recent_user_messages: $ctx}') || exit 0
+# A visible lookup settles it in code: no Jev call, no block.
+LOOKUP_RE='npm (view|show|info|dist-tag ls) |pnpm view |yarn info |composer (show|info|outdated) |npmjs\.com|packagist\.org|npm search '
+if printf '%s' "$CMDS" | jq -r '.[]' 2>/dev/null | grep -qE -- "$LOOKUP_RE"; then
+  exit 0
+fi
+
+STATE=$(jq -nc --arg tool "$RAW_TOOL" --argjson ti "$TOOL_INPUT_JSON" --argjson ctx "$CTX" --argjson cmds "$CMDS" \
+  '{tool: $tool, tool_input: $ti, recent_user_messages: $ctx, recent_commands: $cmds}') || exit 0
 ANSWERS=$(printf '%s' "$STATE" | $JEV ask deps-pin 2>/dev/null) || ANSWERS=""
 if [ -z "$ANSWERS" ]; then
   echo "jev-intent-gate: rule $RULE matched but Jev gave no answer (no key, timeout, or error); allowing without evaluation" >&2

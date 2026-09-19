@@ -84,7 +84,16 @@ LOW='{"review-gate":{"touches_release_ci":{"noul":0.02},"touches_auth":{"noul":0
 AUTH='{"review-gate":{"touches_release_ci":{"noul":0.02},"touches_auth":{"noul":0.91},"touches_data_integrity":{"noul":0.1},"touches_parser_resolution":{"noul":0.03}}}'
 
 rg "$LOW"
-if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q '^WAIVABLE: lines=1 '; then ok "small diff, all surfaces low: WAIVABLE with the numbers"; else bad "waivable" "rc=$RC out=$OUT"; fi
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q '^WAIVABLE: lines=1 .*, paths)'; then ok "small diff, all surfaces low: WAIVABLE, paths-only by default"; else bad "waivable" "rc=$RC out=$OUT"; fi
+
+: >"$JEV_AUDIT_FILE"
+rg "$LOW" --send-diff
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q ', diff)' ; then ok "--send-diff sends the diff"; else bad "send-diff" "rc=$RC out=$OUT"; fi
+
+OUT=$(JEV_STUB_ANSWERS="$(stub "$LOW")" sh "$RG" lane-x --cwd "$REPO" --base no-such-ref --head main 2>/dev/null); RC=$?
+[ $RC -eq 2 ] && ok "unresolvable ref: usage error, never WAIVABLE" || bad "bad ref" "rc=$RC out=$OUT"
+OUT=$(JEV_STUB_ANSWERS="$(stub "$LOW")" sh "$RG" lane-x --cwd "$TMP" --base base --head main 2>/dev/null); RC=$?
+[ $RC -eq 2 ] && ok "not a git tree: usage error" || bad "not git" "rc=$RC out=$OUT"
 
 rg "$AUTH"
 if [ $RC -eq 3 ] && printf '%s' "$OUT" | grep -q '^MANDATORY-REVIEW: auth=0.91'; then ok "small diff touching auth: MANDATORY (exit 3), class named"; else bad "auth" "rc=$RC out=$OUT"; fi

@@ -16,14 +16,28 @@ sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 
 # Flatten every string under tool_input: .command for Bash, .argv / .argv_list
 # for skyline_run, without caring which shape the caller used.
-cmd=$(printf '%s' "$input" | jq -r '[(.tool_input? // {}) | .. | strings] | join(" ")' 2>/dev/null || true)
+cmd=$(printf '%s' "$input" | jq -r '[(.tool_input? // {}) | .. | strings] | join("\n")' 2>/dev/null || true)
 [ -n "$cmd" ] || exit 0
 
-case "$cmd" in
-  *dispatch-worker*|*"agent start"*) event=dispatch ;;
-  *"agent wait"*)                    event=wait ;;
-  *)                                 exit 0 ;;
-esac
+# Classify by the PROGRAM each pipeline stage runs, not by substring: a sed,
+# grep, or cat that merely mentions dispatch-worker is not a dispatch. Stages
+# split on | ; & and newlines; leading VAR=value assignments are skipped;
+# `${HERDR_BIN_PATH:-herdr}` counts as herdr.
+event=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk '
+  BEGIN { ev = "" }
+  {
+    n = split($0, t, /[ \t]+/); i = 1
+    while (i <= n && (t[i] == "" || t[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++
+    if (i > n) next
+    p = t[i]; sub(/.*\//, "", p)
+    if (p == "dispatch-worker") { ev = "dispatch"; exit }
+    if (p ~ /^(\$\{HERDR_BIN_PATH:-herdr\}|"\$\{HERDR_BIN_PATH:-herdr\}"|\$HERDR|"\$HERDR"|herdr)$/ && t[i+1] == "agent") {
+      if (t[i+2] == "start") { ev = "dispatch"; exit }
+      if (t[i+2] == "wait" && ev == "") ev = "wait"
+    }
+  }
+  END { print ev }')
+[ -n "$event" ] || exit 0
 
 printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" >> "/tmp/claude-herdr-org-lanes-$sid"
 exit 0

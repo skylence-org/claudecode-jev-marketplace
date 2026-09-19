@@ -68,7 +68,10 @@ case "$MODEL" in *haiku*) REQ=cheap ;; *opus*) REQ=top ;; esac
 case "$EFFORT" in low) REQ=cheap ;; high|max|xhigh) REQ=top ;; esac
 
 MODEL_ID="${JEV_MODEL:-jev-1.13.0}"
-ANSWERS=$(jq -nc --arg b "$(printf '%s' "$BRIEF" | head -c 140000)" '{brief: $b}' | $JEV ask tier-gauge 2>/dev/null) || ANSWERS=""
+# 80k chars keeps a code-heavy brief inside the 32k-token state budget
+# (code tokenizes at roughly 3 chars per token); anything longer is truncated
+# rather than turned into a 422 that would read as "ungauged".
+ANSWERS=$(jq -nc --arg b "$(printf '%s' "$BRIEF" | head -c 80000)" '{brief: $b}' | $JEV ask tier-gauge 2>/dev/null) || ANSWERS=""
 if [ -z "$ANSWERS" ]; then
   echo "tier-gauge: Jev gave no answer (no key, timeout, or disabled); lane dispatches ungauged" >&2
   [ "$JSON" -eq 1 ] && { jq -nc --arg r "$REQ" '{verdict:"ungauged", requested:$r}'; exit 0; }

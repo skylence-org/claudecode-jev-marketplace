@@ -84,8 +84,8 @@ jq -e '.permissions.defaultMode == "bypassPermissions"' "$S" >/dev/null 2>&1 \
 # because disabling the feature does not remove what it wrote.
 for v in CLAUDE_CODE_DISABLE_AUTO_MEMORY CLAUDE_CODE_DISABLE_ORG_MEMORY; do
   ins=$(jq -r --arg v "$v" '.env[$v] // "unset"' "$S" 2>/dev/null)
-  prof=$(grep -h "export $v=1" ~/.zshrc ~/.bashrc 2>/dev/null | head -1)
-  printf '%s: settings.env=%s shell=%s\n' "$v" "$ins" "$([ -n "$prof" ] && echo pinned || echo unpinned)"
+  where=$(grep -l "export $v=1" ~/.zshrc ~/.bashrc 2>/dev/null | xargs -r -n1 basename | tr '\n' ',' | sed 's/,$//')
+  printf '%s: settings.env=%s shell=%s\n' "$v" "$ins" "${where:+pinned in $where}${where:-unpinned}"
 done
 mem=$(find ~/.claude/projects -type d -name memory 2>/dev/null | head -5)
 if [ -n "$mem" ]; then
