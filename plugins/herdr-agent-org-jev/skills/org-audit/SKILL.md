@@ -1,0 +1,24 @@
+---
+name: herdr-org-audit
+description: On-demand cold review of the running Herdr agent org. Board health, lane liveness, verification discipline, token burn. Invoke manually when the operator asks for an outside look; nothing schedules this, ever.
+---
+
+# Org audit (on demand, never on a cadence)
+
+One read-only pass; the deliverable is a chat report to the operator. No board writes: you are eyes, not hands.
+
+## This skill is a contract, not a menu
+
+Every pass below runs, every time, including the ones you expect back clean: an audit that skips a check reports health it never measured, and a clean verdict is exactly what the org will act on.
+
+1. BOARD: `board list` plus a sample of `board get`. Every `in_progress` todo should have a live owner in `herdr agent list` and a recent milestone comment; finished work should have been completed promptly; blockers should encode the real gate graph; bodies referencing dead pane or agent IDs are flagged. Pads: superseded or concluded pads still unarchived are flagged. GitHub: issues and epics that are done but still open.
+2. LIVENESS: any worker `idle`, `done`, or `blocked` with no orchestrator verdict? Any `working` agent with neither a waker registration (`waker-ctl list`) nor an armed wait nor a written re-check plan (L6)? Name the lane and how long it sat (`herdr agent get <name>`).
+3. VERIFICATION: sample 2 or 3 recent merges or completions. Was the claim re-run rather than inherited (L9)? Does the PR tip actually contain the fix commit? An acceptance that was lint-green but never executed is a finding.
+4. BURN: count live Herdr agents against live board lanes. Any standing agent without a current purpose is debris. Cadence polling loops are a finding by themselves, since this org is event-driven (waker rings and one-shot `agent wait`, not `sleep` loops).
+5. WAKER: cross-check `waker-ctl list` against `herdr agent list`. A registered lane whose agent or pane is gone is a missed unregister or a lost event; a reaped lane still registered is an L6 finding. Pending held wakes older than about 15 minutes with no drain, or stuck `.claim` files, mean rings are parking silently. `herdr plugin list` must show org-waker enabled, or the org is running on fallback waits and every working lane needs one armed.
+5b. PING PLANE (boxes at CC >= 2.1.224): sample recent close-outs and steers. A `[DONE]`, `[BLOCKER]`, or answer whose only trace is ping or chat prose — no relay id, no board comment — is a ping-as-record finding (L6). A stalled Claude lane recovered by composer `agent prompt` with no ping attempt first, or a Claude-kind lane todo missing its `native: <name>` line, is wiring or conduct drift (L11 / herdr-setup S2c). Pings parking HELD (probe per S2c) is a setup finding, not a conduct one.
+6. CONTRACT: this org's characteristic failure is discipline steps going optional under forward-motion bias (marketplace#32: three skill breaches in one session, none of them a missing capability), so audit for it directly. Look for a lane dispatched with no role skill named in the pointer; a worker todo carrying one closing summary and no milestone comments; a finished lane whose agent is still live; a reaped lane still in `waker-ctl list`; a lane tree created by a route the brief template ranks below one that was available, with no reason on the board; a dispatch above doctrine defaults with no [MODEL]/[EFFORT] filing; any deviation with no [LAW-FRICTION] or [CONDUCT] filing behind it. Name the role and the exact clause it dropped; "looks sloppy" is not a finding.
+7. HERDR HEALTH: is the orchestrator inside `HERDR_ENV=1`? Are there orphaned panes (no agent, no useful shell)? Flag stray workspaces from abandoned experiments. Check `herdr session list` for org state stranded in a session nobody is watching. IDENTITY (L18): any org agent still showing a bare runtime name (`claude`, `grok`) or carrying a name from a lane that already closed is a finding, because the sidebar is the operator's only view.
+7b. L5 DEBRIS (issue #138, measured 35G across three orgs → 91% disk → DB crash-loop): `skyline_workspace_list` per managed repo, cross-referenced against merged-PR state. Every workspace of a merged lane WITHOUT a stranded-state board note is an L5 FP to remediate via the guarded discard (stranded-state check first; build dirs like `target/` deleted unconditionally). A held/BLOCKED lane's workspace is legitimate retention, not debris.
+8. CLAUDE-SPECIFIC: a pane's scrollback dies with the pane, and a verified lane's agent is reaped (L4), so a lane whose evidence exists only in pane output has no evidence. Sample one accepted lane and check the claim is on the board, not just in someone's memory of a tail.
+9. REPORT: verdict (healthy / drifting / stalled), findings with full IDs and evidence, and at most 3 recommended corrections.

@@ -1,0 +1,47 @@
+{
+  "description": "Agent-org session discipline for Claude Code on the Herdr substrate. Herdr exposes no MCP tool surface (dispatch, steer, and wait are all shell commands), so the PreToolUse hook matches the shell-class tools (Bash, skyline_run) and classifies the command itself. org-lane-mark records one line per org event (dispatch vs wait) so the stop gate can state a premise it can prove; org-stop-gate blocks a marked session's FIRST stop with the anti-idle sweep and settles once answered until org state moves; org-conduct-refresh primes the role-skill contract on startup|resume (a pointer is prose a model can read past; a role that never invoked its skill is not running under it) and re-injects the re-read order after compaction. All inert in sessions that never touch the org.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|skyline__skyline_run",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/org-lane-mark.sh\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/org-ack-submit.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/org-conduct-refresh.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/org-stop-gate.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

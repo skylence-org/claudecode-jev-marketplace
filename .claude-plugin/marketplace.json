@@ -1,0 +1,32 @@
+{
+  "name": "claudecode-jev-marketplace",
+  "description": "TypeSafe Jev (System One) wired into Claude Code: a decision primitive for hooks, and the Skylence herdr agent-org with Jev measuring tier and review gates.",
+  "owner": {
+    "name": "Skylence",
+    "contact": "github.com/skylence-be"
+  },
+  "plugins": [
+    {
+      "name": "jev-core",
+      "description": "TypeSafe Jev as a decision primitive for Claude Code hooks. The `jev` shell helper (named question sets, thresholds, cache, audit log, stub mode, fail-open) plus two hooks that replace `claude -p` subprocess judgments: jev-intent-gate (PreToolUse; pinned-dependency and manifest-edit rules decided by two Nouls) and jev-research-nudge (Stop; hedged factual claims, one Noul). POSIX sh + curl + jq, no SDK.",
+      "source": {
+        "source": "git-subdir",
+        "url": "skylence-be/claudecode-jev-marketplace",
+        "path": "plugins/jev-core",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/skylence-be/claudecode-jev-marketplace"
+    },
+    {
+      "name": "herdr-agent-org-jev",
+      "description": "The Skylence agent-org on the Herdr multiplexer (forked from multi-llm-marketplace's herdr-agent-org-claude 2.4.1) with Jev at two event boundaries: dispatch-worker runs a TIER GAUGE over each brief (L17 TIER BY BRIEF, measured: refuses a cheap tier on a non-mechanical brief, files [TIER-GAUGE: ...] on the todo) and review-gate-check measures the L10 review gate at accept (MANDATORY-REVIEW / WAIVABLE with the surface probabilities). One Jev request per lane per event, never per tool call. Everything else — seven role skills, filesystem board, org-relay wake plane, session-discipline hooks — is the upstream org unchanged. Requires herdr >= 0.7 and HERDR_ENV=1; install INSTEAD OF herdr-agent-org-claude, not beside it.",
+      "source": {
+        "source": "git-subdir",
+        "url": "skylence-be/claudecode-jev-marketplace",
+        "path": "plugins/herdr-agent-org-jev",
+        "ref": "main"
+      },
+      "homepage": "https://github.com/skylence-be/claudecode-jev-marketplace"
+    }
+  ]
+}

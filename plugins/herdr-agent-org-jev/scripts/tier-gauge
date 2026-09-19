@@ -1,0 +1,124 @@
+#!/bin/sh
+# tier-gauge: L17 TIER BY BRIEF, measured instead of remembered.
+#
+# One Jev request over a lane brief answers: which tier of worker the brief
+# needs (a Choice over descriptions of the WORK, never model names), whether
+# the lane is risky (L10 surfaces), and whether the brief carries three
+# template items a worker cannot do without (lane tree path, milestone
+# comments, inlined board calls). dispatch-worker calls this once per dispatch;
+# the one-line verdict it prints is filed on the lane todo as [TIER-GAUGE: ...].
+#
+#   tier-gauge (--todo SLUG | --brief-file PATH) [--model M] [--effort E] [--json]
+#
+# Exit 0: ok or warn (warnings on stderr, verdict line on stdout).
+# Exit 3: REFUSE — a cheap tier (--model haiku, --effort low) was requested
+#         for a brief the gauge reads as not mechanical, at or above
+#         thresholds.downgrade_bar. The doctrine measured this shape (a
+#         prose-spec brief on a cheap tier) at 2-3x the turns; dispatch-worker
+#         turns the refusal into a hard stop, the same way it refuses a missing
+#         --upgrade-reason.
+# Exit 0 with verdict=ungauged: Jev unavailable (no key, timeout, disabled).
+#         The org proceeds exactly as it did before this script existed.
+# Exit 2: usage error.
+#
+# Policy lives HERE, in code, so a threshold change is a one-line diff:
+#   requested cheap  AND tier != mechanical AND conf >= downgrade_bar  -> refuse
+#   tier == hard AND conf >= upgrade_bar AND requested != top          -> warn
+#   risky >= thresholds.risky                                          -> warn (L10 review gate likely mandatory)
+#   any lint noul < thresholds.lint                                    -> warn (brief template item missing)
+# Never auto-upgrades: an upgrade is an explicit, filed act (L17).
+set -u
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+JEV="$HERE/jev"
+[ -x "$JEV" ] || JEV="sh $HERE/jev"
+export JEV_QUESTIONS="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
+
+TODO=""; FILE=""; MODEL=""; EFFORT=""; JSON=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --todo) TODO=$2; shift 2 ;;
+    --brief-file) FILE=$2; shift 2 ;;
+    --model) MODEL=$2; shift 2 ;;
+    --effort) EFFORT=$2; shift 2 ;;
+    --json) JSON=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "tier-gauge: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+{ [ -n "$TODO" ] || [ -n "$FILE" ]; } || { echo "tier-gauge: --todo SLUG or --brief-file PATH required" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "tier-gauge: jq required" >&2; exit 2; }
+
+if [ -n "$FILE" ]; then
+  [ -f "$FILE" ] || { echo "tier-gauge: no such file $FILE" >&2; exit 2; }
+  BRIEF=$(cat "$FILE")
+else
+  BOARD=""
+  if command -v board >/dev/null 2>&1; then BOARD=board
+  elif [ -x "$HERE/board" ]; then BOARD="$HERE/board"
+  fi
+  [ -n "$BOARD" ] || { echo "tier-gauge: board CLI not found (PATH or $HERE/board)" >&2; exit 2; }
+  BRIEF=$("$BOARD" get "$TODO" --json 2>/dev/null | jq -r '.body // empty') || BRIEF=""
+  [ -n "$BRIEF" ] || { echo "tier-gauge: todo '$TODO' has no body (board get $TODO --json)" >&2; exit 2; }
+fi
+
+# Requested tier from the dispatch args: cheap / default / top.
+REQ=default
+case "$MODEL" in *haiku*) REQ=cheap ;; *opus*) REQ=top ;; esac
+case "$EFFORT" in low) REQ=cheap ;; high|max|xhigh) REQ=top ;; esac
+
+MODEL_ID="${JEV_MODEL:-jev-1.13.0}"
+ANSWERS=$(jq -nc --arg b "$(printf '%s' "$BRIEF" | head -c 140000)" '{brief: $b}' | $JEV ask tier-gauge 2>/dev/null) || ANSWERS=""
+if [ -z "$ANSWERS" ]; then
+  echo "tier-gauge: Jev gave no answer (no key, timeout, or disabled); lane dispatches ungauged" >&2
+  [ "$JSON" -eq 1 ] && { jq -nc --arg r "$REQ" '{verdict:"ungauged", requested:$r}'; exit 0; }
+  echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ"
+  exit 0
+fi
+
+TIER=$(printf '%s' "$ANSWERS" | jq -r '.tier.choice // empty')
+CONF=$(printf '%s' "$ANSWERS" | jq -r '.tier.confidence // 0')
+RISKY=$(printf '%s' "$ANSWERS" | jq -r '.risky.noul // 0')
+L_TREE=$(printf '%s' "$ANSWERS" | jq -r '.names_lane_tree.noul // 1')
+L_MILE=$(printf '%s' "$ANSWERS" | jq -r '.orders_milestones.noul // 1')
+L_SNIP=$(printf '%s' "$ANSWERS" | jq -r '.inlines_board_snippets.noul // 1')
+[ -n "$TIER" ] || { echo "tier-gauge: reply lacked a tier; ungauged" >&2; echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ"; exit 0; }
+
+T_DOWN=$($JEV threshold tier-gauge downgrade_bar); T_UP=$($JEV threshold tier-gauge upgrade_bar)
+T_RISK=$($JEV threshold tier-gauge risky); T_LINT=$($JEV threshold tier-gauge lint)
+ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
+lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'; }
+
+VERDICT=ok; WARN=""
+if [ "$REQ" = cheap ] && [ "$TIER" != mechanical ] && ge "$CONF" "$T_DOWN"; then
+  VERDICT=refuse
+elif [ "$TIER" = hard ] && ge "$CONF" "$T_UP" && [ "$REQ" != top ]; then
+  VERDICT=warn; WARN="brief reads as HARD (conf $CONF >= $T_UP) and the lane is not on the top tier; consider --model opus --upgrade-reason \"...\" (L17)"
+fi
+if ge "$RISKY" "$T_RISK"; then
+  [ "$VERDICT" = ok ] && VERDICT=warn
+  WARN="${WARN:+$WARN; }risky=$RISKY >= $T_RISK: expect L10 MANDATORY-REVIEW at accept"
+fi
+LINT=""
+lt "$L_TREE" "$T_LINT" && LINT="${LINT:+$LINT,}lane-tree-path"
+lt "$L_MILE" "$T_LINT" && LINT="${LINT:+$LINT,}milestone-comments"
+lt "$L_SNIP" "$T_LINT" && LINT="${LINT:+$LINT,}board-snippets"
+if [ -n "$LINT" ]; then
+  [ "$VERDICT" = ok ] && VERDICT=warn
+  WARN="${WARN:+$WARN; }brief template items look missing: $LINT (brief template 2/4/7)"
+fi
+
+[ -n "$WARN" ] && echo "tier-gauge: $WARN" >&2
+
+if [ "$JSON" -eq 1 ]; then
+  jq -nc --arg v "$VERDICT" --arg r "$REQ" --arg t "$TIER" --argjson c "$CONF" --argjson k "$RISKY" --arg l "$LINT" --arg m "$MODEL_ID" \
+    '{verdict:$v, requested:$r, tier:$t, confidence:$c, risky:$k, lint_missing:($l|split(",")|map(select(length>0))), model:$m}'
+else
+  echo "TIER-GAUGE: $MODEL_ID tier=$TIER conf=$CONF risky=$RISKY requested=$REQ verdict=$VERDICT${LINT:+ lint=$LINT}"
+fi
+
+if [ "$VERDICT" = refuse ]; then
+  echo "tier-gauge: REFUSED — requested a cheap tier (${MODEL:-$EFFORT}) for a brief the gauge reads as '$TIER' at confidence $CONF (>= $T_DOWN). A prose-spec brief on a cheap tier costs 2-3x the turns (L17 TIER BY BRIEF). Rewrite the brief to transcription grade, dispatch at the default tier, or pass --no-gauge WITH an [L13 LAW-FRICTION] filing on the todo." >&2
+  exit 3
+fi
+exit 0

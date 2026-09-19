@@ -1,0 +1,113 @@
+#!/bin/sh
+# conduct: start a Claude session bound to exactly one herdr-org board.
+# (Renamed from `orgclaude`, operator order 2026-08-01; a deprecation shim
+# with the old name execs this script until the next minor.)
+#
+# WHY THIS IS A SCRIPT AND NOT A SHELL FUNCTION. HERDR_ORG_ROOT and the plugin
+# scripts dir have to be in the environment of the CLAUDE PROCESS, not of your
+# interactive shell: claude forwards both to workers itself, and dispatch-worker
+# reads them from its own env to decide the board a worker writes to. A script
+# that exports and then `exec`s claude gives claude precisely that environment,
+# because exec replaces this process and the child inherits it. Nothing needs to
+# leak back into the caller, so no function, no `source`, no dotfile logic.
+#
+#   conduct binary-skyline             conduct that org (injects the doctrinal defaults: --model opusplan --advisor opus)
+#   conduct xve-be --model opus        explicit --model/--advisor win over the injected defaults
+#   conduct binary-skybox --resume     resume the last session instead of a new one
+#   CONDUCT_ADVISOR= conduct x         empty CONDUCT_ADVISOR / CONDUCT_MODEL suppresses that injection
+#                                      (ORGCLAUDE_MODEL / ORGCLAUDE_ADVISOR still honored as fallback)
+#
+# A missing board is CREATED, not warned about. The older shell-function form
+# printed "no board yet (run: board init X)" to stderr and started claude anyway;
+# that warning landed on the screen microseconds before a full-screen TUI took it
+# over, so the operator rarely saw it and the agent never did. From inside, the
+# org simply had no board, and every board call fell back to ~/.herdr-org/default
+# with only a one-line stderr note. Measured 2026-07-30: ~25 minutes of a
+# conductor repeatedly reporting its org root unset while four sibling orgs ran
+# fine. A typo in the org name was likewise indistinguishable from a new org.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: conduct <org-name> [claude args ...]" >&2
+  echo "orgs: $(ls "$HOME/.herdr-org" 2>/dev/null | tr '\n' ' ')" >&2
+  exit 2
+fi
+
+org=$1
+shift
+
+# Reject names that would bind the session to the wrong place. Each of these
+# was reproduced before it was guarded (review of #80, 2026-07-30): a forgotten
+# org name (`conduct --resume`) creates a junk board literally named
+# "--resume" and silently routes the whole session, workers included, into it;
+# a name containing `/` or `..` git-inits a board OUTSIDE ~/.herdr-org where no
+# listing or sweep will ever find it; an empty name binds to ~/.herdr-org
+# itself. Whitespace is rejected too, since org roots travel through
+# whitespace-splitting surfaces (dispatch-worker --env, waker rows).
+case $org in
+  ''|-*|.|..|*/*|*[!a-zA-Z0-9._-]*)
+    echo "conduct: invalid org name '$org' (letters, digits, dot, dash, underscore; no leading dash)" >&2
+    exit 2
+    ;;
+esac
+
+HERDR_ORG_ROOT="$HOME/.herdr-org/$org"
+export HERDR_ORG_ROOT
+
+# TASK-BACKED AWAIT support (L6, org-relay 1.0+): a held relay_await must
+# outlive the harness's ~2min pre-background window, and the client's default
+# MCP idle timeout (300s) would abort long holds whose server sends no
+# progress. Export a generous bound into the claude process; an existing
+# operator export wins.
+CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT="${CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT:-1800000}"
+export CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT
+
+# Test for the board SHAPE, not bare directory existence: a root left behind by
+# an aborted init (directory present, todos/ missing) would otherwise skip
+# creation and start a session whose every board call fails with a misleading
+# "run: board init". cmd_init is idempotent, so completing a half-made root is
+# safe.
+if [ ! -d "$HERDR_ORG_ROOT/todos" ]; then
+  echo "conduct: no board at $HERDR_ORG_ROOT - creating it" >&2
+  # Pass the ABSOLUTE path deliberately: `board init <bare-name>` resolves to
+  # $HOME/.herdr-org/<name> and ignores HERDR_ORG_ROOT entirely, so only this
+  # form stays correct if the root is ever relocated.
+  if ! "$here/board" init "$HERDR_ORG_ROOT"; then
+    echo "conduct: board init failed; not starting claude" >&2
+    exit 1
+  fi
+fi
+
+# Put board, dispatch-worker, waker-ctl and build-slot on PATH for claude and for
+# every shell it spawns. Idempotent so a nested invocation cannot stack entries.
+case ":$PATH:" in
+  *":$here:"*) ;;
+  *) PATH="$here:$PATH"; export PATH ;;
+esac
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "conduct: claude is not on PATH" >&2
+  exit 127
+fi
+
+# Doctrinal conductor defaults (operator order 2026-08-01): a bare `conduct
+# <org>` launches `--model opusplan --advisor opus`, so the doctrine is the
+# zero-typing path (marketplace#32's lesson applied to the conductor itself).
+# An explicit --model/--advisor in the args wins; CONDUCT_MODEL /
+# CONDUCT_ADVISOR override a default, and setting one EMPTY suppresses that
+# injection entirely. The pre-rename ORGCLAUDE_* names are honored as a
+# fallback so existing shell profiles keep working.
+want_model=${CONDUCT_MODEL-${ORGCLAUDE_MODEL-opusplan}}
+want_advisor=${CONDUCT_ADVISOR-${ORGCLAUDE_ADVISOR-opus}}
+for a in "$@"; do
+  case $a in
+    --model|--model=*) want_model="" ;;
+    --advisor|--advisor=*) want_advisor="" ;;
+  esac
+done
+if [ -n "$want_model" ]; then set -- --model "$want_model" "$@"; fi
+if [ -n "$want_advisor" ]; then set -- --advisor "$want_advisor" "$@"; fi
+
+exec claude "$@"

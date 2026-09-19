@@ -1,0 +1,37 @@
+#!/bin/sh
+# Pre-commit: fast checks only. Anything slow belongs in CI, because a hook that
+# costs 30 seconds per commit gets disabled within a week and then guards nothing.
+#
+# Install once per clone:  git config core.hooksPath .githooks
+# Bypass deliberately:     git commit --no-verify
+
+fail=0
+
+# The jev helper is a byte-identical twin across plugins and the Jev wiring has
+# load-bearing phrases the doctrine names. One copy patched and its sibling
+# forgotten is the failure this catches.
+if [ -f tools/check-parity.sh ]; then
+  if ! sh tools/check-parity.sh >/dev/null 2>&1; then
+    echo "pre-commit: parity failed."
+    sh tools/check-parity.sh 2>&1 | sed 's/^/  /'
+    fail=1
+  fi
+fi
+
+check_syntax() {
+  case "$(head -1 "$1")" in
+    *bash*) bash -n "$1" 2>&1 ;;
+    *) sh -n "$1" 2>&1 ;;
+  esac
+}
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.sh|plugins/*/scripts/jev|plugins/*/scripts/tier-gauge|plugins/*/scripts/review-gate-check|plugins/*/scripts/dispatch-worker)
+      check_syntax "$f" >/dev/null || { echo "pre-commit: $f is not valid shell"; fail=1; } ;;
+    *.json) jq -e . "$f" >/dev/null 2>&1 || { echo "pre-commit: $f is not valid JSON"; fail=1; } ;;
+  esac
+done
+
+[ "$fail" = 0 ] || { echo "pre-commit: blocked. Use --no-verify to override deliberately."; exit 1; }
+exit 0

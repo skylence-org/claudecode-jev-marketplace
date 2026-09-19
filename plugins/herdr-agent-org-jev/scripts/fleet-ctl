@@ -1,0 +1,164 @@
+#!/bin/sh
+# fleet-ctl: mechanical primitives for the fleet-orchestrator skill. Spawns a
+# fresh orchestrator org in a new Herdr workspace (idempotent), checks whether
+# a board is provably empty, and retires a workspace (closing it always;
+# deleting its board files only when provably empty).
+#
+# Usage:
+#   fleet-ctl spawn --repo ABS_PATH --org NAME [--label TEXT]
+#   fleet-ctl board-empty --org NAME
+#   fleet-ctl retire --org NAME --workspace WID
+#
+# spawn is idempotent: if a live agent's cwd already matches --repo AND its
+# name starts with "orch", nothing new is created; the existing pane/agent is
+# reported instead (F1 — one orchestrator per repo, never a duplicate).
+#
+# spawn runs the full bootstrap sequence measured live 2026-08-01 across three
+# batches of 8 fresh orchestrators: workspace create, conduct launch, the
+# folder-trust dialog (confirmed automatically when Claude Code has not seen
+# this folder before), agent rename to orch-<org>, the orchestrator skill
+# invocation, and the slash-command-palette-parking recovery it needs (a send
+# starting with a slash command sits in the composer as typed text until a
+# second empty submit actually invokes it — this is NOT the L11 unsubmitted-
+# text hazard, it is Claude Code's own palette confirming the match). spawn
+# stops once the orchestrator reaches a settled state (idle/blocked/done) —
+# ORIENT complete, self-identified, standing by. It does NOT send a task: the
+# plan-slice message is content the fleet-orchestrator skill composes itself,
+# handed off as a separate `herdr agent prompt` call after spawn returns.
+#
+# Prints one JSON object on stdout. Requires HERDR_ENV=1 and jq.
+set -eu
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+CMD="${1:-}"
+[ -n "$CMD" ] && shift || true
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
+  exit 2
+}
+
+[ "${HERDR_ENV:-}" = "1" ] || {
+  echo "fleet-ctl: HERDR_ENV!=1, run inside a Herdr-managed pane" >&2
+  exit 1
+}
+command -v jq >/dev/null 2>&1 || { echo "fleet-ctl: jq is required" >&2; exit 2; }
+
+REPO=""; ORG=""; LABEL=""; WID=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo) REPO=$2; shift 2 ;;
+    --org) ORG=$2; shift 2 ;;
+    --label) LABEL=$2; shift 2 ;;
+    --workspace) WID=$2; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "fleet-ctl: unknown arg $1" >&2; usage ;;
+  esac
+done
+
+org_root() { printf '%s/.herdr-org/%s' "$HOME" "$1"; }
+
+# board_is_empty ORG -> 0 if provably empty (no lane ever recorded, inbox pad
+# is template-only), 1 otherwise. Prints the reason to stdout either way.
+board_is_empty() {
+  root=$(org_root "$1")
+  [ -d "$root" ] || { echo "no board directory at $root"; return 0; }
+  todos=$(find "$root/todos" -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+  inbox="$root/pads/inbox.md"
+  inbox_extra=0
+  if [ -f "$inbox" ]; then
+    # grep -c prints its count even when it exits 1 (zero matches), so a
+    # `|| echo 0` fallback would append a SECOND line ("0\n0"); `|| true`
+    # keeps set -e happy without corrupting the count.
+    inbox_extra=$(grep -vc -E '^(# Inbox|Operator questions and escalations land here\.)?$' "$inbox" 2>/dev/null || true)
+    [ -n "$inbox_extra" ] || inbox_extra=0
+  fi
+  if [ "$todos" -eq 0 ] 2>/dev/null && [ "$inbox_extra" -eq 0 ] 2>/dev/null; then
+    echo "empty: 0 todos, inbox pad template-only"
+    return 0
+  fi
+  echo "non-empty: $todos todo file(s), inbox pad has $inbox_extra extra line(s) beyond the template"
+  return 1
+}
+
+case "$CMD" in
+  board-empty)
+    [ -n "$ORG" ] || { echo "fleet-ctl board-empty: --org required" >&2; exit 2; }
+    if reason=$(board_is_empty "$ORG"); then rc=0; else rc=$?; fi
+    empty_bool=false; [ "$rc" -eq 0 ] && empty_bool=true
+    jq -cn --arg org "$ORG" --argjson empty "$empty_bool" --arg reason "$reason" \
+      '{org:$org, empty:$empty, reason:$reason}'
+    ;;
+
+  retire)
+    [ -n "$ORG" ] || { echo "fleet-ctl retire: --org required" >&2; exit 2; }
+    [ -n "$WID" ] || { echo "fleet-ctl retire: --workspace required" >&2; exit 2; }
+    $HERDR workspace close "$WID" >/dev/null 2>&1 || true
+    if reason=$(board_is_empty "$ORG"); then rc=0; else rc=$?; fi
+    deleted=false
+    if [ "$rc" -eq 0 ]; then
+      rm -rf "$(org_root "$ORG")"
+      deleted=true
+    fi
+    jq -cn --arg org "$ORG" --arg wid "$WID" --argjson deleted "$deleted" --arg reason "$reason" \
+      '{org:$org, workspace_closed:true, board_deleted:$deleted, reason:$reason}'
+    ;;
+
+  spawn)
+    [ -n "$REPO" ] || { echo "fleet-ctl spawn: --repo required" >&2; exit 2; }
+    [ -n "$ORG" ] || { echo "fleet-ctl spawn: --org required" >&2; exit 2; }
+    [ -n "$LABEL" ] || LABEL="$ORG"
+    NAME="orch-$ORG"
+
+    # F1 idempotency: a live agent already at this cwd, named orch-*, means
+    # do not spawn a second one (marketplace#89's binary-skyline duplicate).
+    existing=$($HERDR agent list 2>/dev/null | jq -r --arg cwd "$REPO" \
+      '.result.agents[]? | select(.cwd == $cwd) | select(.name // "" | test("^orch")) | "\(.name)\t\(.pane_id)\t\(.workspace_id)"' \
+      | head -1) || existing=""
+    if [ -n "$existing" ]; then
+      e_name=$(printf '%s' "$existing" | cut -f1)
+      e_pane=$(printf '%s' "$existing" | cut -f2)
+      e_wid=$(printf '%s' "$existing" | cut -f3)
+      jq -cn --arg org "$ORG" --arg name "$e_name" --arg pane "$e_pane" --arg wid "$e_wid" \
+        '{org:$org, already_running:true, name:$name, pane_id:$pane, workspace_id:$wid}'
+      exit 0
+    fi
+
+    ws_json=$($HERDR workspace create --cwd "$REPO" --label "$LABEL" --no-focus)
+    PANE=$(printf '%s' "$ws_json" | jq -r '.result.root_pane.pane_id')
+    WORKSPACE=$(printf '%s' "$ws_json" | jq -r '.result.workspace.workspace_id')
+
+    # LAUNCH-ARG BOOT (2026-08-05): conduct execs `claude "$@"`, and a
+    # positional `claude "prompt"` auto-submits as the first message
+    # (documented CLI behavior) — so the role pointer rides the launch and
+    # never touches the composer. The old path typed a slash command into
+    # the palette and empty-submitted it; it parked live twice on 2026-08-05.
+    # SessionStart's ORG CONDUCT PRIME reinforces the skill-first order.
+    POINTER="You are this org's conductor. Invoke the herdr-agent-org-claude:orchestrator skill FIRST, before any org action - it is your role contract - then run ORIENT."
+    $HERDR pane run "$PANE" "conduct $ORG \"$POINTER\"" >/dev/null 2>&1
+    sleep 2
+
+    # Folder-trust dialog: only shown the first time Claude Code sees this
+    # folder. Confirm the default (option 1, "Yes, I trust this folder").
+    tail=$($HERDR pane read "$PANE" --source visible --lines 15 --format text 2>/dev/null) || tail=""
+    if printf '%s' "$tail" | grep -q 'trust this folder'; then
+      $HERDR agent send-keys "$PANE" enter >/dev/null 2>&1 || true
+      sleep 1
+    fi
+
+    $HERDR agent rename "$PANE" "$NAME" >/dev/null 2>&1 || true
+
+    # Wait for ORIENT to settle. Target the name, fall back to the pane id
+    # when the earlier rename lost the race with agent detection.
+    $HERDR agent wait "$NAME" --until idle,blocked,done --timeout 600000 >/dev/null 2>&1 \
+      || $HERDR agent wait "$PANE" --until idle,blocked,done --timeout 600000 >/dev/null 2>&1 \
+      || true
+
+    jq -cn --arg org "$ORG" --arg name "$NAME" --arg pane "$PANE" --arg wid "$WORKSPACE" \
+      '{org:$org, already_running:false, name:$name, pane_id:$pane, workspace_id:$wid}'
+    ;;
+
+  *)
+    usage
+    ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/sh
+# orgclaude: DEPRECATED shim (renamed to `conduct`, operator order 2026-08-01).
+# Kept one minor version so stale plugin-cache skill text and shell muscle
+# memory keep working; delete at the next minor bump.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+echo "orgclaude: deprecated, renamed to \`conduct\` - forwarding" >&2
+exec "$here/conduct" "$@"

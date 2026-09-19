@@ -1,0 +1,204 @@
+#!/bin/sh
+# jev: the one door to TypeSafe's Jev (System One) model for every hook and
+# script in this marketplace. Callers never build a request themselves: they
+# name a QUESTION SET from jev-questions.json, pipe a JSON state on stdin, and
+# read typed answers back. Thresholds live in the same file, so the constants a
+# reviewer must see (what is asked, where the bar sits) are in one place, which
+# is TypeSafe's own advice for agent-written integrations.
+#
+#   jev ask <set> < state.json      -> answers JSON on stdout ({} of typed answers)
+#   jev threshold <set> <name>      -> the number, or nothing
+#   jev sets                        -> question-set ids
+#   jev doctor                      -> key, tools, question file, one live /v1/models call
+#   jev cache-clear
+#
+# CONTRACT (mirrors core-claude's judge-hook): infrastructure failures are
+# FAIL-OPEN and SILENT on stdout — no key, JEV_DISABLE=1, timeout, non-2xx,
+# unparseable reply all print NOTHING and exit 0, with one stderr line. A
+# caller treats empty stdout as "no answer" and proceeds as it would without
+# Jev. Caller bugs (unknown set, non-JSON state) exit 2 so tests catch them.
+#
+# Jev returns typed values, never prose, so every reason a caller shows is a
+# TEMPLATE naming the set, the numbers, and the model. Every call appends one
+# audit line to ~/.claude/jev-audit.jsonl (JEV_AUDIT_FILE) carrying the answers
+# and a checksum of the state, never the state itself.
+#
+# Env: TYPESAFE_API_KEY (required for live calls), JEV_MODEL (default pinned
+# jev-1.13.0 — thresholds are tuned against a version, and the jev-latest
+# alias moves without notice), JEV_TIMEOUT (seconds, default 5; measured 1.1-1.5 s from Western Europe), JEV_QUESTIONS
+# (question file; default beside this script), JEV_QUESTIONS_OVERLAY
+# (~/.claude/jev-questions.json; same shape, recursively merged over the
+# shipped file so thresholds can be tuned per box without editing the plugin),
+# JEV_STUB_ANSWERS (path to a JSON file: either {<set>: <answers>} or a bare
+# answers object; no network, used by every test), JEV_DISABLE=1, JEV_CACHE_DIR,
+# JEV_AUDIT_FILE, TYPESAFE_BASE_URL.
+#
+# Portable: POSIX sh, curl, jq. No Python, no SDK, so the same file ships in
+# every plugin variant (tools/check-parity.sh keeps the twins byte-identical).
+set -u
+
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+JEV_MODEL="${JEV_MODEL:-jev-1.13.0}"
+JEV_TIMEOUT="${JEV_TIMEOUT:-5}"
+BASE_URL="${TYPESAFE_BASE_URL:-https://api.typesafe.ai}"
+QFILE="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
+OVERLAY="${JEV_QUESTIONS_OVERLAY:-$HOME/.claude/jev-questions.json}"
+AUDIT="${JEV_AUDIT_FILE:-$HOME/.claude/jev-audit.jsonl}"
+CACHE_DIR="${JEV_CACHE_DIR:-${TMPDIR:-/tmp}/jev-cache-$(id -u 2>/dev/null || echo 0)}"
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
+  exit 2
+}
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+# Question sets: shipped file, with the overlay recursively merged on top when
+# it exists and parses. A broken overlay is ignored, never fatal: a typo in a
+# local file must not disarm every gate on the box.
+sets_json() {
+  if [ -f "$OVERLAY" ] && jq -e 'type == "object"' "$OVERLAY" >/dev/null 2>&1; then
+    jq -s '.[0] * .[1]' "$QFILE" "$OVERLAY"
+  else
+    cat "$QFILE"
+  fi
+}
+
+checksum() {
+  if need sha256sum; then sha256sum | cut -c1-32
+  elif need shasum; then shasum -a 256 | cut -c1-32
+  else cksum | awk '{print $1 "-" $2}'
+  fi
+}
+
+now_ms() {
+  if need perl; then perl -MTime::HiRes=time -e 'printf "%d", time * 1000'
+  else date +%s000
+  fi
+}
+
+audit() { # <json-object-fields via jq args...>
+  mkdir -p "$(dirname "$AUDIT")" 2>/dev/null || return 0
+  jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$@" >>"$AUDIT" 2>/dev/null || true
+}
+
+[ "$#" -ge 1 ] || usage
+cmd=$1; shift
+
+need jq || { echo "jev: jq is required" >&2; exit 2; }
+[ -f "$QFILE" ] || { echo "jev: question file not found: $QFILE" >&2; exit 2; }
+
+case "$cmd" in
+  sets)
+    sets_json | jq -r '.sets | keys[]'
+    ;;
+
+  threshold)
+    [ "$#" -eq 2 ] || usage
+    sets_json | jq -r --arg s "$1" --arg n "$2" '.sets[$s].thresholds[$n] // empty'
+    ;;
+
+  cache-clear)
+    rm -rf "$CACHE_DIR"
+    echo "jev: cache cleared ($CACHE_DIR)"
+    ;;
+
+  doctor)
+    rc=0
+    if [ -n "${TYPESAFE_API_KEY:-}" ]; then echo "key:       set (${#TYPESAFE_API_KEY} chars)"; else echo "key:       NOT SET (every ask is fail-open: no answers, no gates)"; rc=1; fi
+    need curl && echo "curl:      ok" || { echo "curl:      MISSING"; rc=1; }
+    echo "model:     $JEV_MODEL (timeout ${JEV_TIMEOUT}s, base $BASE_URL)"
+    if jq -e '.sets | type == "object"' "$QFILE" >/dev/null 2>&1; then
+      echo "questions: $QFILE ($(jq -r '.sets | keys | join(", ")' "$QFILE"))"
+    else
+      echo "questions: INVALID $QFILE"; rc=1
+    fi
+    if [ -f "$OVERLAY" ]; then
+      if jq -e 'type == "object"' "$OVERLAY" >/dev/null 2>&1; then echo "overlay:   $OVERLAY (merged)"; else echo "overlay:   $OVERLAY is not a JSON object; IGNORED"; fi
+    else
+      echo "overlay:   none ($OVERLAY)"
+    fi
+    echo "audit:     $AUDIT"
+    echo "cache:     $CACHE_DIR"
+    [ -n "${JEV_STUB_ANSWERS:-}" ] && echo "stub:      JEV_STUB_ANSWERS=$JEV_STUB_ANSWERS (no live calls)"
+    [ "${JEV_DISABLE:-0}" = 1 ] && echo "disabled:  JEV_DISABLE=1"
+    if [ -n "${TYPESAFE_API_KEY:-}" ] && need curl; then
+      models=$(curl -sS -m "$JEV_TIMEOUT" "$BASE_URL/v1/models" -H "Authorization: Bearer $TYPESAFE_API_KEY" 2>/dev/null | jq -r '.models[]?.name' 2>/dev/null | tr '\n' ' ')
+      if [ -n "$models" ]; then echo "live:      ok, models: $models"; else echo "live:      FAILED (no reply from $BASE_URL/v1/models within ${JEV_TIMEOUT}s)"; rc=1; fi
+    fi
+    exit "$rc"
+    ;;
+
+  ask)
+    [ "$#" -eq 1 ] || usage
+    set_id=$1
+    state=$(cat)
+    printf '%s' "$state" | jq -e . >/dev/null 2>&1 || { echo "jev: state on stdin is not valid JSON" >&2; exit 2; }
+    questions=$(sets_json | jq -c --arg s "$set_id" '.sets[$s].questions // empty' 2>/dev/null)
+    [ -n "$questions" ] || { echo "jev: unknown question set '$set_id' (see: jev sets)" >&2; exit 2; }
+
+    body=$(jq -nc --argjson st "$state" --argjson q "$questions" --arg m "$JEV_MODEL" '{state: $st, model: $m, questions: $q}')
+    sum=$(printf '%s' "$body" | checksum)
+
+    if [ "${JEV_DISABLE:-0}" = 1 ]; then
+      echo "jev: JEV_DISABLE=1; no answer (fail-open)" >&2
+      exit 0
+    fi
+
+    # Stub: canned answers for tests and dry runs. Audited like a real call so
+    # a test can assert the audit shape too.
+    if [ -n "${JEV_STUB_ANSWERS:-}" ]; then
+      [ -f "$JEV_STUB_ANSWERS" ] || { echo "jev: JEV_STUB_ANSWERS file not found: $JEV_STUB_ANSWERS" >&2; exit 2; }
+      ans=$(jq -c --arg s "$set_id" 'if type == "object" and has($s) then .[$s] else . end' "$JEV_STUB_ANSWERS" 2>/dev/null)
+      [ -n "$ans" ] || { echo "jev: stub file is not JSON" >&2; exit 2; }
+      audit --arg set "$set_id" --arg model "$JEV_MODEL" --arg sum "$sum" --argjson answers "$ans" \
+        '{ts: $ts, set: $set, model: $model, request_sum: $sum, stub: true, answers: $answers}'
+      printf '%s\n' "$ans"
+      exit 0
+    fi
+
+    [ -n "${TYPESAFE_API_KEY:-}" ] || { echo "jev: TYPESAFE_API_KEY not set; no answer (fail-open)" >&2; exit 0; }
+    need curl || { echo "jev: curl not found; no answer (fail-open)" >&2; exit 0; }
+
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+    cache="$CACHE_DIR/$sum.json"
+    if [ -f "$cache" ] && jq -e 'type == "object"' "$cache" >/dev/null 2>&1; then
+      audit --arg set "$set_id" --arg model "$JEV_MODEL" --arg sum "$sum" --slurpfile answers "$cache" \
+        '{ts: $ts, set: $set, model: $model, request_sum: $sum, cache: true, answers: $answers[0]}'
+      cat "$cache"
+      exit 0
+    fi
+
+    t0=$(now_ms)
+    resp=$(printf '%s' "$body" | curl -sS -m "$JEV_TIMEOUT" -X POST "$BASE_URL/v1/systemone" \
+      -H "Authorization: Bearer $TYPESAFE_API_KEY" -H "Content-Type: application/json" \
+      --data-binary @- -w '\n%{http_code}' 2>/dev/null) || resp=""
+    ms=$(( $(now_ms) - t0 ))
+    code=$(printf '%s' "$resp" | tail -n 1)
+    json=$(printf '%s' "$resp" | sed '$d')
+    answers=$(printf '%s' "$json" | jq -c '.answers // empty' 2>/dev/null)
+    tokens=$(printf '%s' "$json" | jq -r '.usage.input_tokens // 0' 2>/dev/null)
+    served=$(printf '%s' "$json" | jq -r '.model // empty' 2>/dev/null)
+
+    case "$code" in
+      2[0-9][0-9]) ;;
+      *)
+        detail=$(printf '%s' "$json" | jq -r '.detail // .error // .message // empty' 2>/dev/null | head -c 160)
+        echo "jev: HTTP ${code:-timeout} from $BASE_URL after ${ms}ms${detail:+: $detail}; no answer (fail-open)" >&2
+        audit --arg set "$set_id" --arg model "$JEV_MODEL" --arg sum "$sum" --arg http "${code:-timeout}" --argjson ms "$ms" \
+          '{ts: $ts, set: $set, model: $model, request_sum: $sum, http: $http, ms: $ms, error: true}'
+        exit 0
+        ;;
+    esac
+    [ -n "$answers" ] || { echo "jev: reply carried no answers; no answer (fail-open)" >&2; exit 0; }
+
+    printf '%s\n' "$answers" >"$cache.tmp.$$" 2>/dev/null && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
+    audit --arg set "$set_id" --arg model "${served:-$JEV_MODEL}" --arg sum "$sum" --argjson ms "$ms" \
+      --argjson tokens "${tokens:-0}" --argjson answers "$answers" \
+      '{ts: $ts, set: $set, model: $model, request_sum: $sum, ms: $ms, input_tokens: $tokens, answers: $answers}'
+    printf '%s\n' "$answers"
+    ;;
+
+  -h|--help) usage ;;
+  *) echo "jev: unknown command '$cmd'" >&2; usage ;;
+esac

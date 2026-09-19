@@ -1,0 +1,91 @@
+{
+  "_comment": "Every Jev question and threshold the herdr org uses, in one reviewable place. One request per EVENT (a dispatch, an accept), never per tool call; each set's questions run in parallel over the same state and a caller reads only what its branch needs. Question ids are never sent to the model. Thresholds are starting points: tune them in the overlay (~/.claude/jev-questions.json, same shape, recursively merged) after reading ~/.claude/jev-audit.jsonl, not here. The asymmetric bars follow what the doctrine measured: under-provisioning a lane (a prose-spec brief on a cheap tier) costs 2-3x the turns, over-provisioning costs tokens, so refusing a DOWN-tier needs more certainty than warning about an UP-tier.",
+  "_model_note": "Written against jev-1.13.0. `tier` is a Choice over descriptions of the WORK, never model names, so a renamed model tier changes nothing here. A Choice's confidence summarises how peaked its distribution is; a Noul is the probability of YES with no separate confidence.",
+  "sets": {
+    "tier-gauge": {
+      "_used_by": "scripts/tier-gauge, called by scripts/dispatch-worker (L17 TIER BY BRIEF)",
+      "questions": {
+        "tier": {
+          "type": "choice",
+          "instructions": {
+            "question": "Which description fits the work `brief` asks of the worker?",
+            "focus": "Judge how much the worker must DESIGN or DECIDE, not how large the task is."
+          },
+          "criteria": {
+            "mechanical": {
+              "what": "Transcription-grade: complete code blocks, exact file paths and line ranges, each step one action with its command and expected output, acceptance checks as exact commands with expected counts. The worker types; it invents nothing.",
+              "not_for": "A brief that says what to build without showing how."
+            },
+            "ordinary": {
+              "what": "Ordinary engineering: the goal and acceptance criteria are clear and the interfaces are named, but the worker chooses the implementation, writes tests from a description, or fills in details the brief leaves open.",
+              "not_for": "A brief with every code block already written, or one whose acceptance is ambiguous."
+            },
+            "hard": {
+              "what": "Hard or high-stakes: multi-file design choices, ambiguous acceptance criteria, cross-repo blast radius, causal diagnosis of an anomaly, or a prior bounce for a wrong approach.",
+              "not_for": "A large but fully specified task."
+            }
+          }
+        },
+        "risky": {
+          "type": "noul",
+          "instructions": "Does `brief` have the worker touch release or CI configuration, authentication or authorization, data integrity (migrations, schemas, money, persistence formats), parser or resolution logic, or state that cannot be undone?",
+          "criteria": {
+            "true": "At least one of those surfaces is in scope for this lane.",
+            "false": "The lane stays inside ordinary feature or fix code."
+          }
+        },
+        "names_lane_tree": {
+          "type": "noul",
+          "instructions": "Does `brief` name an absolute path for this lane's dedicated working tree (a skyline workspace, skyrift workspace, or git worktree), rather than a shared checkout or no path at all?",
+          "criteria": { "true": "An absolute lane-tree path is stated.", "false": "No path, a relative path, or the shared main checkout." }
+        },
+        "orders_milestones": {
+          "type": "noul",
+          "instructions": "Does `brief` require the worker to post milestone comments on the board todo at phase boundaries (with commands, counts, SHAs), rather than one summary at the end?",
+          "criteria": { "true": "Milestone comments at phase boundaries are required.", "false": "Only an end summary, or reporting is not mentioned." }
+        },
+        "inlines_board_snippets": {
+          "type": "noul",
+          "instructions": "Does `brief` inline the exact board commands the worker needs (board get, board comment, board pad append) and the board root, so the worker never re-derives them?",
+          "criteria": { "true": "The board calls are written out.", "false": "The worker is told to report but not shown the calls." }
+        }
+      },
+      "thresholds": {
+        "downgrade_bar": 0.6,
+        "upgrade_bar": 0.3,
+        "risky": 0.7,
+        "lint": 0.5
+      }
+    },
+    "review-gate": {
+      "_used_by": "scripts/review-gate-check at ACCEPT SEQUENCE step 1 (L10 REVIEW GATE)",
+      "questions": {
+        "touches_release_ci": {
+          "type": "noul",
+          "instructions": "Does the change in `diff` (or, when only `paths` and `commit_subjects` are given, the files and commits named) modify release, packaging, versioning, or CI configuration?",
+          "criteria": { "true": "Workflow files, release scripts, version manifests, publish or deploy configuration are changed.", "false": "None of those surfaces change." }
+        },
+        "touches_auth": {
+          "type": "noul",
+          "instructions": "Does the change in `diff` (or the named `paths` and `commit_subjects`) modify authentication, authorization, session, token, permission, or credential handling?",
+          "criteria": { "true": "Login, tokens, permissions, roles, secrets, or access checks are changed.", "false": "None of those surfaces change." }
+        },
+        "touches_data_integrity": {
+          "type": "noul",
+          "instructions": "Does the change in `diff` (or the named `paths` and `commit_subjects`) modify database migrations or schemas, persistence formats, money or balance handling, or anything that could corrupt or lose stored data?",
+          "criteria": { "true": "Migrations, schemas, serialisation formats, financial arithmetic, or destructive data paths are changed.", "false": "None of those surfaces change." }
+        },
+        "touches_parser_resolution": {
+          "type": "noul",
+          "instructions": "Does the change in `diff` (or the named `paths` and `commit_subjects`) modify a parser, tokenizer, name or path resolution, or the interpretation of external input formats?",
+          "criteria": { "true": "Parsing, lexing, resolution, or input-format interpretation is changed.", "false": "None of those surfaces change." }
+        }
+      },
+      "thresholds": {
+        "gate_lines": 150,
+        "surface": 0.7,
+        "max_diff_chars": 120000
+      }
+    }
+  }
+}

@@ -1,0 +1,137 @@
+#!/bin/sh
+# doorbell: send the close-out doorbell and wait for the receiver's runtime
+# ACK. The herdr-agent-org-claude plugin's UserPromptSubmit hook
+# (hooks/org-ack-submit.sh) writes acks/<sha256(prompt)>.ack into the
+# org-waker config dir at the exact moment a [DOORBELL] prompt becomes a
+# turn in the receiving session -- ground truth, not a composer read.
+#
+#   doorbell <orchestrator-agent-name> <lane-slug>
+#
+# Exit codes and JSON `status` on stdout:
+#   0 delivered    -- the receiver's hook confirmed the prompt became a turn
+#   1 unconfirmed  -- sent, no ack (route to the [INCIDENT] branch; the board
+#                     comment stands as the durable record)
+#   2 skipped      -- L11: the target composer carried text that is not ours;
+#                     never type into it (the board comment stands)
+#
+# One sanctioned recovery is built in: when the no-ack re-read shows OUR
+# exact text parked on the composer, a single empty submit is sent and the
+# ack awaited once more. Everything beyond that is the org-waker's job.
+set -eu
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+[ "${HERDR_ENV:-}" = "1" ] || { echo "doorbell: HERDR_ENV!=1, run inside a Herdr-managed pane" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "doorbell: jq is required" >&2; exit 2; }
+[ "$#" -eq 2 ] || { echo "usage: doorbell <orchestrator-agent-name> <lane-slug>" >&2; exit 2; }
+
+TARGET=$1
+SLUG=$2
+TEXT="[DOORBELL] lane $SLUG [DONE], verdict needed. board get $SLUG"
+
+sha_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-32
+  else
+    printf '%s' "$1" | sha256sum | cut -c1-32
+  fi
+}
+
+ACKDIR=$($HERDR plugin config-dir skylence.org-waker 2>/dev/null || true)
+[ -n "$ACKDIR" ] || ACKDIR="$HOME/.config/herdr/plugins/config/skylence.org-waker"
+ACKDIR="$ACKDIR/acks"
+ACK="$ACKDIR/$(sha_of "$TEXT").ack"
+rm -f "$ACK" 2>/dev/null || true
+
+# Ack consumed = the doorbell became a turn in the receiver (runtime ground
+# truth). Leave a marker so the waker suppresses the now-redundant settle
+# ring for this lane (org-waker 0.7.2). Lane slugs are [a-z0-9_-], so the
+# filename matches the waker's sane() output byte for byte.
+mark_doorbell() {
+  d="${ACKDIR%/acks}/state"
+  mkdir -p "$d" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$d/doorbell--$SLUG" 2>/dev/null || true
+}
+
+pane_of() { $HERDR agent get "$TARGET" 2>/dev/null | jq -r '.result.agent.pane_id // empty' 2>/dev/null; }
+
+# The prompt char must be built with printf octal escapes: a `\x`-escaped
+# default inside the awk -v assignment reaches BSD awk as the literal
+# backslash text and never matches the rendered ❯ (measured live 2026-08-02:
+# the recovery branch read every composer as empty and a parked doorbell
+# went unrecovered).
+PC="${ORG_WAKER_PROMPT_CHAR:-$(printf '\342\235\257')}"
+BOX="$(printf '\342\224\202')"
+NB="$(printf '\302\240')"
+
+# composer_line -> the text after the prompt char on the target's composer,
+# or the empty string. Grok box-border glyphs stripped like the waker does.
+composer_line() {
+  p=$(pane_of); [ -n "$p" ] || { echo ""; return; }
+  $HERDR pane read "$p" --source visible --lines 25 --format text 2>/dev/null | awk -v pc="$PC" -v box="$BOX" -v nb="$NB" '
+    { i = index($0, pc); if (i) { found = 1; line = substr($0, i + length(pc)) } }
+    END {
+      if (!found) { print ""; exit }
+      lead = "^[" nb " \t]+"; trail = "[" nb " \t\r]+$"
+      gsub(lead, "", line); gsub(trail, "", line)
+      gsub(box, "", line)
+      gsub(lead, "", line); gsub(trail, "", line)
+      print line
+    }'
+}
+
+emit() { jq -cn --arg t "$TARGET" --arg l "$SLUG" --arg s "$1" --argjson a "$2" \
+  '{target:$t, lane:$l, status:$s, acked:$a}'; }
+
+wait_ack() {
+  n=0
+  while [ "$n" -lt "$1" ]; do
+    [ -e "$ACK" ] && { rm -f "$ACK"; return 0; }
+    sleep 0.5
+    n=$((n + 1))
+  done
+  [ -e "$ACK" ] && { rm -f "$ACK"; return 0; }
+  return 1
+}
+
+recover_parked() {
+  p=$(pane_of)
+  [ -n "$p" ] && $HERDR pane run "$p" "" >/dev/null 2>&1 || true
+  wait_ack "$1"
+}
+
+# L11 pre-send, three-way: foreign text means do not type; OUR OWN earlier
+# parked copy means recover it (a second paste on top would fuse into
+# garbage), never re-send; clear means send.
+pre=$(composer_line)
+if [ "$pre" = "$TEXT" ]; then
+  if recover_parked 16; then
+    mark_doorbell
+    emit delivered true
+    exit 0
+  fi
+  emit unconfirmed false
+  exit 1
+fi
+if [ -n "$pre" ]; then
+  emit skipped false
+  exit 2
+fi
+
+$HERDR agent prompt "$TARGET" "$TEXT" >/dev/null 2>&1 || { emit unconfirmed false; exit 1; }
+
+if wait_ack 16; then
+  mark_doorbell
+  emit delivered true
+  exit 0
+fi
+
+# No ack: one sanctioned recovery when OUR exact text sits parked.
+now=$(composer_line)
+if [ "$now" = "$TEXT" ] && recover_parked 8; then
+  mark_doorbell
+  emit delivered true
+  exit 0
+fi
+
+emit unconfirmed false
+exit 1

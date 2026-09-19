@@ -1,0 +1,170 @@
+#!/bin/sh
+# waker-ctl: org-side client of the skylence.org-waker herdr plugin.
+#
+# The waker's interface is its config dir (herdr-plugins/org-waker/README.md,
+# "The registry contract"): registry.tsv rows plus per-pane state files. This
+# script implements the same upsert/remove semantics client-side so dispatch
+# and close-out never depend on locating the plugin's own script, only on
+# `herdr plugin config-dir` resolving. Keep the two in sync when the contract
+# changes.
+#
+# Usage:
+#   waker-ctl present                       # exit 0 iff the plugin is installed
+#   waker-ctl register --pane ID --lane NAME --target ORCH [--todo SLUG] [--beat-note TEXT]
+#   waker-ctl unregister --lane NAME        # BEFORE reaping the lane agent (L6)
+#   waker-ctl list
+#   waker-ctl drain                         # deliver held wakes now
+#   waker-ctl doctor
+set -u
+
+PLUGIN_ID="skylence.org-waker"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+sane() { printf '%s' "$1" | tr ':/' '--'; }
+# Flatten newlines/tabs/CR to spaces so a beat note is one TSV field. Chosen
+# over reject: orchestrator paste with a stray newline still stores a usable line.
+flatten_note() { printf '%s' "$1" | tr '\n\t\r' '   '; }
+
+# Same resolution order as the waker script (keep the two in sync): the
+# handler-environment override first, then the CLI lookup.
+CFG="${HERDR_PLUGIN_CONFIG_DIR:-}"
+if [ -z "$CFG" ]; then
+  CFG=$($HERDR plugin config-dir "$PLUGIN_ID" 2>/dev/null || true)
+fi
+
+cmd=${1:-help}
+[ "$cmd" = help ] || [ "$cmd" = -h ] || [ "$cmd" = --help ] && {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
+  exit 2
+}
+
+if [ "$cmd" = present ]; then
+  [ -n "$CFG" ] && exit 0 || exit 1
+fi
+
+[ -n "$CFG" ] || { echo "waker-ctl: org-waker plugin not installed (herdr plugin config-dir $PLUGIN_ID failed)" >&2; exit 1; }
+REGD="$CFG/registry"
+# Migrate the pre-0.2.0 single registry.tsv to one row file per lane (same
+# semantics as the waker script; keep the two in sync).
+if [ -f "$CFG/registry.tsv" ]; then
+  mkdir -p "$REGD"
+  while IFS="$(printf '\t')" read -r mpane mlane mrest; do
+    [ -n "$mlane" ] || continue
+    printf '%s\t%s\t%s\n' "$mpane" "$mlane" "$mrest" > "$REGD/$(sane "$mlane").row"
+  done < "$CFG/registry.tsv"
+  mv "$CFG/registry.tsv" "$CFG/registry.tsv.migrated" 2>/dev/null || true
+fi
+shift
+
+case "$cmd" in
+  register)
+    pane=""; lane=""; target=""; todo=""; beat_note=""; org_root="${HERDR_ORG_ROOT:-}"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --pane) pane=$2; shift 2 ;;
+        --lane) lane=$2; shift 2 ;;
+        --target) target=$2; shift 2 ;;
+        --todo) todo=$2; shift 2 ;;
+        --beat-note) beat_note=$(flatten_note "$2"); shift 2 ;;
+        --org-root) org_root=$2; shift 2 ;;
+        *) echo "waker-ctl register: unknown arg $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$pane" ] && [ -n "$lane" ] && [ -n "$target" ] || {
+      echo "waker-ctl register: --pane, --lane, --target required" >&2; exit 2; }
+    mkdir -p "$CFG/state" "$CFG/pending" "$CFG/spool" "$CFG/log" "$REGD"
+    gen=1
+    old=$(cut -f5 "$REGD/$(sane "$lane").row" 2>/dev/null)
+    [ -n "${old:-}" ] && gen=$((old + 1))
+    tmp=$(mktemp "${TMPDIR:-/tmp}/org-waker.XXXXXX")
+    # Field 8 (beat_note) is written only when set so a no-flag register keeps
+    # today's exact 7-field row (list + ring line unchanged).
+    if [ -n "$beat_note" ]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$lane" "$todo" "$target" "$gen" "$org_root" "$(now_utc)" "$beat_note" > "$tmp" \
+        && mv "$tmp" "$REGD/$(sane "$lane").row"
+    else
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$lane" "$todo" "$target" "$gen" "$org_root" "$(now_utc)" > "$tmp" \
+        && mv "$tmp" "$REGD/$(sane "$lane").row"
+    fi
+    rm -f "$CFG/state/status--$(sane "$pane")" "$CFG/state/dead--$(sane "$pane")" 2>/dev/null || true
+    printf '{"registered":"%s","pane":"%s","target":"%s","gen":%s}\n' "$lane" "$pane" "$target" "$gen"
+    ;;
+  unregister)
+    lane=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --lane) lane=$2; shift 2 ;;
+        *) echo "waker-ctl unregister: unknown arg $1" >&2; exit 2 ;;
+      esac
+    done
+    [ -n "$lane" ] || { echo "waker-ctl unregister: --lane required" >&2; exit 2; }
+    pane=$(cut -f1 "$REGD/$(sane "$lane").row" 2>/dev/null)
+    rm -f "$REGD/$(sane "$lane").row"
+    [ -n "$pane" ] && rm -f "$CFG/state/status--$(sane "$pane")" "$CFG/state/dead--$(sane "$pane")" 2>/dev/null
+    # Purge held wakes for the lane by exact filename parse (a glob would also
+    # purge lanes this one suffixes, e.g. rev-<lane>). MUST mirror the plugin's
+    # cmd_unregister (waker header: keep the two in sync): that means BOTH
+    # .msg and .msg.claim files (a wake mid-drain is renamed to .claim, and a
+    # failed drain renames it back, resurrecting a silently-skipped wake as a
+    # zombie ring for a closed lane; measured 2026-07-31, lanes i337/i338), and
+    # one dropped:unregistered rings.jsonl line per removal (audit invariant:
+    # every permanent removal of a pending wake is logged).
+    for f in "$CFG"/pending/*.msg "$CFG"/pending/*.claim; do
+      [ -e "$f" ] || continue
+      b=${f##*/}
+      case "$b" in
+        *.msg.claim) base=${b%.msg.claim} ;;
+        *.msg)       base=${b%.msg} ;;
+        *)           continue ;;
+      esac
+      g=${base##*-g}
+      l=${base#*-}; l=${l%-g"$g"}
+      if [ "$l" = "$(sane "$lane")" ]; then
+        text=$(sed -n '2p' "$f" 2>/dev/null || true)
+        if command -v jq >/dev/null 2>&1; then
+          jq -cn --arg t "$(now_utc)" --arg l "$lane" --arg g "$g" --arg x "$text" \
+            '{timestamp:$t, lane:$l, gen:($g|tonumber? // 0), outcome:"dropped:unregistered", text:$x}' \
+            >> "$CFG/log/rings.jsonl" 2>/dev/null || true
+        fi
+        rm -f "$f"
+      fi
+    done
+    printf '{"unregistered":"%s"}\n' "$lane"
+    ;;
+  list)
+    set -- "$REGD"/*.row
+    if [ -e "$1" ]; then
+      printf 'PANE\tLANE\tTODO\tTARGET\tGEN\tORG_ROOT\tREGISTERED\n'
+      cat "$REGD"/*.row
+    else
+      echo "(no registered lanes)"
+    fi
+    set -- "$CFG"/pending/*.msg
+    if [ -e "$1" ]; then echo "pending: $#"; else echo "pending: 0"; fi
+    ;;
+  drain)
+    $HERDR plugin action invoke drain --plugin "$PLUGIN_ID"
+    ;;
+  doctor)
+    # Actions run async with output only in `herdr plugin log list`, so
+    # report locally instead of invoking the doctor action.
+    echo "org-waker (via waker-ctl)"
+    echo "  config dir: $CFG"
+    rows=0
+    set -- "$REGD"/*.row
+    [ -e "$1" ] && rows=$#
+    echo "  registered lanes: $rows"
+    set -- "$CFG"/pending/*.msg
+    if [ -e "$1" ]; then echo "  pending wakes: $#"; else echo "  pending wakes: 0"; fi
+    if [ -f "$CFG/log/rings.jsonl" ]; then
+      echo "  last rings:"
+      tail -n 5 "$CFG/log/rings.jsonl" | sed 's/^/    /'
+    fi
+    echo "  handler logs: herdr plugin log list"
+    ;;
+  *)
+    echo "waker-ctl: unknown subcommand $cmd (try: waker-ctl help)" >&2
+    exit 2
+    ;;
+esac

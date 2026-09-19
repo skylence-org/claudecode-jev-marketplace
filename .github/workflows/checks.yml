@@ -1,0 +1,61 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every script here is POSIX sh or bash over curl + jq, and the suites are
+  # stub-driven, so both platforms the plugins ship to run the same jobs. The
+  # macOS leg exists for the BSD fallbacks (base64 -D, shasum, no GNU date %N).
+  suites:
+    name: shell suites (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The checker follows the SHEBANG, not the extension.
+      - name: shell syntax
+        run: |
+          for f in plugins/*/hooks/*.sh plugins/*/scripts/* plugins/*/tests/*.sh plugins/*/tests/*/*.sh tools/*.sh .githooks/*; do
+            [ -f "$f" ] || continue
+            case "$(head -1 "$f")" in
+              *bash*) bash -n "$f" || { echo "invalid bash: $f"; exit 1; } ;;
+              *sh*)   sh -n "$f"   || { echo "invalid sh: $f"; exit 1; } ;;
+            esac
+          done
+
+      - name: JSON syntax
+        run: |
+          shopt -s nullglob
+          for f in .claude-plugin/marketplace.json plugins/*/hooks/*.json plugins/*/.claude-plugin/plugin.json plugins/*/scripts/*.json; do
+            jq -e . "$f" >/dev/null || { echo "invalid JSON: $f"; exit 1; }
+          done
+
+      - name: parity (jev twins, wiring phrases)
+        run: sh tools/check-parity.sh
+
+      - name: jev-core suite
+        run: bash plugins/jev-core/tests/jev.test.sh
+
+      - name: herdr-agent-org-jev gauge suite
+        run: bash plugins/herdr-agent-org-jev/tests/jev/gauge.test.sh
+
+      - name: conduct harness self-test (stubbed, no LLM call)
+        run: sh plugins/herdr-agent-org-jev/tests/conduct/run-conduct.sh --self-test
+
+      # The suites drive the model through JEV_STUB_ANSWERS and never export a
+      # key. If that ever stops being true this job starts costing money, which
+      # is worth noticing.
+      - name: assert the suites made no live Jev call
+        run: |
+          grep -q 'JEV_STUB_ANSWERS' plugins/jev-core/tests/jev.test.sh || { echo "jev-core suite no longer stubs Jev"; exit 1; }
+          grep -q 'JEV_STUB_ANSWERS' plugins/herdr-agent-org-jev/tests/jev/gauge.test.sh || { echo "gauge suite no longer stubs Jev"; exit 1; }
+          grep -q 'unset TYPESAFE_API_KEY' plugins/jev-core/tests/jev.test.sh || { echo "jev-core suite does not clear the key"; exit 1; }

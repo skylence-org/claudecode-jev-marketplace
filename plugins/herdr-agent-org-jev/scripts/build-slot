@@ -1,0 +1,32 @@
+#!/bin/sh
+# build-slot: machine-wide compile serializer (one build at a time).
+# Usage: build-slot cargo clippy --all-targets -- -D warnings
+# mkdir-style lock, interoperable with skyline_run's lock_path on the same dir.
+set -u
+LOCK="${BUILD_SLOT_LOCK:-/tmp/skylence-build.lock}"
+STALE="${BUILD_SLOT_STALE:-7200}"
+[ "$#" -ge 1 ] || { echo "usage: build-slot <command> [args...]" >&2; exit 2; }
+case " $* " in
+  *nextest*) echo "build-slot: cargo-nextest is OPERATOR-ONLY (banned 2026-06-06, froze the machine); not running it" >&2; exit 2 ;;
+esac
+announced=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+  pid=$(cat "$LOCK/pid" 2>/dev/null || true)
+  if [ -n "${pid:-}" ] && ! kill -0 "$pid" 2>/dev/null; then
+    rm -rf "$LOCK"   # owner died; reclaim
+    continue
+  fi
+  now=$(date +%s); mt=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo "$now")
+  if [ $((now - mt)) -gt "$STALE" ]; then
+    rm -rf "$LOCK"   # stale beyond TTL; reclaim
+    continue
+  fi
+  if [ "$announced" -eq 0 ]; then
+    echo "build-slot: waiting for $LOCK (held by pid ${pid:-unknown})" >&2
+    announced=1
+  fi
+  sleep 5
+done
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT INT TERM
+"$@"
