@@ -74,6 +74,20 @@ t=$(JEV_QUESTIONS_OVERLAY="$TMP/broken.json" sh "$JEV" threshold research-nudge 
 out=$(printf '{"assistant_text":"x"}' | JEV_DISABLE=1 JEV_STUB_ANSWERS="$S" sh "$JEV" ask research-nudge 2>/dev/null); rc=$?
 { [ $rc -eq 0 ] && [ -z "$out" ]; } && ok "JEV_DISABLE=1 is fail-open" || bad "disable" "rc=$rc out=$out"
 
+# Key resolution: env, then the key file, then (macOS only) the Keychain. The
+# base URL points at a closed local port so doctor's live probe fails fast
+# without any network; only the key line is under test here.
+mkdir -p "$HOME/.config/typesafe"; printf 'sk-test-from-file\n' >"$HOME/.config/typesafe/api_key"
+out=$(TYPESAFE_BASE_URL=http://127.0.0.1:9 JEV_TIMEOUT=1 sh "$JEV" doctor 2>&1)
+printf '%s' "$out" | grep -q '^key:.*set (17 chars) via file' && ok "key file fallback: doctor reports 'via file'" || bad "key file" "$out"
+out=$(TYPESAFE_API_KEY=sk-env TYPESAFE_BASE_URL=http://127.0.0.1:9 JEV_TIMEOUT=1 sh "$JEV" doctor 2>&1)
+printf '%s' "$out" | grep -q '^key:.*via env' && ok "env var wins over the key file" || bad "env precedence" "$out"
+out=$(TYPESAFE_API_KEY_FILE="$TMP/elsewhere" TYPESAFE_BASE_URL=http://127.0.0.1:9 JEV_TIMEOUT=1 sh "$JEV" doctor 2>&1)
+printf '%s' "$out" | grep -q '^key:.*NOT SET.*elsewhere' && ok "TYPESAFE_API_KEY_FILE overrides the path and names it when empty" || bad "key file override" "$out"
+out=$(printf '{"assistant_text":"x"}' | TYPESAFE_BASE_URL=http://127.0.0.1:9 JEV_TIMEOUT=1 sh "$JEV" ask research-nudge 2>"$TMP/err"); rc=$?
+{ [ $rc -eq 0 ] && [ -z "$out" ] && grep -q 'fail-open' "$TMP/err"; } && ok "key from file, API unreachable: fail-open" || bad "file key unreachable" "rc=$rc err=$(cat "$TMP/err")"
+rm -f "$HOME/.config/typesafe/api_key"
+
 echo "--- jev-intent-gate ---------------------------------------------------"
 
 run_gate() { # <tool> <tool_input json> [stub json]

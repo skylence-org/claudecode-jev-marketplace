@@ -67,7 +67,7 @@ jq -e 'type == "object"' "$RULES" >/dev/null && echo "overlay parses: OK" || ech
 
 ## Step 2b: Jev, write the question overlay (only if absent) and probe the key
 
-Every Jev question and threshold ships in `$CLAUDE_PLUGIN_ROOT/scripts/jev-questions.json` and arrives with every plugin update. `~/.claude/jev-questions.json` is an OVERLAY of the same shape, recursively merged over the shipped file; it starts EMPTY and is where thresholds get tuned per box after reading `~/.claude/jev-audit.jsonl`. The key is never written by this skill: `TYPESAFE_API_KEY` belongs in the shell environment (a user-level environment variable on Windows, the shell profile on macOS and Linux), set by the operator and never pasted into a chat. Without it both Jev hooks are fail-open and inert; everything else in this baseline works exactly as core-claude does.
+Every Jev question and threshold ships in `$CLAUDE_PLUGIN_ROOT/scripts/jev-questions.json` and arrives with every plugin update. `~/.claude/jev-questions.json` is an OVERLAY of the same shape, recursively merged over the shipped file; it starts EMPTY and is where thresholds get tuned per box after reading `~/.claude/jev-audit.jsonl`. The key is never written by this skill and never pasted into a chat. `jev` looks for it in three places, first hit wins: the `TYPESAFE_API_KEY` environment variable; the key file `~/.config/typesafe/api_key` (one line, `chmod 600`; `TYPESAFE_API_KEY_FILE` overrides the path); on macOS a Keychain generic password with service `TYPESAFE_API_KEY`. The key file is the recommended place on every OS because every process of the operator's user reads it, including herdr split panes and daemon-routed shell calls, which do not inherit a shell's environment. Without a key both Jev hooks are fail-open and inert; everything else in this baseline works exactly as core-claude does.
 
 ```bash
 Q=~/.claude/jev-questions.json
@@ -80,7 +80,7 @@ else
   echo "$Q is NOT valid JSON: it is ignored until fixed (the shipped thresholds stay active)"
 fi
 sh "$CLAUDE_PLUGIN_ROOT/scripts/jev" doctor \
-  || echo 'jev: key missing or the API unreachable. The two Jev hooks stay inert (fail-open) until TYPESAFE_API_KEY is in the shell environment and Claude Code is restarted; judge-hook, writing-guard, HUD and guidelines are unaffected.'
+  || echo 'jev: key missing or the API unreachable. The two Jev hooks stay inert (fail-open) until a key is in place (recommended: one line in ~/.config/typesafe/api_key, chmod 600) and Claude Code is restarted; judge-hook, writing-guard, HUD and guidelines are unaffected.'
 ```
 
 ## Step 3: wire settings.json (backup first; idempotent)
@@ -205,7 +205,7 @@ core:setup
 ----------
 plugin hooks                   judge-hook, jev-intent-gate, writing-guard, jev-research-nudge run from ${CLAUDE_PLUGIN_ROOT} (update with the plugin; nothing copied)
 ~/.claude/jev-questions.json   empty overlay written | existing overlay kept
-TYPESAFE_API_KEY               set, jev doctor live | NOT SET (both Jev hooks inert, fail-open; set it in the shell environment and restart)
+Jev key                        set via env | file | keychain, jev doctor live | NOT SET (both Jev hooks inert, fail-open; put it in ~/.config/typesafe/api_key, chmod 600, and restart)
 ~/.claude/core-hud.sh          installed (statusline; the one file still copied)
 ~/.claude/judge-rules.json     empty overlay written | existing overlay kept | full copy retired to .fullcopy.bak
 ~/.claude/*.sh.retired.*       legacy hook copies retired, if any were present

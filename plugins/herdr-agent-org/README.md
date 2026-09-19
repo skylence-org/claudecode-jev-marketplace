@@ -12,7 +12,7 @@ One Jev request per lane per **event**, never per tool call, and nothing changes
 
 Not on Jev, on purpose: `ghost-probe.sh` (the no-fusion classifier must stay a deterministic diff), the org-relay nudge watchdog (timing), the reviewer lane (needs generation), the architect dry-read gate (the gauge must be the priced worker tier), and `tests/conduct` (a live model under pressure is the subject under test).
 
-Setup: `TYPESAFE_API_KEY` in the pane shell's environment before `claude` starts (same rule as `HERDR_ORG_ROOT`; split panes inherit the herdr server's env, so put it where that process sees it). On a skyline-enforced box, pass it in the tool call's `env` parameter next to `HERDR_ORG_ROOT` (the SKYLINE-ROUTED SHELL GOTCHA in the orchestrator skill names it), or every dispatch is silently ungauged. `sh scripts/jev doctor` checks it.
+Setup: put the key in `~/.config/typesafe/api_key` (one line, `chmod 600`). `jev` reads that file when `TYPESAFE_API_KEY` is not in the environment, and a file is what makes the org work: split panes inherit the herdr *server's* env, not yours, and a skyline-routed shell call runs inside a detached daemon — neither sees a shell export, both read a file owned by the same user. The env-variable route still works (pane shell before `claude` starts, or the tool call's `env` parameter per the SKYLINE-ROUTED SHELL GOTCHA), it just has to be repeated per process. `sh scripts/jev doctor` prints which source it found.
 
 ---
 

@@ -43,10 +43,13 @@ and threshold lives in one `jev-questions.json` per plugin, overridable per box.
 /core:setup
 ```
 
-Set `TYPESAFE_API_KEY` in your shell environment (a key from
-https://console.typesafe.ai/keys; never paste it into a chat) and restart Claude Code. Without
-a key every Jev call is fail-open: hooks allow, dispatches go ungauged, and one stderr line
-says so. `sh plugins/core/scripts/jev doctor` checks the setup.
+Put your key (from https://console.typesafe.ai/keys; never paste it into a chat) in
+`~/.config/typesafe/api_key` (one line, `chmod 600`) and restart Claude Code. That works the
+same on Windows, macOS and Linux, and reaches processes a shell export never does (herdr
+split panes, daemon-routed shell calls). `jev` also honours a `TYPESAFE_API_KEY` environment
+variable (it wins when set) and, on macOS, a Keychain item of that name. Without a key every
+Jev call is fail-open: hooks allow, dispatches go ungauged, and one stderr line says so.
+`sh plugins/core/scripts/jev doctor` prints which source it found.
 
 ## What is deliberately NOT on Jev
 

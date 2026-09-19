@@ -13,7 +13,7 @@
 #   jev cache-clear
 #
 # CONTRACT (mirrors core-claude's judge-hook): infrastructure failures are
-# FAIL-OPEN and SILENT on stdout — no key, JEV_DISABLE=1, timeout, non-2xx,
+# FAIL-OPEN and SILENT on stdout, no key, JEV_DISABLE=1, timeout, non-2xx,
 # unparseable reply all print NOTHING and exit 0, with one stderr line. A
 # caller treats empty stdout as "no answer" and proceeds as it would without
 # Jev. Caller bugs (unknown set, non-JSON state) exit 2 so tests catch them.
@@ -23,8 +23,20 @@
 # audit line to ~/.claude/jev-audit.jsonl (JEV_AUDIT_FILE) carrying the answers
 # and a checksum of the state, never the state itself.
 #
-# Env: TYPESAFE_API_KEY (required for live calls), JEV_MODEL (default pinned
-# jev-1.13.0 — thresholds are tuned against a version, and the jev-latest
+# KEY, looked up in this order (first hit wins; `jev doctor` prints which):
+#   1. TYPESAFE_API_KEY in the environment (Windows user-level variable, shell
+#      profile export, or a tool call's env parameter);
+#   2. the key file, one line, private: ~/.config/typesafe/api_key
+#      (TYPESAFE_API_KEY_FILE overrides the path). The portable answer: every
+#      process of your user reads it, Claude Code hooks, herdr split panes
+#      (which inherit the herdr SERVER's env, not yours), daemon-routed shell
+#      calls, with no env plumbing on either OS;
+#   3. macOS Keychain, generic password with service TYPESAFE_API_KEY
+#      (security add-generic-password -a "$USER" -s TYPESAFE_API_KEY -w '<key>' -U).
+# No key anywhere means every ask is fail-open, as below.
+#
+# Env: JEV_MODEL (default pinned
+# jev-1.13.0, thresholds are tuned against a version, and the jev-latest
 # alias moves without notice), JEV_TIMEOUT (seconds, default 5; measured 1.1-1.5 s from Western Europe), JEV_QUESTIONS
 # (question file; default beside this script), JEV_QUESTIONS_OVERLAY
 # (~/.claude/jev-questions.json; same shape, recursively merged over the
@@ -45,6 +57,7 @@ QFILE="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
 OVERLAY="${JEV_QUESTIONS_OVERLAY:-$HOME/.claude/jev-questions.json}"
 AUDIT="${JEV_AUDIT_FILE:-$HOME/.claude/jev-audit.jsonl}"
 CACHE_DIR="${JEV_CACHE_DIR:-${TMPDIR:-/tmp}/jev-cache-$(id -u 2>/dev/null || echo 0)}"
+KEY_FILE="${TYPESAFE_API_KEY_FILE:-$HOME/.config/typesafe/api_key}"
 
 usage() {
   awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
@@ -52,6 +65,31 @@ usage() {
 }
 
 need() { command -v "$1" >/dev/null 2>&1; }
+
+# Sets KEY and KEY_SOURCE (env | file | keychain); returns 1 when no source
+# has a key. A function, not a $(...) substitution, so the source survives.
+resolve_key() {
+  KEY=""; KEY_SOURCE=""
+  if [ -n "${TYPESAFE_API_KEY:-}" ]; then KEY=$TYPESAFE_API_KEY; KEY_SOURCE=env; return 0; fi
+  if [ -f "$KEY_FILE" ]; then
+    KEY=$(head -n 1 "$KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$KEY" ] && { KEY_SOURCE=file; return 0; }
+  fi
+  if [ "$(uname -s 2>/dev/null)" = Darwin ] && need security; then
+    KEY=$(security find-generic-password -s TYPESAFE_API_KEY -w 2>/dev/null | tr -d '[:space:]')
+    [ -n "$KEY" ] && { KEY_SOURCE=keychain; return 0; }
+  fi
+  KEY=""; return 1
+}
+
+# The key file must be private. NTFS keeps a profile-dir file private already
+# and its mode bits are decorative, so the check is POSIX-only.
+key_file_perms_note() {
+  [ -f "$KEY_FILE" ] || return 0
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  mode=$(ls -l "$KEY_FILE" 2>/dev/null | cut -c1-10)
+  case "$mode" in -rw-------) ;; *) echo "  WARNING: $KEY_FILE is $mode; make it private: chmod 600 $KEY_FILE" ;; esac
+}
 
 # Question sets: shipped file, with the overlay recursively merged on top when
 # it exists and parses. A broken overlay is ignored, never fatal: a typo in a
@@ -105,7 +143,12 @@ case "$cmd" in
 
   doctor)
     rc=0
-    if [ -n "${TYPESAFE_API_KEY:-}" ]; then echo "key:       set (${#TYPESAFE_API_KEY} chars)"; else echo "key:       NOT SET (every ask is fail-open: no answers, no gates)"; rc=1; fi
+    if resolve_key; then
+      echo "key:       set (${#KEY} chars) via $KEY_SOURCE"
+      [ "$KEY_SOURCE" = file ] && key_file_perms_note
+    else
+      echo "key:       NOT SET (every ask is fail-open: no answers, no gates). Looked in: env TYPESAFE_API_KEY, $KEY_FILE, macOS Keychain item TYPESAFE_API_KEY"; rc=1
+    fi
     need curl && echo "curl:      ok" || { echo "curl:      MISSING"; rc=1; }
     echo "model:     $JEV_MODEL (timeout ${JEV_TIMEOUT}s, base $BASE_URL)"
     if jq -e '.sets | type == "object"' "$QFILE" >/dev/null 2>&1; then
@@ -122,8 +165,8 @@ case "$cmd" in
     echo "cache:     $CACHE_DIR"
     [ -n "${JEV_STUB_ANSWERS:-}" ] && echo "stub:      JEV_STUB_ANSWERS=$JEV_STUB_ANSWERS (no live calls)"
     [ "${JEV_DISABLE:-0}" = 1 ] && echo "disabled:  JEV_DISABLE=1"
-    if [ -n "${TYPESAFE_API_KEY:-}" ] && need curl; then
-      models=$(curl -sS -m "$JEV_TIMEOUT" "$BASE_URL/v1/models" -H "Authorization: Bearer $TYPESAFE_API_KEY" 2>/dev/null | jq -r '.models[]?.name' 2>/dev/null | tr '\n' ' ')
+    if [ -n "$KEY" ] && need curl; then
+      models=$(curl -sS -m "$JEV_TIMEOUT" "$BASE_URL/v1/models" -H "Authorization: Bearer $KEY" 2>/dev/null | jq -r '.models[]?.name' 2>/dev/null | tr '\n' ' ')
       if [ -n "$models" ]; then echo "live:      ok, models: $models"; else echo "live:      FAILED (no reply from $BASE_URL/v1/models within ${JEV_TIMEOUT}s)"; rc=1; fi
     fi
     exit "$rc"
@@ -157,7 +200,7 @@ case "$cmd" in
       exit 0
     fi
 
-    [ -n "${TYPESAFE_API_KEY:-}" ] || { echo "jev: TYPESAFE_API_KEY not set; no answer (fail-open)" >&2; exit 0; }
+    resolve_key || { echo "jev: no API key (env TYPESAFE_API_KEY, $KEY_FILE, or macOS Keychain); no answer (fail-open)" >&2; exit 0; }
     need curl || { echo "jev: curl not found; no answer (fail-open)" >&2; exit 0; }
 
     mkdir -p "$CACHE_DIR" 2>/dev/null || true
@@ -171,7 +214,7 @@ case "$cmd" in
 
     t0=$(now_ms)
     resp=$(printf '%s' "$body" | curl -sS -m "$JEV_TIMEOUT" -X POST "$BASE_URL/v1/systemone" \
-      -H "Authorization: Bearer $TYPESAFE_API_KEY" -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
       --data-binary @- -w '\n%{http_code}' 2>/dev/null) || resp=""
     ms=$(( $(now_ms) - t0 ))
     code=$(printf '%s' "$resp" | tail -n 1)

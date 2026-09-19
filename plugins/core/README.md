@@ -34,19 +34,24 @@ hooks would fire twice.
 /core:setup
 ```
 
-Then, once per box, in your own shell (never paste the key into a chat):
+Then put the key (from https://console.typesafe.ai/keys) where `jev` looks for it. Never
+paste it into a chat. `jev` tries three places, first hit wins, and `jev doctor` prints which
+one it used:
 
-```powershell
-[Environment]::SetEnvironmentVariable('TYPESAFE_API_KEY', '<key from https://console.typesafe.ai/keys>', 'User')
-```
+| Place | OS | Reaches | Notes |
+|---|---|---|---|
+| **`~/.config/typesafe/api_key`** — one line, private (`chmod 600`). **Recommended.** | Windows, macOS, Linux | every process of your user: Claude Code hooks, herdr split panes, daemon-routed shell calls, launchd-started services | No env plumbing on either OS. `TYPESAFE_API_KEY_FILE` overrides the path. Lives outside the dotfiles people sync to git. |
+| `TYPESAFE_API_KEY` environment variable | Windows: user-level variable (`[Environment]::SetEnvironmentVariable(…, 'User')`). macOS/Linux: `export` in the shell profile. | only processes that inherit it | Wins over the file when both are set. Does **not** reach a herdr pane (panes inherit the herdr server's env) or a daemon unless set for that process. |
+| macOS Keychain, generic password, service `TYPESAFE_API_KEY` | macOS | interactive sessions | `security add-generic-password -a "$USER" -s TYPESAFE_API_KEY -w '<key>' -U`. Read only when the two above are absent; a locked keychain fails fast and fails open. |
 
 ```bash
-export TYPESAFE_API_KEY=...   # macOS / Linux: in your shell profile
+mkdir -p ~/.config/typesafe && printf '%s\n' '<key>' > ~/.config/typesafe/api_key && chmod 600 ~/.config/typesafe/api_key
 ```
 
 Restart Claude Code so the hooks and statusline take effect. Without a key every Jev hook is
 inert and says so once on stderr; the judge-hook, writing-guard, HUD, and guidelines work
-exactly as in core-claude.
+exactly as in core-claude. Never in `~/.claude/settings.json` (plain JSON that gets copied
+around, and its `env` block has known reliability bugs) and never in a repo.
 
 ## Migrating from core-claude
 
