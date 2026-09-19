@@ -14,9 +14,10 @@
 # last message, and the audit line (~/.claude/jev-audit.jsonl) carries the
 # probability that drove it. Fails OPEN on every infrastructure error.
 #
-# Silent in agent-org sessions (Solo or Herdr lane markers present): org roles
-# stop constantly, their milestone prose is hedge-shaped, and they answer to
-# the org's own stop discipline. That reasoning survives the cost change.
+# Silent in herdr agent-org sessions (the org-lane-mark marker is present):
+# org roles stop constantly, their milestone prose is hedge-shaped, and they
+# answer to the org's own stop discipline. That reasoning survives the cost
+# change.
 set -uo pipefail
 
 command -v jq >/dev/null 2>&1 || exit 0
@@ -28,12 +29,8 @@ INPUT=$(cat)
 ACTIVE=$(printf '%s' "$INPUT" | jq -r '.stop_hook_active // false')
 [ "$ACTIVE" = "true" ] && exit 0
 
-[ -n "${SOLO_PROCESS_ID:-}" ] && exit 0
 SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
-if [ -n "$SID" ]; then
-  [ -f "/tmp/claude-org-lanes-$SID" ] && exit 0
-  [ -f "/tmp/claude-herdr-org-lanes-$SID" ] && exit 0
-fi
+[ -n "$SID" ] && [ -f "/tmp/claude-herdr-org-lanes-$SID" ] && exit 0
 
 TRANSCRIPT=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty')
 { [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; } || exit 0

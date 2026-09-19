@@ -24,7 +24,7 @@ hooks would fire twice.
 | `core-hud.sh` | `~/.claude/`, `statusLine` | Four-line HUD: model + effort chip + project ⎇ branch stats; gradient context bar; 5h/7d quota lines with a burn-rate engine. The one file still copied, because `statusLine` takes a plain command path. Unchanged. |
 | Guidelines | `~/.claude/CLAUDE.md` | Advisor, Decisive Thinking, Coding, Review Mindset, Writing — between `core:guidelines` markers. Unchanged, and the marker names are kept so a `core-claude` install's block is replaced in place, not duplicated. |
 | `/core:doctor` | skill | Read-only audit: proves the judge gate by running it, flags double-fire wiring, reports the overlays, statusline drift, guidelines sync, version stamp — plus `jev doctor` (key, question sets, one live `/v1/models` call) and the audit-log tail. |
-| `/core:session-handoff`, `/core:uninstall-claude`, `/core:purge-claude-user-scope` | skills | Unchanged from core-claude. The Solo-substrate skills (`solo-setup`, `solo-session-handoff`) are not carried: no Solo plugin lives in this marketplace. |
+| `/core:session-handoff`, `/core:uninstall-claude`, `/core:purge-claude-user-scope` | skills | Unchanged from core-claude. The Solo-substrate skills (`solo-setup`, `solo-session-handoff`) are not carried: Solo is retired, herdr replaced it. |
 
 ## Install
 

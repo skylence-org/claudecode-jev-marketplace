@@ -1,6 +1,6 @@
 {
   "name": "core",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "The opinionated Claude Code baseline (forked from multi-llm-marketplace's core-claude 0.9.8) with TypeSafe Jev deciding the judgments core-claude spent a `claude -p` subprocess on. /core:setup installs, with no prompts, the judge-hook PreToolUse rules engine (skyline-aware; complete ruleset plugin-owned, ~/.claude/judge-rules.json an overlay), the writing-guard, the core-hud statusline, the CLAUDE.md guidelines block, the full-bypass permission posture gated by the judge, and the Jev pieces: the `jev` shell helper (named question sets, thresholds with a per-box overlay, cache, audit log, stub mode, fail-open) and an empty ~/.claude/jev-questions.json. Two hooks answer with Jev: jev-intent-gate (PreToolUse; the dependency version-pin rules, two Nouls over the tool input and recent user messages) and jev-research-nudge (Stop; hedged factual claims, one Noul). /core:doctor audits it all read-only, including a live Jev probe. Replaces core-claude; never install both.",
   "author": {
     "name": "Skylence",
