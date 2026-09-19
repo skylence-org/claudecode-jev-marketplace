@@ -12,7 +12,7 @@ One Jev request per lane per **event**, never per tool call, and nothing changes
 
 Not on Jev, on purpose: `ghost-probe.sh` (the no-fusion classifier must stay a deterministic diff), the org-relay nudge watchdog (timing), the reviewer lane (needs generation), the architect dry-read gate (the gauge must be the priced worker tier), and `tests/conduct` (a live model under pressure is the subject under test).
 
-Setup: `TYPESAFE_API_KEY` in the pane shell's environment before `claude` starts (same rule as `HERDR_ORG_ROOT`; split panes inherit the herdr server's env, so put it where that process sees it). `sh scripts/jev doctor` checks it.
+Setup: `TYPESAFE_API_KEY` in the pane shell's environment before `claude` starts (same rule as `HERDR_ORG_ROOT`; split panes inherit the herdr server's env, so put it where that process sees it). On a skyline-enforced box, pass it in the tool call's `env` parameter next to `HERDR_ORG_ROOT` (the SKYLINE-ROUTED SHELL GOTCHA in the orchestrator skill names it), or every dispatch is silently ungauged. `sh scripts/jev doctor` checks it.
 
 ---
 
