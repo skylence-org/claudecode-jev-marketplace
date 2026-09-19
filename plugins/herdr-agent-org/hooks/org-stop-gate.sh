@@ -3,8 +3,7 @@
 # not end its turn without confirming follow-up. Blocks the FIRST stop only
 # (stop_hook_active passes the second), so it costs one extra turn, not a loop.
 #
-# Carries both fixes the Solo sibling landed 2026-07-21, which the Grok/Herdr
-# port predates:
+# Two rules, both field-driven (2026-07-21):
 #   PREMISE FOLLOWS EVIDENCE. org-lane-mark.sh records dispatch and wait
 #     separately, so a session that only armed a lifecycle wait is never told it
 #     dispatched workers.

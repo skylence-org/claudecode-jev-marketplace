@@ -12,8 +12,8 @@
 # ON HERDR, START WITH live, THEN probe. `herdr pane read` strips ANSI by
 # default and `--format ansi` keeps the styling, so BOTH sources still show a
 # ghost's text: there is no styling-stripped source that renders a ghost as an
-# empty prompt line. zero-touch therefore needs Solo's raw output (or an
-# equivalent) and will call a ghost TYPED without it. That errs toward refusing
+# empty prompt line. zero-touch therefore needs a raw, styling-stripped source
+# and will call a ghost TYPED without it. That errs toward refusing
 # to send, which is safe but useless, so on a pure Herdr box the working
 # sequence is live (is the operator typing right now?) then probe.
 #
