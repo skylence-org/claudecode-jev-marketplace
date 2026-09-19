@@ -1,0 +1,971 @@
+#!/bin/sh
+# org-waker: event-driven wake-up for the herdr agent-org (marketplace#37).
+#
+# herdr invokes this script via the manifest [[events]] blocks. A registered
+# lane's settle, block, or death becomes ONE `herdr agent prompt` into the
+# registered orchestrator agent: the ring STARTS an orchestrator turn, which
+# is the thing an armed `herdr agent wait` structurally cannot do after the
+# orchestrator's own turn has ended.
+#
+# Discipline (prior art credited in README.md):
+# - Unregistered pane: exit with ZERO herdr calls (herdmates' silence rule).
+# - Ring predicate (herdmates, MIT): blocked on a blocked-edge; idle/done only
+#   on a working->terminal edge. Repeated re-emissions stay silent, so no
+#   stale-fire class exists for the orchestrator to dismiss (issue #20).
+# - Death coverage (herdr-pings, MIT): pane.exited/pane.closed on a registered
+#   lane ring as a crash; so does a status event whose `agent` label is empty
+#   while the lane is registered (agent process died before settling). An
+#   orchestrator that unregisters a lane BEFORE reaping it keeps expected
+#   deaths silent.
+# - Send safety (org law L11): two visible-frame tails of the target are
+#   compared ghost-probe-style before any prompt; a changing or non-empty
+#   input line HOLDS the wake as a pending file and raises a toast instead of
+#   stomping operator text. Held wakes are re-delivered by `drain` (manifest
+#   action, also attempted opportunistically after handled events) through a
+#   claim-by-rename queue, so concurrent handlers never double-deliver.
+#
+# Everything lives under the plugin CONFIG dir: it is the one root both the
+# handler environment (HERDR_PLUGIN_CONFIG_DIR) and a plain shell
+# (`herdr plugin config-dir skylence.org-waker`) resolve identically; herdr
+# treats the contents as plugin-owned. Layout:
+#   registry/<lane>.row pane_id  lane  todo  target  gen  org_root  registered_at  [beat_note]
+#   state/status--<pane>   last seen agent_status + agent label
+#   state/dead--<pane>     dead-ring-fired marker
+#   pending/<ms>-<lane>-g<gen>.msg   held wake: target / text / sent|unsent
+#                                    (claimed as .claim; `sent` = the prompt
+#                                    paste already reached the target, drain
+#                                    must never re-prompt it)
+#   spool/<lane>.jsonl     append-only event records (catch-up surface)
+#   log/rings.jsonl        delivery audit
+#
+# Usage:
+#   waker on-event | startup | drain | doctor | list | stats
+#   waker register --pane ID --lane NAME --target ORCH [--todo SLUG] [--org-root PATH] [--beat-note TEXT]
+#   waker unregister --lane NAME
+set -u
+
+PLUGIN_ID="skylence.org-waker"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+PROMPT_CHAR="${ORG_WAKER_PROMPT_CHAR:-❯}"
+# Exact Claude Code mid-turn queue indicator (composer line after a successful queue).
+# Conservative: full string match only — no substring guessing.
+QUEUED_HINT="Press up to edit queued messages"
+NP="$(printf '\001')NOPROMPT"
+DRAIN_CAP=5
+STALE_CLAIM_SECS=300
+DRAIN_DEBOUNCE_SECS=2
+# Evidence-only, never control flow: recover_parked_submit sets this on every
+# give-up path when it was passed a target agent name, so a caller can log
+# WHY the recovery failed (cross-org field report 2026-08-01: an
+# unconfirmed hypothesis that a busy/working target has a narrower window to
+# accept the recovery Enter). Read immediately after the call that may set
+# it; reset to "" at the top of recover_parked_submit so no run ever reads a
+# stale value left by an earlier target in the same drain loop.
+RECOVER_FAIL_STATUS=""
+# Target agent_status captured by send_prompt immediately BEFORE the paste;
+# verify_submitted's pure-clear branch needs it to know which lifecycle
+# corroboration applies (working target -> queued hint is the only proof;
+# settled target -> a started turn is the proof).
+PRE_SEND_STATUS=""
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+epoch_ms() { printf '%s000' "$(date +%s)"; }
+sane() { printf '%s' "$1" | tr ':/' '--'; }
+# Flatten newlines/tabs/CR to spaces so a beat note is one TSV field. Chosen
+# over reject: orchestrator paste with a stray newline still stores a usable line.
+flatten_note() { printf '%s' "$1" | tr '\n\t\r' '   '; }
+# with_note BASE NOTE -> BASE, or BASE. NOTE: <note> when NOTE is non-empty.
+with_note() {
+  if [ -n "$2" ]; then
+    printf '%s. NOTE: %s' "$1" "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+CFG="${HERDR_PLUGIN_CONFIG_DIR:-}"
+if [ -z "$CFG" ]; then
+  CFG=$($HERDR plugin config-dir "$PLUGIN_ID" 2>/dev/null || true)
+fi
+
+cmd=${1:-help}
+
+# Event context must never fail or spam; CLI context may speak.
+quiet=0
+case "$cmd" in on-event|startup) quiet=1 ;; esac
+
+fail() {
+  [ "$quiet" -eq 1 ] && exit 0
+  echo "waker: $*" >&2
+  exit 1
+}
+
+[ -n "$CFG" ] || fail "cannot resolve the plugin config dir (is the plugin installed/linked?)"
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+mkdir -p "$CFG/state" "$CFG/pending" "$CFG/spool" "$CFG/log" "$CFG/registry" 2>/dev/null || fail "cannot create $CFG"
+
+REGD="$CFG/registry"
+
+# --- registry -------------------------------------------------------------
+# One row file per lane (registry/<lane>.row holding a single TSV line), so
+# two concurrent registrars never read-modify-write each other's rows away.
+# The pre-0.2.0 single registry.tsv migrates in place on first touch.
+
+if [ -f "$CFG/registry.tsv" ]; then
+  while IFS="$(printf '\t')" read -r mpane mlane mrest; do
+    [ -n "$mlane" ] || continue
+    printf '%s\t%s\t%s\n' "$mpane" "$mlane" "$mrest" > "$REGD/$(sane "$mlane").row"
+  done < "$CFG/registry.tsv"
+  mv "$CFG/registry.tsv" "$CFG/registry.tsv.migrated" 2>/dev/null || true
+fi
+
+reg_row_by_lane() { cat "$REGD/$(sane "$1").row" 2>/dev/null || true; }
+reg_gen_of_lane() { reg_row_by_lane "$1" | cut -f5; }
+reg_row_by_pane() { cat "$REGD"/*.row 2>/dev/null | awk -F'\t' -v p="$1" '$1==p {print; exit}'; }
+reg_remove_lane() { rm -f "$REGD/$(sane "$1").row"; }
+
+# --- durable records ------------------------------------------------------
+
+spool_append() {
+  # spool_append LANE JSON
+  printf '%s\n' "$2" >> "$CFG/spool/$1.jsonl" 2>/dev/null || true
+}
+
+log_ring() {
+  # log_ring LANE GEN OUTCOME TEXT
+  jq -cn --arg t "$(now_utc)" --arg l "$1" --arg g "$2" --arg o "$3" --arg x "$4" \
+    '{timestamp:$t, lane:$l, gen:($g|tonumber? // 0), outcome:$o, text:$x}' \
+    >> "$CFG/log/rings.jsonl" 2>/dev/null || true
+}
+
+toast() {
+  # toast TITLE BODY  (best-effort; only from inside a herdr context)
+  [ -n "${HERDR_SOCKET_PATH:-}${HERDR_ENV:-}" ] || return 0
+  $HERDR notification show "$1" --body "$2" --sound request >/dev/null 2>&1 || true
+}
+
+# --- send safety (org L11) ------------------------------------------------
+
+# Last input-line content of a rendered tail, after ghost-probe's prompt_text
+# (plugins/herdr-agent-org-*/scripts/ghost-probe.sh). Sentinel when no prompt
+# line exists in the frame. Grok's TUI draws the composer inside a box, so the
+# extracted line after the prompt char ends with U+2502 (light vertical); strip
+# that decoration (and re-trim) so an empty grok composer classifies clear.
+# NBSP (U+00A0) counts as whitespace: some Claude TUI builds render a
+# non-breaking space after the prompt char (measured live 2026-08-02, Fable 5
+# TUI), and a plain [ \t] trim leaves it attached, misclassifying an exact
+# parked copy as foreign.
+prompt_text() {
+  printf '%s\n' "$1" | awk -v p="$PROMPT_CHAR" -v np="$NP" -v nb="$(printf '\302\240')" '
+    { i = index($0, p); if (i) { found = 1; line = substr($0, i + length(p)) } }
+    END {
+      if (!found) { print np; exit }
+      lead = "^[" nb " \t]+"; trail = "[" nb " \t\r]+$"
+      gsub(lead, "", line); gsub(trail, "", line)
+      # U+2502 box-drawing light vertical — grok TUI composer border only.
+      # Literal UTF-8 bytes (portable on macOS /usr/bin/awk; no gawk required).
+      gsub(/│/, "", line)
+      gsub(lead, "", line); gsub(trail, "", line)
+      print line
+    }
+  '
+}
+
+# 0 = composer clear and stable; 1 = hold (typing, occupied, ghost-ambiguous,
+# or unreadable). On pure Herdr a ghost is indistinguishable from typed text
+# (no styling-stripped source), so any non-empty line errs toward holding.
+composer_clear() {
+  t0=$($HERDR agent read "$1" --source visible --lines 25 --format text 2>/dev/null) || return 1
+  sleep 0.4
+  t1=$($HERDR agent read "$1" --source visible --lines 25 --format text 2>/dev/null) || return 1
+  p0=$(prompt_text "$t0")
+  p1=$(prompt_text "$t1")
+  [ "$p1" = "$NP" ] && return 1
+  [ "$p0" != "$p1" ] && return 1
+  [ -n "$p1" ] && return 1
+  return 0
+}
+# Post-send submit verification (skylore mark 90): herdr's Enter into a
+# Claude pane is timing-flaky in every direction, so a `deliver` that merely
+# returned the exit code of `agent prompt` could report "delivered" for a
+# prompt still parked, unsubmitted, on the target's composer line.
+#
+# classify_composer TAIL SENT_LINE -> prints clear|parked|queued|foreign
+# Pure text classification (no herdr calls), split out so it is unit-testable
+# with a fake tail. Reuses prompt_text (the existing prompt-line awk).
+# `queued` is the exact QUEUED_HINT text: proof the prompt entered Claude's
+# mid-turn queue (delivered-equivalent; verify_submitted trusts one read).
+classify_composer() {
+  line=$(prompt_text "$1")
+  if [ "$line" = "$NP" ] || [ -z "$line" ]; then
+    echo clear
+  elif [ "$line" = "$2" ]; then
+    echo parked
+  elif [ "$line" = "$QUEUED_HINT" ]; then
+    echo queued
+  elif printf '%s' "$line" | grep -Eq '^\[Pasted text #[0-9]+\]( \[Pasted text #[0-9]+\])*$'; then
+    # Claude Code renders any paste past its length threshold as this
+    # placeholder, so a long wake line can NEVER match `parked` by text and
+    # fell through to foreign -> held forever, operator pressing Enter by
+    # hand (measured live 2026-08-01, three orchestrator panes at once).
+    # `pasted` is parked-equivalent ONLY where the paste is provably ours
+    # (post-send verify, sent-marked drain files) — never on the pre-send
+    # hold path, where a placeholder may be the operator's own draft.
+    echo pasted
+  else
+    echo foreign
+  fi
+}
+
+# verify_submitted TARGET LINE -> 0 confirmed submitted, 1 not delivered.
+# Resolves the target's pane, settles so paste can render, then classifies
+# the composer line: clear is trusted only after a second read also says
+# clear; the exact QUEUED_HINT counts as delivered on ONE read (a rendered
+# hint is already proof the prompt queued); our own text still parked gets
+# empty-submit recovery (re-confirm parked right before each Enter; settle
+# before each re-check; one retry of the Enter itself — the submit is
+# timing-flaky; success only clear|queued — foreign fails); anything else
+# on the line is left alone and reported undelivered -- never empty-submit
+# text we did not send (fusion hazard).
+
+# recover_parked_submit PANE LINE [TARGET] -> 0 clear|queued after an empty
+# submit (or already clear|queued before Enter), 1 still parked after two
+# attempts or foreign at any re-check. Each attempt: re-read and require
+# parked immediately before pane run "" (abort without Enter on foreign;
+# treat clear|queued as already delivered), then Enter, settle (~1s),
+# re-read. Success only on clear|queued after settle — foreign is a hold,
+# never a silent delivered. Settle-before-recheck avoids the false-held
+# race where the Enter landed but the immediate re-read still saw the old
+# parked text. TARGET is optional and evidence-only: when passed, every
+# return-1 path sets RECOVER_FAIL_STATUS to the target's agent_status at
+# the moment of give-up, for a caller to log; omitted, the function's
+# control flow is unchanged from before this parameter existed.
+recover_give_up() {
+  RECOVER_FAIL_STATUS=""
+  [ -n "${1:-}" ] && RECOVER_FAIL_STATUS=$($HERDR agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  return 1
+}
+recover_parked_submit() {
+  RECOVER_FAIL_STATUS=""
+  tries=0
+  while [ "$tries" -lt 2 ]; do
+    # Re-confirm parked immediately before each Enter (fusion / mutation).
+    tail=$($HERDR pane read "$1" --source visible --lines 25 --format text 2>/dev/null) || { recover_give_up "${3:-}"; return 1; }
+    case "$(classify_composer "$tail" "$2")" in
+      clear|queued) return 0 ;;
+      parked|pasted) ;;
+      *) recover_give_up "${3:-}"; return 1 ;;
+    esac
+    $HERDR pane run "$1" "" >/dev/null 2>&1 || true
+    sleep 1
+    tail=$($HERDR pane read "$1" --source visible --lines 25 --format text 2>/dev/null) || { recover_give_up "${3:-}"; return 1; }
+    case "$(classify_composer "$tail" "$2")" in
+      clear|queued) return 0 ;;
+      parked|pasted) tries=$((tries + 1)) ;;
+      *) recover_give_up "${3:-}"; return 1 ;;
+    esac
+  done
+  recover_give_up "${3:-}"
+  return 1
+}
+
+# recover_own_text TARGET LINE -> 0 if the composer already holds EXACTLY LINE
+# and empty-submit recovery submitted it (counts as delivery; do not re-prompt).
+# Foreign/changing/empty-unstable still return 1 so the caller holds.
+recover_own_text() {
+  RECOVER_FAIL_STATUS=""
+  pane=$($HERDR agent get "$1" 2>/dev/null | jq -r '.result.agent.pane_id // empty' 2>/dev/null)
+  [ -n "$pane" ] || return 1
+  tail=$($HERDR pane read "$pane" --source visible --lines 25 --format text 2>/dev/null) || return 1
+  [ "$(classify_composer "$tail" "$2")" = "parked" ] || return 1
+  recover_parked_submit "$pane" "$2" "$1"
+}
+
+verify_submitted() {
+  pane=$($HERDR agent get "$1" 2>/dev/null | jq -r '.result.agent.pane_id // empty' 2>/dev/null)
+  [ -n "$pane" ] || return 1
+  # Paste can land after herdr returns from agent prompt; settle before the
+  # first read so a still-empty composer is not raced into a false clear.
+  sleep 1
+  tail=$($HERDR pane read "$pane" --source visible --lines 25 --format text 2>/dev/null) || return 1
+  case "$(classify_composer "$tail" "$2")" in
+    clear)
+      # First clear may be pre-render emptiness. Re-read after another settle
+      # window; if still clear, corroborate against the target's LIFECYCLE
+      # before calling it delivered. Measured live 2026-08-01 (loadavg ~20,
+      # lane donchian-port): the paste rendered SLOWER than two 1s-spaced
+      # reads, both saw an empty composer, the outcome logged "delivered",
+      # the pending file was deleted, and the ring sat parked on the
+      # composer with no machinery left watching it -- a false positive is
+      # strictly worse than a false negative here, because a hold keeps the
+      # SENT-file reconciliation alive (drain infers or recovers later,
+      # never re-pastes) while "delivered" ends the story. Corroboration:
+      # a prompt really delivered to a BUSY target renders the queued hint
+      # (handled below), so pure-clear with pre-send status "working" proves
+      # nothing -> hold. A prompt really delivered to an idle/done target
+      # STARTS a turn, so post-verify status "working" is the proof; still
+      # idle with a clear composer means nothing observably happened ->
+      # hold. A fast target that finished its whole turn inside the window
+      # lands in the hold branch too, and the drain's clear+stable
+      # inference resolves it one beat later without a duplicate.
+      sleep 1
+      tail=$($HERDR pane read "$pane" --source visible --lines 25 --format text 2>/dev/null) || return 1
+      [ "$(classify_composer "$tail" "$2")" = "clear" ] || return 1
+      case "${PRE_SEND_STATUS:-}" in
+        working)
+          RECOVER_FAIL_STATUS="working"
+          return 1
+          ;;
+      esac
+      post=$($HERDR agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+      if [ "$post" = "working" ]; then
+        return 0
+      fi
+      RECOVER_FAIL_STATUS="${post:-unknown}"
+      return 1
+      ;;
+    queued)
+      # Rendered queued hint is already proof the prompt entered the mid-turn
+      # queue; one read is enough (no double-read settle).
+      return 0
+      ;;
+    foreign) return 1 ;;
+    parked|pasted)
+      # parked: our exact text still on the line. pasted: the placeholder a
+      # long paste renders as — we verified the composer clear immediately
+      # before sending, so in THIS post-send window the placeholder is ours.
+      recover_parked_submit "$pane" "$2" "$1"
+      return $?
+      ;;
+  esac
+}
+
+hold_wake() {
+  # hold_wake LANE GEN TARGET LINE WHY SENT
+  # File line 1 is the target, line 2 the wake text, so drain never has to
+  # re-derive the target from the registry (a dead lane has no row, and
+  # guessing from another row could ring a different org's orchestrator).
+  # Line 3 is the sent marker: `sent` means the prompt paste ALREADY reached
+  # the target once (Claude Code queues every mid-turn paste, even when the
+  # composer verification afterwards is inconclusive), so drain must never
+  # re-prompt it; it may only Enter-recover a parked copy or infer submission.
+  # Measured 2026-07-30, lane i331-runtime-facts: one done event, one
+  # held:undelivered entry, 3+ actual deliveries, because every drain retry
+  # re-pasted a prompt the target had already queued.
+  # COALESCE: a lane's newer settle wake supersedes its older UNSENT holds.
+  # The ring only says "go read the board", so N piled copies deliver later
+  # as a stale barrage (measured: dockerize-tests, five held:composer rings
+  # for one lane, drained as a burst). SENT files are never touched: their
+  # paste already reached the target and the file is the only memory that
+  # prevents a duplicate. Audit invariant: every removal logs one ring line.
+  for old in "$CFG"/pending/*.msg; do
+    [ -e "$old" ] || break
+    ob=${old##*/}; obase=${ob%.msg}
+    og=${obase##*-g}
+    ol=${obase#*-}; ol=${ol%-g"$og"}
+    [ "$ol" = "$(sane "$1")" ] || continue
+    [ "$(sed -n '3p' "$old" 2>/dev/null)" = "sent" ] && continue
+    [ "$og" -le "$2" ] 2>/dev/null || continue
+    log_ring "$1" "$og" "dropped:coalesced-g$2" "$(sed -n '2p' "$old" 2>/dev/null)"
+    rm -f "$old"
+  done
+  f="$CFG/pending/$(epoch_ms)-$(sane "$1")-g$2.msg"
+  printf '%s\n%s\n%s\n' "$3" "$4" "${6:-unsent}" > "$f" 2>/dev/null || true
+  log_ring "$1" "$2" "held:$5" "$4"
+  toast "org-waker held a wake ($5)" "$4"
+}
+
+send_prompt() {
+  # send_prompt TARGET LINE -> 0 the prompt call was accepted (the paste is
+  # now in the target's hands and MUST NOT be repeated), 1 nothing was sent.
+  # No --wait even for settled targets: submit confirmation is
+  # verify_submitted's job, and a wait timeout on an accepted paste would
+  # read as failure and re-arm the exact duplicate machine this split kills.
+  tstatus=$($HERDR agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null || echo unknown)
+  PRE_SEND_STATUS="$tstatus"
+  case "$tstatus" in
+    working|idle|done)
+      $HERDR agent prompt "$1" "$2" >/dev/null 2>&1 || return 1
+      ;;
+    *)
+      # blocked: typing into an approval dialog is wrong input. unknown: no basis.
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# --- runtime acknowledgment (receiver-side hook, 0.7.0) --------------------
+# The herdr-agent-org-claude plugin installs a UserPromptSubmit hook
+# (hooks/org-ack-submit.sh) in every Claude session on the box: the moment a
+# [RING g*] / [DOORBELL] prompt actually BECOMES A TURN in the receiving
+# session, the hook writes acks/<sha256(prompt)>.ack under this plugin's
+# config dir. That is ground truth from the runtime itself; every composer
+# heuristic below is the fallback for receivers without the hook (grok
+# targets, stale plugin caches, non-org sessions).
+ack_sha() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-32
+  else
+    printf '%s' "$1" | sha256sum | cut -c1-32
+  fi
+}
+
+# ack_wait LINE SECS -> 0 (ack consumed) when the receiving session's hook
+# confirmed the prompt became a turn; 1 on timeout. Consuming removes the
+# file so a later identical wake cannot match a stale ack.
+ack_wait() {
+  sha=$(ack_sha "$1")
+  [ -n "$sha" ] || return 1
+  f="$CFG/acks/$sha.ack"
+  n=0
+  lim=$(( ${2:-5} * 2 ))
+  while [ "$n" -lt "$lim" ]; do
+    if [ -e "$f" ]; then
+      rm -f "$f"
+      return 0
+    fi
+    sleep 0.5
+    n=$((n + 1))
+  done
+  [ -e "$f" ] && { rm -f "$f"; return 0; }
+  return 1
+}
+
+# doorbell_evidence LANE TODO -> 0 when the lane's close-out doorbell
+# provably reached its target: either the doorbell script's marker
+# (state/doorbell--<slug>, written after a consumed ack or verified
+# delivery, 0.7.2) or an UNCONSUMED ack file for the canonical doorbell
+# text (0.7.3). The second leg covers workers that hand-roll
+# `herdr agent prompt` with the canonical text because the doorbell
+# script was unreachable (routed shells lose the scripts PATH, measured
+# 2026-08-02: receiver hook wrote the ack at 12:21Z, nobody consumed it,
+# the settle ring at 12:22:36Z went out anyway).
+#
+# 0.7.4: every leg tries BOTH the registry lane name and the todo slug,
+# in both text positions. The doorbell script is invoked with the TODO
+# slug while registration carries the AGENT name; when an orchestrator
+# shortens the agent name (lane interval-normalize, todo
+# interval-normalize-consolidation, measured 2026-08-02 12:5xZ) every
+# single-name key misses and the stale ring returns. Both legs consume
+# their evidence and honor a 1h freshness bound; stale evidence is
+# discarded and the ring proceeds.
+doorbell_evidence() {
+  for _n in "$1" "${2:-}"; do
+    [ -n "$_n" ] || continue
+    db="$CFG/state/doorbell--$(sane "$_n")"
+    if [ -f "$db" ]; then
+      if [ $(( $(date +%s) - $(mtime_of "$db") )) -lt 3600 ]; then
+        rm -f "$db" 2>/dev/null || true
+        return 0
+      fi
+      rm -f "$db" 2>/dev/null || true
+    fi
+  done
+  for _l in "$1" "${2:-}"; do
+    [ -n "$_l" ] || continue
+    for _s in "$1" "${2:-}"; do
+      [ -n "$_s" ] || continue
+      a="$CFG/acks/$(ack_sha "[DOORBELL] lane $_l [DONE], verdict needed. board get $_s").ack"
+      if [ -e "$a" ]; then
+        if [ $(( $(date +%s) - $(mtime_of "$a") )) -lt 3600 ]; then
+          rm -f "$a" 2>/dev/null || true
+          return 0
+        fi
+        rm -f "$a" 2>/dev/null || true
+      fi
+    done
+  done
+  return 1
+}
+
+# confirm_delivery TARGET LINE -> 0 delivered (acked or verified), 1 not.
+# Ack first: it needs zero pane reads and cannot be raced by paste-render
+# latency. Only when no ack lands does the composer machinery run.
+confirm_delivery() {
+  if ack_wait "$2" 5; then
+    return 0
+  fi
+  verify_submitted "$1" "$2"
+}
+
+deliver() {
+  # deliver TARGET LINE -> 0 delivered, 1 not (nothing sent OR unverified;
+  # callers that need the distinction use send_prompt + confirm_delivery).
+  send_prompt "$1" "$2" || return 1
+  # The prompt call alone does not prove the Enter actually submitted
+  # (skylore mark 90): ack or composer verification before calling this
+  # delivered.
+  confirm_delivery "$1" "$2"
+}
+
+ring_or_hold() {
+  # ring_or_hold LANE GEN TARGET LINE
+  if ! composer_clear "$3"; then
+    # Own-text recovery: a previously parked copy of THIS wake already sits on
+    # the composer. Empty-submit that parked copy (do not re-prompt, that would
+    # duplicate); success counts as delivery. Foreign text keeps holding.
+    if recover_own_text "$3" "$4"; then
+      log_ring "$1" "$2" "delivered" "$4"
+      return 0
+    fi
+    hold_wake "$1" "$2" "$3" "$4" "composer:status=${RECOVER_FAIL_STATUS:-unknown}" "unsent"
+    return 0
+  fi
+  if ! send_prompt "$3" "$4"; then
+    hold_wake "$1" "$2" "$3" "$4" "unsendable" "unsent"
+    return 0
+  fi
+  if ack_wait "$4" 5; then
+    log_ring "$1" "$2" "delivered:acked" "$4"
+    return 0
+  fi
+  if verify_submitted "$3" "$4"; then
+    log_ring "$1" "$2" "delivered" "$4"
+  else
+    # The paste already happened; hold as SENT so drain only recovers or
+    # infers, and never pastes a second copy.
+    hold_wake "$1" "$2" "$3" "$4" "unverified:status=${RECOVER_FAIL_STATUS:-unknown}" "sent"
+  fi
+}
+
+# --- pending queue --------------------------------------------------------
+
+sweep_stale_claims() {
+  now=$(date +%s)
+  for c in "$CFG"/pending/*.claim; do
+    [ -e "$c" ] || break
+    age=$(( now - $(mtime_of "$c") ))
+    [ "$age" -ge "$STALE_CLAIM_SECS" ] && mv "$c" "${c%.claim}" 2>/dev/null || true
+  done
+  # Acks nobody consumed (receiver hook fired but the sender's wait had
+  # already timed out and the composer machinery resolved the wake) go
+  # stale after an hour; consuming machinery always rm's on match, so
+  # anything old is an orphan.
+  for a in "$CFG"/acks/*.ack; do
+    [ -e "$a" ] || break
+    age=$(( now - $(mtime_of "$a") ))
+    [ "$age" -ge 3600 ] && rm -f "$a" 2>/dev/null || true
+  done
+}
+
+do_drain() {
+  sweep_stale_claims
+  # Claim up to DRAIN_CAP files in order; group the survivors per target.
+  n=0
+  claimed=""
+  for f in "$CFG"/pending/*.msg; do
+    [ -e "$f" ] || break
+    [ "$n" -ge "$DRAIN_CAP" ] && break
+    mv "$f" "$f.claim" 2>/dev/null || continue   # rename winner owns delivery
+    claimed="$claimed$f.claim
+"
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || return 0
+
+  # A pending wake is dropped only when its lane was RE-registered at a higher
+  # generation (superseded by a re-dispatch). A lane absent from the registry
+  # still delivers: dead rings outlive their row by design.
+  printf '%s' "$claimed" | while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    base=${c##*/}; base=${base%.msg.claim}
+    gen=${base##*-g}
+    lane=${base#*-}; lane=${lane%-g"$gen"}
+    cur=$(reg_gen_of_lane "$lane")
+    if [ -n "$cur" ] && [ "$cur" -gt "$gen" ] 2>/dev/null; then
+      log_ring "$lane" "$gen" "dropped:superseded-g$cur" "$(cat "$c" 2>/dev/null)"
+      rm -f "$c"
+      continue
+    fi
+    target=$(head -n 1 "$c" 2>/dev/null)
+    line=$(sed -n '2p' "$c" 2>/dev/null)
+    sent=$(sed -n '3p' "$c" 2>/dev/null)   # absent on pre-marker files = unsent
+    if [ -z "$target" ] || [ -z "$line" ]; then
+      log_ring "$lane" "$gen" "dropped:malformed" "$(cat "$c" 2>/dev/null | tr '\n' ' ')"
+      rm -f "$c"
+      continue
+    fi
+    if [ "$sent" = "sent" ]; then
+      # This wake's paste already reached the target once. NEVER re-prompt:
+      # Claude Code queued that paste even though verification could not
+      # confirm it, so a second prompt is a guaranteed duplicate. Legal moves
+      # only: a LATE ACK from the receiver hook (the paste's turn started
+      # after the sender's wait timed out), infer submission from a
+      # clear+stable composer (a paste cannot leave the composer without
+      # submitting or queueing), Enter-recover a parked copy of our exact
+      # text, or accept the rendered queued hint.
+      if ack_wait "$line" 0; then
+        log_ring "$lane" "$gen" "drain-delivered:acked" "$line"
+        rm -f "$c"
+      elif composer_clear "$target"; then
+        log_ring "$lane" "$gen" "drain-delivered:inferred" "$line"
+        rm -f "$c"
+      elif recover_own_text "$target" "$line"; then
+        log_ring "$lane" "$gen" "drain-delivered" "$line"
+        rm -f "$c"
+      else
+        pane=$($HERDR agent get "$target" 2>/dev/null | jq -r '.result.agent.pane_id // empty' 2>/dev/null)
+        tail=""
+        [ -n "$pane" ] && tail=$($HERDR pane read "$pane" --source visible --lines 25 --format text 2>/dev/null)
+        cls=""
+        [ -n "$tail" ] && cls=$(classify_composer "$tail" "$line")
+        if [ "$cls" = "queued" ]; then
+          log_ring "$lane" "$gen" "drain-delivered" "$line"
+          rm -f "$c"
+        elif [ "$cls" = "pasted" ] && [ -n "$pane" ] && recover_parked_submit "$pane" "$line" "$target"; then
+          # A placeholder on a SENT file is our own paste rendered as
+          # [Pasted text #N] (the composer was verified clear before we
+          # sent). Narrow fusion window: an operator paste landing after the
+          # failed verify would be submitted here — accepted over holding
+          # forever, which measured as the operator pressing Enter by hand.
+          log_ring "$lane" "$gen" "drain-delivered" "$line"
+          rm -f "$c"
+        else
+          mv "$c" "${c%.claim}" 2>/dev/null || true
+          # Foreign text or unreadable target: keep holding, in order.
+          break
+        fi
+      fi
+      continue
+    fi
+    if composer_clear "$target"; then
+      if ! send_prompt "$target" "$line"; then
+        mv "$c" "${c%.claim}" 2>/dev/null || true
+        # Target still unreachable: later entries would fail the same way, and
+        # delivering out of order is worse than waiting (herdmates' break rule).
+        break
+      fi
+      if confirm_delivery "$target" "$line"; then
+        log_ring "$lane" "$gen" "drain-delivered" "$line"
+        rm -f "$c"
+      else
+        # The paste already reached the target. Restoring this file UNSENT
+        # would re-arm the duplicate machine on the next drain (the #87
+        # class, reborn on the drain path: measured as N identical wakes
+        # queueing mid-turn and firing back-to-back). Rewrite as SENT so
+        # later drains only infer, Enter-recover, or accept the queued hint.
+        printf '%s\n%s\n%s\n' "$target" "$line" "sent" > "${c%.claim}" 2>/dev/null || true
+        rm -f "$c"
+        log_ring "$lane" "$gen" "held:unverified:status=${RECOVER_FAIL_STATUS:-unknown}" "$line"
+        break
+      fi
+    elif recover_own_text "$target" "$line"; then
+      # Pending wake's own text already parked on the target composer — recover
+      # with empty submit instead of holding forever behind L11.
+      log_ring "$lane" "$gen" "drain-delivered" "$line"
+      rm -f "$c"
+    else
+      mv "$c" "${c%.claim}" 2>/dev/null || true
+      # Target still unreachable: later entries would fail the same way, and
+      # delivering out of order is worse than waiting (herdmates' break rule).
+      break
+    fi
+  done
+  return 0
+}
+
+maybe_drain() {
+  # Opportunistic post-event drain, debounced by a marker file (a fresh
+  # process handles every event, so in-memory state cannot debounce).
+  set -- "$CFG"/pending/*.msg
+  [ -e "$1" ] || return 0
+  marker="$CFG/state/drain-last"
+  now=$(date +%s)
+  last=$(mtime_of "$marker")
+  [ $(( now - last )) -lt "$DRAIN_DEBOUNCE_SECS" ] && return 0
+  touch "$marker" 2>/dev/null || true
+  do_drain
+}
+
+# --- subcommands ----------------------------------------------------------
+
+cmd_on_event() {
+  # Normalize the event name to underscore form. Measured on herdr 0.7.5
+  # (2026-07-28): HERDR_PLUGIN_EVENT arrives dot-form (pane.exited) while the
+  # payload envelope's .event is underscore (pane_exited); tolerate both.
+  ev=$(printf '%s' "${HERDR_PLUGIN_EVENT:-}" | tr '.' '_')
+  [ -n "$ev" ] || ev=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | jq -r '.event // empty' 2>/dev/null)
+  # pane.focused is subscribed ONLY as a drain heartbeat: held wakes get a
+  # retry whenever the operator moves focus, instead of waiting for the next
+  # lane event. No trace line (focus changes are frequent), no payload parse.
+  if [ "$ev" = "pane_focused" ]; then
+    maybe_drain
+    exit 0
+  fi
+  # One trace line per lane-relevant event; herdr keeps handler stderr in
+  # `herdr plugin log list`, so this is the observability surface.
+  printf 'on-event ev=%s json=%.160s\n' "${ev:-none}" "${HERDR_PLUGIN_EVENT_JSON:-none}" >&2
+  # NOTE: never write ${VAR:-{}} in sh: the first } ends the expansion,
+  # appending a literal brace that makes jq exit nonzero on trailing garbage.
+  payload=${HERDR_PLUGIN_EVENT_JSON:-}
+  [ -n "$payload" ] || payload='{}'
+  data=$(printf '%s' "$payload" | jq -c '.data // .' 2>/dev/null) || exit 0
+  pane=$(printf '%s' "$data" | jq -r '.pane_id // empty')
+  [ -n "$pane" ] || exit 0
+
+  row=$(reg_row_by_pane "$pane")
+  [ -n "$row" ] || exit 0          # unregistered pane: total silence
+
+  lane=$(printf '%s' "$row" | cut -f2)
+  todo=$(printf '%s' "$row" | cut -f3)
+  target=$(printf '%s' "$row" | cut -f4)
+  gen=$(printf '%s' "$row" | cut -f5)
+  # Field 8 optional beat note (absent on pre-note 7-field rows).
+  note=$(printf '%s' "$row" | cut -f8)
+  ptr="board get ${todo:-$lane}"
+  sp="$CFG/state/status--$(sane "$pane")"
+  dm="$CFG/state/dead--$(sane "$pane")"
+
+  case "$ev" in
+    pane_agent_status_changed)
+      status=$(printf '%s' "$data" | jq -r '.agent_status // empty')
+      agent=$(printf '%s' "$data" | jq -r '.agent // empty')
+      prev=$(cut -f1 "$sp" 2>/dev/null || true)
+      printf '%s\t%s\n' "$status" "$agent" > "$sp" 2>/dev/null || true
+      spool_append "$lane" "$(jq -cn --arg e agent_status_changed --arg p "$pane" --arg l "$lane" \
+        --arg s "$status" --arg a "$agent" --arg g "$gen" --arg t "$(now_utc)" \
+        '{event:$e, pane_id:$p, lane:$l, agent_status:$s, agent:$a, gen:($g|tonumber? // 0), timestamp:$t}')"
+
+      if [ -z "$agent" ]; then
+        # Agent label gone while registered: the process died (herdr-pings'
+        # early-crash watchdog insight). Ring once per generation.
+        if [ ! -f "$dm" ]; then
+          touch "$dm" 2>/dev/null || true
+          ring_or_hold "$lane" "$gen" "$target" \
+            "$(with_note "[RING g${gen}] lane ${lane}: agent process GONE (last status ${status:-unknown}). Crash-class: ${ptr}, consider a replacer." "$note")"
+        fi
+      else
+        ring=0
+        case "$status" in
+          blocked)   [ "$prev" != "blocked" ] && ring=1 ;;
+          idle|done)
+            if [ "$prev" = "working" ]; then
+              ring=1
+              # A confirmed close-out doorbell already became a turn in the
+              # target session for THIS lane, so the settle ring would land
+              # after the orchestrator's accept beat as a guaranteed-stale
+              # duplicate (measured 5/5 healthy lane completions,
+              # 2026-08-02). Evidence legs live in doorbell_evidence():
+              # script marker (0.7.2) or unconsumed canonical-text ack
+              # (0.7.3). Crash and blocked paths never consult it; no
+              # evidence means the ring stays the safety net.
+              if doorbell_evidence "$lane" "$todo"; then
+                log_ring "$lane" "$gen" "suppressed:doorbell-acked" ""
+                ring=0
+              fi
+            fi
+            ;;
+        esac
+        [ "$ring" -eq 1 ] && ring_or_hold "$lane" "$gen" "$target" \
+          "$(with_note "[RING g${gen}] lane ${lane} -> ${status}. ${ptr}" "$note")"
+      fi
+      ;;
+    pane_exited|pane_closed)
+      code=$(printf '%s' "$data" | jq -r '.exit_code // empty')
+      spool_append "$lane" "$(jq -cn --arg e "$ev" --arg p "$pane" --arg l "$lane" \
+        --arg c "$code" --arg g "$gen" --arg t "$(now_utc)" \
+        '{event:$e, pane_id:$p, lane:$l, exit_code:($c|tonumber? // null), gen:($g|tonumber? // 0), timestamp:$t}')"
+      # Still registered at death = unexpected. (Expected close-out
+      # unregisters BEFORE reaping, so this path stays silent for it.)
+      reg_remove_lane "$lane"
+      rm -f "$sp" "$dm" 2>/dev/null || true
+      ring_or_hold "$lane" "$gen" "$target" \
+        "$(with_note "[RING g${gen}] lane ${lane} PANE ${ev#pane_}${code:+ (exit ${code})} while registered. Crash-class: ${ptr}, consider a replacer." "$note")"
+      ;;
+    *)
+      log_ring "$lane" "$gen" "ignored-event:${ev:-none}" ""
+      ;;
+  esac
+
+  maybe_drain
+  exit 0
+}
+
+cmd_register() {
+  pane=""; lane=""; target=""; todo=""; beat_note=""; org_root="${HERDR_ORG_ROOT:-}"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --pane) pane=$2; shift 2 ;;
+      --lane) lane=$2; shift 2 ;;
+      --target) target=$2; shift 2 ;;
+      --todo) todo=$2; shift 2 ;;
+      --beat-note) beat_note=$(flatten_note "$2"); shift 2 ;;
+      --org-root) org_root=$2; shift 2 ;;
+      *) fail "register: unknown arg $1" ;;
+    esac
+  done
+  [ -n "$pane" ] && [ -n "$lane" ] && [ -n "$target" ] || fail "register needs --pane, --lane, --target"
+  [ "$pane" = "$target" ] && fail "register: a lane cannot target its own pane"
+  gen=1
+  old=$(reg_gen_of_lane "$lane")
+  [ -n "$old" ] && gen=$((old + 1))
+  tmp=$(mktemp "${TMPDIR:-/tmp}/org-waker.XXXXXX") || fail "mktemp failed"
+  # Field 8 (beat_note) only when set: no-flag register keeps today's 7-field row.
+  if [ -n "$beat_note" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$lane" "$todo" "$target" "$gen" "$org_root" "$(now_utc)" "$beat_note" > "$tmp" \
+      && mv "$tmp" "$REGD/$(sane "$lane").row" || fail "cannot write registry row"
+  else
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$lane" "$todo" "$target" "$gen" "$org_root" "$(now_utc)" > "$tmp" \
+      && mv "$tmp" "$REGD/$(sane "$lane").row" || fail "cannot write registry row"
+  fi
+  rm -f "$CFG/state/status--$(sane "$pane")" "$CFG/state/dead--$(sane "$pane")" 2>/dev/null || true
+  rm -f "$CFG/state/doorbell--$(sane "$lane")" 2>/dev/null || true
+  printf '{"registered":"%s","pane":"%s","target":"%s","gen":%s}\n' "$lane" "$pane" "$target" "$gen"
+}
+
+cmd_unregister() {
+  lane=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --lane) lane=$2; shift 2 ;;
+      *) fail "unregister: unknown arg $1" ;;
+    esac
+  done
+  [ -n "$lane" ] || fail "unregister needs --lane"
+  row=$(reg_row_by_lane "$lane")
+  pane=$(printf '%s' "$row" | cut -f1)
+  reg_remove_lane "$lane"
+  rm -f "$CFG/state/doorbell--$(sane "$lane")" 2>/dev/null || true
+  [ -n "$pane" ] && rm -f "$CFG/state/status--$(sane "$pane")" "$CFG/state/dead--$(sane "$pane")" 2>/dev/null
+  # Close-out purge of held wakes for this lane. Every permanent removal of a
+  # pending .msg/.claim must write exactly one rings.jsonl line (audit
+  # invariant). A silent rm left held:undelivered lying when a late-landing
+  # Enter had already delivered the wake and unregister then ate the file.
+  # Parse filenames exactly: a bare glob would also purge lanes this one
+  # suffixes (rev-<lane> is real reviewer naming).
+  for f in "$CFG"/pending/*.msg "$CFG"/pending/*.claim; do
+    [ -e "$f" ] || continue
+    b=${f##*/}
+    case "$b" in
+      *.msg.claim) base=${b%.msg.claim} ;;
+      *.msg)       base=${b%.msg} ;;
+      *)           continue ;;
+    esac
+    g=${base##*-g}
+    l=${base#*-}; l=${l%-g"$g"}
+    if [ "$l" = "$(sane "$lane")" ]; then
+      text=$(sed -n '2p' "$f" 2>/dev/null || true)
+      [ -n "$text" ] || text=$(tr '\n' ' ' < "$f" 2>/dev/null || true)
+      log_ring "$lane" "$g" "dropped:unregistered" "$text"
+      rm -f "$f"
+    fi
+  done
+  printf '{"unregistered":"%s"}\n' "$lane"
+}
+
+cmd_list() {
+  echo "registry ($REGD):"
+  set -- "$REGD"/*.row
+  if [ -e "$1" ]; then
+    printf 'PANE\tLANE\tTODO\tTARGET\tGEN\tORG_ROOT\tREGISTERED\n'
+    cat "$REGD"/*.row
+  else
+    echo "  (empty)"
+  fi
+  set -- "$CFG"/pending/*.msg
+  if [ -e "$1" ]; then echo "pending: $#"; else echo "pending: 0"; fi
+}
+
+cmd_startup() {
+  sweep_stale_claims
+  # Reconcile: an event that fired while the server was down is lost forever,
+  # so a registered lane whose PANE no longer exists at startup gets its
+  # crash ring synthesized here. Panes that still exist are left to the live
+  # event stream, because agent detection may still be settling right after
+  # restore and ringing on it now would false-positive. Iterate a snapshot:
+  # the ring path rewrites the registry.
+  set -- "$REGD"/*.row
+  if [ -e "$1" ]; then
+    cat "$REGD"/*.row 2>/dev/null | while IFS="$(printf '\t')" read -r pane lane todo target gen rest; do
+      [ -n "$pane" ] || continue
+      $HERDR pane get "$pane" >/dev/null 2>&1 && continue
+      # rest is org_root\tregistered_at[\tbeat_note]; field 8 of the full row is the note.
+      note=$(printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pane" "$lane" "$todo" "$target" "$gen" "$rest" | cut -f8)
+      spool_append "$lane" "$(jq -cn --arg p "$pane" --arg l "$lane" --arg g "$gen" --arg t "$(now_utc)" \
+        '{event:"pane_missing_at_startup", pane_id:$p, lane:$l, gen:($g|tonumber? // 0), timestamp:$t}')"
+      reg_remove_lane "$lane"
+      rm -f "$CFG/state/status--$(sane "$pane")" "$CFG/state/dead--$(sane "$pane")" 2>/dev/null || true
+      ring_or_hold "$lane" "$gen" "$target" \
+        "$(with_note "[RING g${gen}] lane ${lane} PANE MISSING at startup (its death event was lost while the server was down). Crash-class: board get ${todo:-$lane}, consider a replacer." "$note")"
+    done
+  fi
+  set -- "$CFG"/pending/*.msg
+  [ -e "$1" ] || exit 0
+  toast "org-waker: $# held wake(s) pending" "Run the drain action (herdr plugin action invoke drain --plugin $PLUGIN_ID) or wait for the next lane event."
+  exit 0
+}
+
+cmd_doctor() {
+  echo "org-waker doctor"
+  echo "  plugin id : $PLUGIN_ID"
+  echo "  config dir: $CFG"
+  echo "  herdr     : $($HERDR --version 2>/dev/null || echo MISSING)"
+  echo "  jq        : $(command -v jq || echo MISSING)"
+  rows=0
+  set -- "$REGD"/*.row
+  [ -e "$1" ] && rows=$#
+  echo "  registered lanes: $rows"
+  [ "$rows" -gt 0 ] && cat "$REGD"/*.row | sed 's/^/    /'
+  set -- "$CFG"/pending/*.msg
+  if [ -e "$1" ]; then echo "  pending wakes: $#"; else echo "  pending wakes: 0"; fi
+  set -- "$CFG"/pending/*.claim
+  [ -e "$1" ] && echo "  in-flight claims: $#"
+  if [ -f "$CFG/log/rings.jsonl" ]; then
+    echo "  last rings:"
+    tail -n 5 "$CFG/log/rings.jsonl" | sed 's/^/    /'
+  fi
+  exit 0
+}
+
+cmd_stats() {
+  echo "org-waker stats"
+  echo "  config dir: $CFG"
+  rings="$CFG/log/rings.jsonl"
+  if [ -s "$rings" ]; then
+    echo "  ring outcomes:"
+    jq -s -r 'group_by(.outcome) | map("    \(.[0].outcome): \(length)") | .[]' "$rings" 2>/dev/null
+    echo "  ring lanes:"
+    jq -s -r 'group_by(.lane) | map("    \(.[0].lane): \(length)") | .[]' "$rings" 2>/dev/null
+  else
+    echo "  ring outcomes: 0"
+    echo "  ring lanes: 0"
+  fi
+  set -- "$CFG"/pending/*.msg
+  if [ -e "$1" ]; then
+    count=$#
+    now=$(date +%s)
+    oldest=""
+    for f in "$@"; do
+      m=$(mtime_of "$f")
+      if [ -z "$oldest" ] || [ "$m" -lt "$oldest" ]; then oldest=$m; fi
+    done
+    age_min=$(( (now - oldest) / 60 ))
+    echo "  pending wakes: $count (oldest age: ${age_min}m)"
+  else
+    echo "  pending wakes: 0"
+  fi
+  set -- "$CFG"/pending/*.claim
+  if [ -e "$1" ]; then
+    echo "  in-flight claims: $#"
+  else
+    echo "  in-flight claims: 0"
+  fi
+  exit 0
+}
+
+case "$cmd" in
+  on-event)   shift; cmd_on_event ;;
+  startup)    shift; cmd_startup ;;
+  drain)      shift; do_drain; exit 0 ;;
+  doctor)     shift; cmd_doctor ;;
+  list)       shift; cmd_list ;;
+  stats)      shift; cmd_stats ;;
+  register)   shift; cmd_register "$@" ;;
+  unregister) shift; cmd_unregister "$@" ;;
+  help|-h|--help)
+    awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
+    ;;
+  *) fail "unknown subcommand $cmd (try: waker help)" ;;
+esac

@@ -1,0 +1,42 @@
+id = "skylence.org-waker"
+name = "Org Waker"
+version = "0.7.4"
+description = "Event-driven wake-up for the herdr agent-org: rings the registered orchestrator agent when a registered lane settles, blocks, or dies. Unregistered panes are ignored entirely."
+min_herdr_version = "0.7.4"
+platforms = ["macos", "linux"]
+
+# One handler for the three lifecycle events the org cares about. The manifest
+# uses the dot-form event names; HERDR_PLUGIN_EVENT_JSON carries the
+# underscore form (herdmates hook.rs enforces the same split).
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "waker", "on-event"]
+
+[[events]]
+on = "pane.exited"
+command = ["sh", "waker", "on-event"]
+
+[[events]]
+on = "pane.closed"
+command = ["sh", "waker", "on-event"]
+
+# Heartbeat only: pane.focused retries held wakes whenever the operator moves
+# focus; the handler exits before any payload parse or trace line.
+[[events]]
+on = "pane.focused"
+command = ["sh", "waker", "on-event"]
+
+# After session restore: sweep stale delivery claims and toast if held wakes
+# survived the restart, so nothing stays silently parked.
+[[startup]]
+command = ["sh", "waker", "startup"]
+
+[[actions]]
+id = "drain"
+title = "Deliver held org wakes"
+command = ["sh", "waker", "drain"]
+
+[[actions]]
+id = "doctor"
+title = "Check org-waker"
+command = ["sh", "waker", "doctor"]

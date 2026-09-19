@@ -1,0 +1,178 @@
+#!/bin/sh
+# nudge-deliver: content-free turn-starter for a relay recipient that has
+# unconsumed backlog and no active relay_await. Invoked by the org-relay
+# daemon's nudge watchdog (src/main.rs) as:
+#
+#   sh nudge-deliver <agent-name> <canonical-nudge-text>
+#
+# Prints ONE outcome word as its LAST stdout line (the daemon logs it to the
+# `nudge` stream) and always exits 0 — a delivery problem is an outcome, not
+# an error; the watchdog retries after its cooldown.
+#
+# Delivery discipline is a deliberately simplified cut of org-waker's
+# send/verify/recover pipeline (herdr-plugins/org-waker/waker: prompt_text,
+# classify_composer, recover_parked_submit — credit where the scar tissue
+# came from). Simplification is SAFE here, where it was not for the waker,
+# because a nudge is content-free and idempotent: a lost nudge re-fires after
+# the watchdog cooldown, a duplicate costs one relay_inbox read, and the
+# canonical text is deterministic per recipient so our own parked copy is
+# exact-matchable. The waker's pending queue, sent markers, and drain existed
+# because rings carried CONTENT that must never double-deliver or vanish.
+#
+# Outcomes (last stdout line):
+#   delivered                  prompt landed, target turn started
+#   delivered-queued           target mid-turn; prompt entered its queue
+#   delivered-recovered        parked after send; empty-submit landed it
+#   delivered-recovered-prior  a PREVIOUS nudge was parked; submitted it
+#   sent-unverified            sent, but frame/composer not readable (tiny pane)
+#   unconfirmed                composer clear yet no turn observed; retry later
+#   parked                     still parked after recovery; retry later
+#   held-foreign|held-unstable|held-pasted  composer not safely ours; held
+#   skip-working|skip-blocked|skip-queued   target state makes a nudge moot
+#   no-agent|prompt-failed|read-failed|jq-missing|herdr-missing  environment
+set -u
+
+PROMPT_CHAR="${ORG_RELAY_PROMPT_CHAR:-❯}"
+NP="$(printf '\001')NOPROMPT"
+QUEUED_HINT="Press up to edit queued messages"
+
+# prompt_text TAIL: content of the LAST composer line after PROMPT_CHAR,
+# trimmed; NP sentinel when no prompt line exists in the frame. Borrowed from
+# org-waker (NBSP counts as whitespace; grok's │ box border strips to empty) —
+# see that file for the field notes behind each rule.
+prompt_text() {
+  printf '%s\n' "$1" | awk -v p="$PROMPT_CHAR" -v np="$NP" -v nb="$(printf '\302\240')" '
+    { i = index($0, p); if (i) { found = 1; line = substr($0, i + length(p)) } }
+    END {
+      if (!found) { print np; exit }
+      lead = "^[" nb " \t]+"; trail = "[" nb " \t\r]+$"
+      gsub(lead, "", line); gsub(trail, "", line)
+      gsub(/│/, "", line)
+      gsub(lead, "", line); gsub(trail, "", line)
+      print line
+    }
+  '
+}
+
+# classify TAIL TEXT -> none|clear|ours|queued|pasted|foreign
+# OURS is exact-match OR tag-prefix: the TUI draws the composer with its own
+# soft wraps at render time (every read source returns the FIRST visual
+# fragment as the prompt line — recent-unwrapped only unwraps scrollback, not
+# the live composer), so a parked nudge longer than one visual line can never
+# exact-match. A prompt line beginning with the [RELAY-NUDGE] tag can only be
+# a nudge, and recovering a nudge is safe by construction: content-free and
+# idempotent, so an empty submit costs at most one relay_inbox no-op even if
+# it were somehow not this recipient's copy. Anything else stays foreign.
+classify() {
+  line=$(prompt_text "$1")
+  if [ "$line" = "$NP" ]; then echo none
+  elif [ -z "$line" ]; then echo clear
+  elif [ "$line" = "$2" ]; then echo ours
+  else
+    case "$line" in
+      "[RELAY-NUDGE]"*) echo ours; return ;;
+    esac
+    if [ "$line" = "$QUEUED_HINT" ]; then echo queued
+    elif printf '%s' "$line" | grep -Eq '^\[Pasted text #[0-9]+\]( \[Pasted text #[0-9]+\])*$'; then echo pasted
+    else echo foreign
+    fi
+  fi
+}
+
+# Test hook (no herdr needed): classify a tail from stdin against $2.
+if [ "${1:-}" = "--classify" ]; then
+  tail_in=$(cat)
+  classify "$tail_in" "${2:-}"
+  exit 0
+fi
+
+NAME="${1:-}"; TEXT="${2:-}"
+if [ -z "$NAME" ] || [ -z "$TEXT" ]; then
+  echo "usage: nudge-deliver <agent-name> <text>" >&2
+  echo usage-error
+  exit 0
+fi
+HERDR="${HERDR_BIN_PATH:-herdr}"
+command -v jq >/dev/null 2>&1 || { echo jq-missing; exit 0; }
+command -v "$HERDR" >/dev/null 2>&1 || { echo herdr-missing; exit 0; }
+
+agent_status() { "$HERDR" agent get "$NAME" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null; }
+# recent-unwrapped so scrollback lines come back logical; note the COMPOSER is
+# TUI-rendered and soft-wraps regardless of source (measured live 2026-08-04,
+# twice) — the tag-prefix branch in classify is what makes a wrapped parked
+# nudge recognizable, not the read source.
+read_tail() { "$HERDR" agent read "$NAME" --source recent-unwrapped --lines 40 --format text 2>/dev/null; }
+row=$("$HERDR" agent list 2>/dev/null | jq -r --arg n "$NAME" '.result.agents[]? | select(.name==$n) | .pane_id + " " + .agent_status' 2>/dev/null | head -1)
+[ -n "$row" ] || { echo no-agent; exit 0; }
+PANE=${row%% *}
+STATUS=${row#* }
+# A working target is alive and will re-arm or sweep on its own; a blocked one
+# has a permission UI up that a prompt cannot get past.
+[ "$STATUS" = "working" ] && { echo skip-working; exit 0; }
+[ "$STATUS" = "blocked" ] && { echo skip-blocked; exit 0; }
+
+# recover_ours OUTCOME: empty-submit our own parked text, re-confirming it is
+# still ours immediately before each Enter (fusion hazard); up to 2 attempts.
+recover_ours() {
+  tries=0
+  while [ "$tries" -lt 2 ]; do
+    t=$(read_tail) || { echo read-failed; return; }
+    case "$(classify "$t" "$TEXT")" in
+      clear|queued) echo "$1"; return ;;
+      ours|pasted) ;;
+      *) echo held-foreign; return ;;
+    esac
+    "$HERDR" pane run "$PANE" "" >/dev/null 2>&1 || true
+    sleep 1
+    t=$(read_tail) || { echo read-failed; return; }
+    case "$(classify "$t" "$TEXT")" in
+      clear|queued) echo "$1"; return ;;
+      ours|pasted) tries=$((tries + 1)) ;;
+      *) echo held-foreign; return ;;
+    esac
+  done
+  echo parked
+}
+
+# Pre-send composer guard: two reads 0.4s apart; anything not clearly empty or
+# our own prior nudge holds this round (the watchdog retries after cooldown).
+t0=$(read_tail) || { echo read-failed; exit 0; }
+sleep 0.4
+t1=$(read_tail) || { echo read-failed; exit 0; }
+c0=$(classify "$t0" "$TEXT")
+c1=$(classify "$t1" "$TEXT")
+[ "$c0" = "$c1" ] || { echo held-unstable; exit 0; }
+case "$c1" in
+  foreign) echo held-foreign; exit 0 ;;
+  pasted)  echo held-pasted;  exit 0 ;;
+  queued)  echo skip-queued;  exit 0 ;;
+  ours)    recover_ours delivered-recovered-prior; exit 0 ;;
+esac
+# c1 is clear, or none (pane too small to render a composer): send, then fall
+# back to lifecycle corroboration where the composer cannot be read.
+
+"$HERDR" agent prompt "$NAME" "$TEXT" >/dev/null 2>&1 || { echo prompt-failed; exit 0; }
+sleep 1
+t=$(read_tail) || { echo sent-unverified; exit 0; }
+case "$(classify "$t" "$TEXT")" in
+  queued) echo delivered-queued; exit 0 ;;
+  ours|pasted) recover_ours delivered-recovered; exit 0 ;;
+  foreign) echo held-foreign; exit 0 ;;
+  none)
+    post=$(agent_status)
+    [ "$post" = "working" ] && { echo delivered; exit 0; }
+    echo sent-unverified; exit 0 ;;
+  clear)
+    # First clear may be pre-render emptiness (org-waker measured a paste
+    # rendering slower than two spaced reads under load). Re-read, then
+    # corroborate against the lifecycle before calling it delivered.
+    sleep 1
+    t=$(read_tail) || { echo sent-unverified; exit 0; }
+    case "$(classify "$t" "$TEXT")" in
+      queued) echo delivered-queued; exit 0 ;;
+      ours|pasted) recover_ours delivered-recovered; exit 0 ;;
+    esac
+    post=$(agent_status)
+    [ "$post" = "working" ] && { echo delivered; exit 0; }
+    echo unconfirmed; exit 0 ;;
+esac

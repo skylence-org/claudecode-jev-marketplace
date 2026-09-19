@@ -1,0 +1,402 @@
+#!/bin/sh
+# awctx — ActivityWatch context for LLM agents (herdr plugin skylence.aw-context).
+# Pull-only reader of the local aw-server REST API: compact, agent-readable
+# answers about what the human is actually doing at the desktop.
+# POSIX sh; needs curl + jq; macOS and Linux.
+set -eu
+
+SERVER="${AWCTX_SERVER:-http://127.0.0.1:5600}"
+API="$SERVER/api/0"
+
+die() { printf 'awctx: %s\n' "$*" >&2; exit 1; }
+
+need_jq() { command -v jq >/dev/null 2>&1 || die 'jq not found on PATH'; }
+
+fetch() { curl -sf --max-time 5 "$@"; }
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# $1 = minutes back from now, ISO8601 UTC. BSD date first, GNU fallback.
+ago_iso() {
+  date -u -v-"$1"M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# First bucket id of type $1 (currentwindow | afkstatus); empty when the
+# watcher is absent; nonzero exit only when aw-server is unreachable.
+bucket_of() {
+  fetch "$API/buckets/" \
+    | jq -r --arg t "$1" 'to_entries | map(select(.value.type == $t)) | (.[0].key // empty)'
+}
+
+# Shared jq defs. AW timestamps carry fractional seconds and a +00:00 offset
+# that fromdateiso8601 rejects; clean_ts normalizes to plain Z form.
+JQ_DEFS='
+def clean_ts: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z");
+def epoch: clean_ts | fromdateiso8601;
+def tod: clean_ts | sub("^[0-9-]+T"; "");
+def hms: floor as $s
+  | if $s >= 3600 then "\(($s/3600)|floor)h\((($s%3600)/60)|floor)m"
+    elif $s >= 60 then "\(($s/60)|floor)m\($s%60)s"
+    else "\($s)s" end;
+'
+
+cmd_now() {
+  need_jq
+  wb=$(bucket_of currentwindow) || die "aw-server unreachable at $SERVER"
+  [ -n "$wb" ] || die 'no currentwindow bucket (is aw-watcher-window running?)'
+  ab=$(bucket_of afkstatus)
+  win=$(fetch "$API/buckets/$wb/events?limit=1")
+  afk='[]'
+  [ -z "$ab" ] || afk=$(fetch "$API/buckets/$ab/events?limit=1")
+  jq -rn --argjson w "$win" --argjson a "$afk" "$JQ_DEFS"'
+    now as $now | ($w[0] // null) as $we | ($a[0] // null) as $ae
+    | (if $ae == null then "unknown (no afk watcher)"
+       else (($now - (($ae.timestamp|epoch) + $ae.duration)) | floor) as $age
+       | "\(if $ae.data.status == "not-afk" then "active" else "afk" end) (heartbeat \($age)s old)"
+       end) as $presence
+    | if $we == null then "presence:  \($presence)\nwindow:    no events yet"
+      else (($now - (($we.timestamp|epoch) + $we.duration)) | floor) as $wage
+      | "presence:  \($presence)\n"
+        + "app:       \($we.data.app // "?")\n"
+        + "title:     \($we.data.title // "?")\n"
+        + "since:     \($we.timestamp|tod) UTC, for \($we.duration|hms)\n"
+        + "data age:  \($wage)s"
+      end'
+}
+
+cmd_recent() {
+  need_jq
+  mins=${1:-30}
+  wb=$(bucket_of currentwindow) || die "aw-server unreachable at $SERVER"
+  [ -n "$wb" ] || die 'no currentwindow bucket (is aw-watcher-window running?)'
+  fetch "$API/buckets/$wb/events?start=$(ago_iso "$mins")&end=$(now_iso)&limit=500" \
+    | jq -r --arg m "$mins" "$JQ_DEFS"'
+        map(select(.duration >= 1)) | sort_by(.timestamp)
+        | if length == 0 then "no window events >= 1s in the last \($m)m"
+          else .[] | "\(.timestamp|tod)  \(.duration|hms)  \(.data.app // "?")  \(.data.title // "?")"
+          end'
+}
+
+cmd_afk() {
+  need_jq
+  hours=${1:-3}
+  ab=$(bucket_of afkstatus) || die "aw-server unreachable at $SERVER"
+  [ -n "$ab" ] || die 'no afkstatus bucket (is aw-watcher-afk running?)'
+  fetch "$API/buckets/$ab/events?start=$(ago_iso $((hours * 60)))&end=$(now_iso)&limit=200" \
+    | jq -r --arg h "$hours" "$JQ_DEFS"'
+        sort_by(.timestamp)
+        | if length == 0 then "no afk events in the last \($h)h"
+          else .[] | "\(.timestamp|tod)  \(.duration|hms)  \(.data.status)"
+          end'
+}
+
+# AFK-filtered per-app/per-title totals via the aw-server query engine —
+# the same flood + filter_period_intersect pipeline the AW dashboard uses,
+# so numbers here match what the human sees in their own UI.
+cmd_summary() {
+  need_jq
+  hours=${1:-6}
+  period="$(ago_iso $((hours * 60)))/$(now_iso)"
+  q='afk = flood(query_bucket(find_bucket("aw-watcher-afk_")));
+     afk = filter_keyvals(afk, "status", ["not-afk"]);
+     window = flood(query_bucket(find_bucket("aw-watcher-window_")));
+     window = filter_period_intersect(window, afk);
+     apps = sort_by_duration(merge_events_by_keys(window, ["app"]));
+     titles = sort_by_duration(merge_events_by_keys(window, ["app", "title"]));
+     RETURN = {"active_secs": sum_durations(window), "apps": apps, "titles": titles};'
+  jq -n --arg q "$q" --arg p "$period" '{query: [$q], timeperiods: [$p]}' \
+    | curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -d @- "$API/query/" \
+    | jq -r --arg h "$hours" "$JQ_DEFS"'
+        .[0]
+        | "active: \(.active_secs|hms) of the last \($h)h (afk-filtered)",
+          "",
+          "apps:",
+          (.apps[:12][] | "  \(.duration|hms)  \(.data.app // "?")"),
+          "",
+          "top windows:",
+          (.titles[:12][] | "  \(.duration|hms)  \(.data.app // "?")  \(.data.title // "?")")' \
+    || die "query failed (aw-server unreachable at $SERVER, or missing watcher buckets)"
+}
+
+cmd_buckets() {
+  need_jq
+  fetch "$API/buckets/" \
+    | jq -r "$JQ_DEFS"'
+        now as $now
+        | to_entries[]
+        | "\(.key)  type=\(.value.type)  updated=\(
+            if .value.last_updated then "\((($now - (.value.last_updated|epoch))|floor))s ago" else "?" end)"' \
+    || die "aw-server unreachable at $SERVER"
+}
+
+cmd_events() {
+  [ $# -ge 1 ] || die 'usage: awctx events <bucket-id> [minutes] [limit]'
+  b=$1; mins=${2:-60}; lim=${3:-100}
+  fetch "$API/buckets/$b/events?start=$(ago_iso "$mins")&end=$(now_iso)&limit=$lim" \
+    || die "cannot read bucket $b at $SERVER"
+}
+
+cmd_query() {
+  need_jq
+  [ $# -ge 1 ] || die 'usage: awctx query <aw-query-program> [hours]'
+  hours=${2:-6}
+  period="$(ago_iso $((hours * 60)))/$(now_iso)"
+  jq -n --arg q "$1" --arg p "$period" '{query: [$q], timeperiods: [$p]}' \
+    | curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -d @- "$API/query/" \
+    || die "query failed at $SERVER"
+}
+
+cmd_doctor() {
+  fail=0
+  if command -v jq >/dev/null 2>&1; then echo 'ok    jq present'
+  else echo 'FAIL  jq missing from PATH'; fail=1; fi
+  if info=$(fetch "$API/info"); then
+    if command -v jq >/dev/null 2>&1; then
+      echo "ok    aw-server $(printf '%s' "$info" | jq -r .version) at $SERVER"
+    else
+      echo "ok    aw-server reachable at $SERVER"
+    fi
+  else
+    echo "FAIL  aw-server unreachable at $SERVER (set AWCTX_SERVER to override)"
+    exit 1
+  fi
+  [ "$fail" -eq 0 ] || exit 1
+  buckets=$(fetch "$API/buckets/")
+  for t in currentwindow afkstatus; do
+    line=$(printf '%s' "$buckets" | jq -r --arg t "$t" "$JQ_DEFS"'
+      now as $now
+      | to_entries | map(select(.value.type == $t)) | .[0]
+      | if . == null then "FAIL  no \($t) bucket (watcher not running?)"
+        else (($now - (.value.last_updated|epoch)) | floor) as $age
+        | if $age > 300 then "WARN  \(.key) stale (updated \($age)s ago)"
+          else "ok    \(.key) fresh (updated \($age)s ago)" end
+        end')
+    echo "$line"
+    case $line in FAIL*) fail=1 ;; esac
+  done
+  exit "$fail"
+}
+
+# ---- write side: category tree + settings -------------------------------
+# Every write to the classes key first snapshots the current tree into the
+# plugin config dir, so a bad rule is one `awctx setting classes "$(cat ...)"`
+# away from undone.
+
+CFG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-$HOME/.config/herdr/plugins/config/skylence.aw-context}"
+
+backup_classes() {
+  mkdir -p "$CFG_DIR/backups"
+  bf="$CFG_DIR/backups/classes-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
+  fetch "$API/settings/classes" > "$bf" || die "cannot read current classes at $SERVER"
+  printf 'backup: %s\n' "$bf" >&2
+}
+
+post_setting() { # $1 = key; JSON value on stdin
+  curl -sf --max-time 5 -X POST -H 'Content-Type: application/json' \
+    -d @- "$API/settings/$1" >/dev/null
+}
+
+cmd_categories() {
+  need_jq
+  fetch "$API/settings/classes" \
+    | jq -r '
+        if . == null or . == [] then "no category tree stored on this server"
+        else .[] | "\(.name | join("/"))  rule=\(.rule.type // "none")\(
+          if .rule.regex then "  /\(.rule.regex)/\(if .rule.ignore_case then "i" else "" end)" else "" end)"
+        end' \
+    || die "aw-server unreachable at $SERVER"
+}
+
+cmd_category_add() {
+  need_jq
+  [ $# -ge 2 ] || die 'usage: awctx category add <Name[/Sub...]> <regex> [--ignore-case]'
+  name=$1; regex=$2; ic=false
+  [ "${3:-}" != --ignore-case ] || ic=true
+  cur=$(fetch "$API/settings/classes") || die "aw-server unreachable at $SERVER"
+  backup_classes
+  printf '%s' "$cur" \
+    | jq --arg n "$name" --arg r "$regex" --argjson ic "$ic" '
+        (if . == null then [] else . end)
+        | ($n | split("/")) as $path
+        | ({type: "regex", regex: $r} + (if $ic then {ignore_case: true} else {} end)) as $rule
+        | if any(.[]; .name == $path)
+          then map(if .name == $path then .rule = $rule else . end)
+          else . + [{name: $path, rule: $rule}]
+          end' \
+    | post_setting classes || die 'classes update failed'
+  echo "category '$name' set: /$regex/$([ "$ic" = false ] || printf i)"
+}
+
+cmd_category_rm() {
+  need_jq
+  [ $# -ge 1 ] || die 'usage: awctx category rm <Name[/Sub...]>'
+  name=$1
+  cur=$(fetch "$API/settings/classes") || die "aw-server unreachable at $SERVER"
+  printf '%s' "$cur" | jq -e --arg n "$name" 'any(.[]?; .name == ($n | split("/")))' >/dev/null \
+    || die "no category named '$name' (see: awctx categories)"
+  backup_classes
+  printf '%s' "$cur" \
+    | jq --arg n "$name" '($n | split("/")) as $p | map(select(.name != $p))' \
+    | post_setting classes || die 'classes update failed'
+  echo "category '$name' removed"
+}
+
+# Bring the tree to a known state from a JSON file of category entries.
+# Default merges (upsert by exact name path, other entries untouched);
+# --replace makes the tree exactly the file. No-op writes are skipped, so
+# repeated syncs are safe in setup scripts.
+cmd_category_sync() {
+  need_jq
+  [ $# -ge 1 ] || die 'usage: awctx category sync <file.json> [--replace]'
+  file=$1; replace=false
+  [ "${2:-}" != --replace ] || replace=true
+  [ -r "$file" ] || die "cannot read $file"
+  jq -e 'type == "array" and all(.[]; .name and .rule)' "$file" >/dev/null 2>&1 \
+    || die "$file is not a category array (need [{name: [...], rule: {...}}, ...])"
+  cur=$(fetch "$API/settings/classes") || die "aw-server unreachable at $SERVER"
+  if [ "$replace" = true ]; then
+    new=$(jq -c . "$file")
+  else
+    new=$(printf '%s' "$cur" | jq -c --slurpfile want "$file" '
+      (if . == null then [] else . end)
+      | reduce $want[0][] as $w (.;
+          if any(.[]; .name == $w.name)
+          then map(if .name == $w.name then $w else . end)
+          else . + [$w] end)')
+  fi
+  if [ "$(printf '%s' "$cur" | jq -cS .)" = "$(printf '%s' "$new" | jq -cS .)" ]; then
+    echo 'categories already in sync (no write)'
+    return 0
+  fi
+  backup_classes
+  printf '%s' "$new" | post_setting classes || die 'classes update failed'
+  echo "categories synced from $file$([ "$replace" = false ] || printf ' (replace)')"
+}
+
+# Portable desired-state config for a whole AW instance. export captures this
+# machine's category tree plus the portable settings keys (device-specific
+# keys like landingpage/hostname and telemetry timestamps are deliberately
+# excluded); apply brings a fresh instance to exactly that state. Both sides
+# skip no-op writes, so apply is safe to rerun on every device, every time.
+BOOTSTRAP_KEYS='startOfDay startOfWeek durationDefault theme views'
+
+cmd_bootstrap_export() {
+  need_jq
+  out=${1:-}
+  s=$(fetch "$API/settings") || die "aw-server unreachable at $SERVER"
+  doc=$(printf '%s' "$s" | jq --arg keys "$BOOTSTRAP_KEYS" '
+    {classes: (.classes // []),
+     settings: (. as $s | ($keys | split(" "))
+       | map({key: ., value: $s[.]}) | from_entries
+       | with_entries(select(.value != null)))}')
+  if [ -n "$out" ]; then
+    printf '%s\n' "$doc" > "$out"
+    echo "baseline exported to $out"
+  else
+    printf '%s\n' "$doc"
+  fi
+}
+
+cmd_bootstrap_apply() {
+  need_jq
+  [ $# -ge 1 ] || die 'usage: awctx bootstrap apply <baseline.json>'
+  f=$1
+  [ -r "$f" ] || die "cannot read $f"
+  jq -e 'has("classes") and has("settings")' "$f" >/dev/null 2>&1 \
+    || die "$f is not a baseline (need {classes: [...], settings: {...}})"
+  cur=$(fetch "$API/settings/classes") || die "aw-server unreachable at $SERVER"
+  want=$(jq -c .classes "$f")
+  if [ "$(printf '%s' "$cur" | jq -cS .)" = "$(printf '%s' "$want" | jq -cS .)" ]; then
+    echo 'classes: already in sync'
+  else
+    backup_classes
+    printf '%s' "$want" | post_setting classes || die 'classes write failed'
+    echo "classes: replaced ($(printf '%s' "$cur" | jq 'if . == null then 0 else length end') -> $(printf '%s' "$want" | jq length) entries)"
+  fi
+  for k in $(jq -r '.settings | keys[]' "$f"); do
+    wv=$(jq -c --arg k "$k" '.settings[$k]' "$f")
+    cv=$(fetch "$API/settings/$k") || cv=null
+    if [ "$(printf '%s' "$cv" | jq -cS .)" = "$(printf '%s' "$wv" | jq -cS .)" ]; then
+      echo "$k: already in sync"
+    else
+      printf '%s' "$wv" | post_setting "$k" || die "write failed for setting '$k'"
+      echo "$k: set"
+    fi
+  done
+}
+
+cmd_setting() {
+  [ $# -ge 1 ] || die 'usage: awctx setting <key> [<json-value>]'
+  if [ $# -eq 1 ]; then
+    fetch "$API/settings/$1" || die "cannot read setting '$1' at $SERVER"
+    echo
+  else
+    need_jq
+    printf '%s' "$2" | jq -e . >/dev/null 2>&1 || die 'value is not valid JSON'
+    [ "$1" != classes ] || backup_classes
+    printf '%s' "$2" | post_setting "$1" || die "cannot write setting '$1' at $SERVER"
+    echo "setting '$1' updated"
+  fi
+}
+
+cmd_agent_help() {
+  cat <<EOF
+awctx — real desktop activity of the human operator, from ActivityWatch.
+Data source: local aw-server ($SERVER), fed by aw-watcher-window and
+aw-watcher-afk. All timestamps UTC. "afk" = no keyboard/mouse input.
+
+  awctx now                        current app + window title + presence
+  awctx recent [minutes=30]        window history, chronological, with durations
+  awctx summary [hours=6]          active time per app + top windows (afk-filtered)
+  awctx afk [hours=3]              presence timeline (afk / not-afk spans)
+  awctx buckets                    available data buckets + freshness
+  awctx events <bucket> [min] [n]  raw events JSON from any bucket
+  awctx query '<program>' [hours]  raw aw-server query-language passthrough
+  awctx doctor                     check server, watchers, freshness
+
+write side (changes the human's own ActivityWatch — use deliberately):
+  awctx categories                 category tree (name path + rule regex)
+  awctx category add <Path> <regex> [--ignore-case]   add or update a rule
+  awctx category rm <Path>         remove one category entry
+  awctx category sync <file> [--replace]   upsert a category set (or replace tree)
+  awctx bootstrap export [file]    capture tree + portable settings as a baseline
+  awctx bootstrap apply <file>     bring a fresh instance to that exact state
+  awctx setting <key> [<json>]     read or write any aw-server setting
+Category writes snapshot the prior tree to $CFG_DIR/backups first.
+
+Interpretation rules: trust "doctor" before trusting numbers; "data age"
+over ~60s means watchers are lagging and "now" may be stale. Window titles
+can contain sensitive text — quote them only when the task needs it.
+EOF
+}
+
+case ${1:-agent-help} in
+  now)        shift; cmd_now "$@" ;;
+  recent)     shift; cmd_recent "$@" ;;
+  summary)    shift; cmd_summary "$@" ;;
+  afk)        shift; cmd_afk "$@" ;;
+  buckets)    shift; cmd_buckets "$@" ;;
+  events)     shift; cmd_events "$@" ;;
+  query)      shift; cmd_query "$@" ;;
+  doctor)     shift; cmd_doctor "$@" ;;
+  categories) shift; cmd_categories "$@" ;;
+  category)
+    shift; sub=${1:-}; [ $# -eq 0 ] || shift
+    case $sub in
+      add) cmd_category_add "$@" ;;
+      sync) cmd_category_sync "$@" ;;
+      rm)  cmd_category_rm "$@" ;;
+      *)   die 'usage: awctx category add|rm ...' ;;
+    esac ;;
+  setting)    shift; cmd_setting "$@" ;;
+  bootstrap)
+    shift; sub=${1:-}; [ $# -eq 0 ] || shift
+    case $sub in
+      export) cmd_bootstrap_export "$@" ;;
+      apply)  cmd_bootstrap_apply "$@" ;;
+      *)      die 'usage: awctx bootstrap export|apply ...' ;;
+    esac ;;
+  agent-help|help|-h|--help) cmd_agent_help ;;
+  *) die "unknown command '$1' (try: awctx agent-help)" ;;
+esac

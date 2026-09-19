@@ -34,6 +34,14 @@ and threshold lives in one `jev-questions.json` per plugin, overridable per box.
   gate, measured). Everything else is the upstream org unchanged.
   [README](plugins/herdr-agent-org/README.md).
 
+## Herdr plugins
+
+`herdr-plugins/` carries the three herdr-side components the org runs on, so this repo is
+self-contained: **org-relay** (the message bus and wake plane, a Rust daemon with an MCP
+surface; L6), **org-waker** (the legacy crash net) and **aw-context** (ActivityWatch
+context). `herdr-setup` installs them with
+`herdr plugin install skylence-org/claudecode-jev-marketplace/herdr-plugins/<name>`.
+
 ## Install
 
 ```

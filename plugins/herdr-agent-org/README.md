@@ -26,7 +26,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
 2. Orchestrator and workers must run **inside Herdr panes** (`HERDR_ENV=1`).
 3. `jq` on PATH (the hooks and `dispatch-worker` parse Herdr's JSON).
 4. Optional: `herdr integration install claude`. See the caveat below before assuming it does more than it does.
-5. Recommended: the **org-waker** herdr plugin (`herdr plugin install skylence-org/multi-llm-marketplace/herdr-plugins/org-waker`). It is the event-driven wake mechanism L6 builds on; without it the org runs on fallback waits alone.
+5. Recommended: the **org-waker** herdr plugin (`herdr plugin install skylence-org/claudecode-jev-marketplace/herdr-plugins/org-waker`). It is the event-driven wake mechanism L6 builds on; without it the org runs on fallback waits alone.
 
 ## What it provides
 

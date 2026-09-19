@@ -24,7 +24,7 @@ jobs:
       # The checker follows the SHEBANG, not the extension.
       - name: shell syntax
         run: |
-          for f in plugins/*/hooks/*.sh plugins/*/scripts/* plugins/*/statusline/*.sh plugins/*/skills/*/*.sh plugins/*/tests/*.sh plugins/*/tests/*/*.sh tools/*.sh .githooks/*; do
+          for f in plugins/*/hooks/*.sh plugins/*/scripts/* plugins/*/statusline/*.sh plugins/*/skills/*/*.sh plugins/*/tests/*.sh plugins/*/tests/*/*.sh tools/*.sh .githooks/* herdr-plugins/*/test/*.sh herdr-plugins/org-relay/nudge-deliver herdr-plugins/org-relay/relay-ctl herdr-plugins/org-waker/waker herdr-plugins/aw-context/awctx; do
             [ -f "$f" ] || continue
             case "$(head -1 "$f")" in
               *bash*) bash -n "$f" || { echo "invalid bash: $f"; exit 1; } ;;
@@ -70,3 +70,25 @@ jobs:
           grep -q 'JEV_STUB_ANSWERS' plugins/herdr-agent-org/tests/jev/gauge.test.sh || { echo "gauge suite no longer stubs Jev"; exit 1; }
           grep -q 'unset TYPESAFE_API_KEY' plugins/core/tests/jev.test.sh || { echo "core suite does not clear the key"; exit 1; }
           grep -q 'stub_claude' plugins/core/hooks/judge-hook.test.sh || { echo "judge-hook suite no longer stubs the CLI"; exit 1; }
+
+  # The org-relay daemon is the org's message bus and wake plane (L6); a red
+  # crate here means the org ships deaf. Ubuntu is fine: rusqlite bundles
+  # sqlite and rmcp is platform-neutral; the macOS-only pieces (launchd,
+  # nudge-deliver) are shell, covered by the syntax job and the classify test.
+  org-relay:
+    name: org-relay build + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo test
+        run: cargo test --manifest-path herdr-plugins/org-relay/Cargo.toml
+      - name: nudge-deliver classify suite
+        run: sh herdr-plugins/org-relay/test/nudge_deliver_classify.sh
+      - name: concurrency smoke (parallel awaits, fan-out, burst, consume race)
+        run: |
+          cargo build --manifest-path herdr-plugins/org-relay/Cargo.toml
+          sh herdr-plugins/org-relay/test/concurrency_smoke.sh
+      - name: org-waker suites
+        run: for t in herdr-plugins/org-waker/test/*.sh; do sh "$t" || exit 1; done
+      - name: aw-context smoke
+        run: sh herdr-plugins/aw-context/test/smoke.sh

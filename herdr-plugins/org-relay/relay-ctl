@@ -1,0 +1,193 @@
+#!/bin/sh
+# relay-ctl: start/stop/status/run/install-daemon/rollback for the org-relay
+# MCP server. install-daemon is the production path: it refuses a dirty tree,
+# copies the release binary to a VERSIONED slot outside the repo, repoints the
+# `current` symlink, restarts launchd, and verifies the served sha matches the
+# installed one. The plist execs the symlink, so repo churn (cargo clean,
+# branch switches, moves) can never touch a running daemon, and rollback is a
+# symlink repoint away. Legacy repo-path deployment is gone on purpose.
+set -u
+DIR=$(cd "$(dirname "$0")" && pwd)
+PORT="${ORG_RELAY_PORT:-7431}"
+BIN="$DIR/target/release/org-relay"
+PIDFILE="${TMPDIR:-/tmp}/org-relay.$PORT.pid"
+LABEL=com.skylence.org-relay
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+# Installed binaries live OUTSIDE the repo; `current` is what launchd runs.
+LIBEXEC="$HOME/.local/libexec/org-relay"
+CURRENT="$LIBEXEC/current"
+KEEP_BINARIES=3
+# ONE server serves the whole box, so the db is box-wide by default — this is
+# what makes cross-org (peer orchestrator) messages deliverable. Override with
+# ORG_RELAY_DB only when you genuinely want an isolated bus.
+BOX_DB="$HOME/.config/herdr/org-relay/relay.db"
+
+alive() { curl -s -m 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q ok; }
+served_sha() { curl -s -m 3 "http://127.0.0.1:$PORT/health" 2>/dev/null | jq -r '.build.sha // empty' 2>/dev/null; }
+ensure_bin() {
+  if [ ! -x "$BIN" ]; then
+    echo "org-relay: no release binary; building..." >&2
+    (cd "$DIR" && cargo build --release >/dev/null 2>&1) || { echo "org-relay: build failed" >&2; exit 1; }
+  fi
+}
+runnable() {
+  # The installed daemon binary when present, else the repo build (ad-hoc dev).
+  if [ -x "$CURRENT" ]; then echo "$CURRENT"; else ensure_bin; echo "$BIN"; fi
+}
+write_plist_and_bootstrap() {
+  mkdir -p "$(dirname "$BOX_DB")" "$HOME/Library/LaunchAgents"
+  # The nudge watchdog shells out to herdr (via nudge-deliver), and launchd's
+  # default PATH does not contain the herdr install dir: bake the resolving
+  # PATH and an explicit HERDR_BIN_PATH into the plist at install time. The
+  # helper path is pinned too, since the daemon no longer lives beside it.
+  HERDR_RESOLVED=$(command -v "${HERDR_BIN_PATH:-herdr}" 2>/dev/null || echo herdr)
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$CURRENT</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>ORG_RELAY_PORT</key><string>$PORT</string>
+    <key>ORG_RELAY_DB</key><string>$BOX_DB</string>
+    <key>ORG_RELAY_NUDGE_HELPER</key><string>$DIR/nudge-deliver</string>
+    <key>PATH</key><string>$PATH</string>
+    <key>HERDR_BIN_PATH</key><string>$HERDR_RESOLVED</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${TMPDIR:-/tmp}/org-relay.$PORT.log</string>
+  <key>StandardErrorPath</key><string>${TMPDIR:-/tmp}/org-relay.$PORT.log</string>
+</dict></plist>
+EOF
+  # Hand the port over: stop any ad-hoc instance, then bootstrap. A bootout
+  # can still be settling when the bootstrap lands (observed: "Load failed:
+  # 5: Input/output error" with a clean plist), so retry once after a pause.
+  "$0" stop >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
+    || { sleep 10; launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; } \
+    || launchctl load "$PLIST"
+  sleep 2
+}
+verify_serving() {
+  want=$1
+  got=$(served_sha)
+  if [ -z "$got" ]; then
+    echo "org-relay: VERIFY FAILED — daemon not serving; see ${TMPDIR:-/tmp}/org-relay.$PORT.log" >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "org-relay: VERIFY FAILED — serving sha $got, expected $want" >&2
+    return 1
+  fi
+  echo "org-relay: serving verified sha $got on :$PORT"
+}
+
+case "${1:-status}" in
+  run)
+    # Foreground exec for launchd-free ad-hoc use.
+    B=$(runnable)
+    mkdir -p "$(dirname "${ORG_RELAY_DB:-$BOX_DB}")"
+    ORG_RELAY_NUDGE_HELPER="${ORG_RELAY_NUDGE_HELPER:-$DIR/nudge-deliver}" ORG_RELAY_DB="${ORG_RELAY_DB:-$BOX_DB}" exec "$B"
+    ;;
+  install-daemon)
+    ensure_bin
+    # Production gate: never install from a dirty crate tree. The binary bakes
+    # its dirty flag at build time, so trust the BINARY's own attestation
+    # (a clean tree with a stale dirty build would lie the other way).
+    ver_line=$("$BIN" --version 2>/dev/null) || { echo "org-relay: binary has no --version; rebuild" >&2; exit 1; }
+    set -- $ver_line
+    VERSION=${2:-unknown}; SHA=${3:-unknown}; DIRTYF=${4:-unknown}
+    # Gate semantics: "dirty" is uncommitted DEV drift — refuse. "unknown"
+    # splits by context: inside a git checkout it means broken attestation
+    # (refuse), but a consumer box's `herdr plugin install` snapshot has no
+    # .git at all, provenance is structurally unknowable, and the drift the
+    # gate exists to stop cannot occur — allow with a warning.
+    if [ "$DIRTYF" = "dirty" ] && [ "${ORG_RELAY_ALLOW_DIRTY:-}" != "1" ]; then
+      echo "org-relay: REFUSING install: binary built from a dirty tree ($ver_line)." >&2
+      echo "  Commit first and rebuild, or force with ORG_RELAY_ALLOW_DIRTY=1." >&2
+      exit 1
+    fi
+    if [ "$DIRTYF" = "unknown" ] && [ "${ORG_RELAY_ALLOW_DIRTY:-}" != "1" ]; then
+      if git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "org-relay: REFUSING install: this is a git checkout but the binary attests unknown provenance ($ver_line) — rebuild so build.rs can see git." >&2
+        exit 1
+      fi
+      echo "org-relay: non-repo install (consumer box): provenance unknown by design, proceeding." >&2
+    fi
+    mkdir -p "$LIBEXEC"
+    SLOT="$LIBEXEC/org-relay-$VERSION+$SHA"
+    cp "$BIN" "$SLOT.tmp" && mv "$SLOT.tmp" "$SLOT" && chmod +x "$SLOT"
+    PREV=$(readlink "$CURRENT" 2>/dev/null || true)
+    ln -sfn "$SLOT" "$CURRENT"
+    write_plist_and_bootstrap
+    if verify_serving "$SHA"; then
+      [ -n "$PREV" ] && [ "$PREV" != "$SLOT" ] && echo "org-relay: rollback available: relay-ctl rollback (prev: $(basename "$PREV"))"
+      # Retention: keep the newest KEEP_BINARIES slots plus whatever current
+      # points at; older ones go.
+      ls -t "$LIBEXEC"/org-relay-* 2>/dev/null | tail -n +$((KEEP_BINARIES + 1)) | while read -r old; do
+        [ "$old" = "$(readlink "$CURRENT")" ] && continue
+        rm -f "$old"
+      done
+      echo "org-relay: installed $(basename "$SLOT"), db=$BOX_DB"
+    else
+      if [ -n "$PREV" ] && [ -x "$PREV" ]; then
+        echo "org-relay: reverting current -> $(basename "$PREV")" >&2
+        ln -sfn "$PREV" "$CURRENT"
+        launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+      fi
+      exit 1
+    fi
+    ;;
+  rollback)
+    [ -L "$CURRENT" ] || { echo "org-relay: nothing installed" >&2; exit 1; }
+    NOW=$(readlink "$CURRENT")
+    PREV=$(ls -t "$LIBEXEC"/org-relay-* 2>/dev/null | grep -vF "$NOW" | head -1)
+    [ -n "$PREV" ] || { echo "org-relay: no previous binary to roll back to" >&2; exit 1; }
+    ln -sfn "$PREV" "$CURRENT"
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    sleep 2
+    want=$("$PREV" --version | awk '{print $3}')
+    verify_serving "$want" && echo "org-relay: rolled back to $(basename "$PREV")"
+    ;;
+  start)
+    if alive; then echo "org-relay: already serving on :$PORT"; exit 0; fi
+    # Prefer the daemon when installed; kick it rather than forking an orphan.
+    if [ -f "$PLIST" ]; then
+      launchctl kickstart "gui/$(id -u)/$LABEL" 2>/dev/null || launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+      sleep 2
+      alive && { echo "org-relay: started via launchd on :$PORT"; exit 0; }
+    fi
+    B=$(runnable)
+    mkdir -p "$(dirname "${ORG_RELAY_DB:-$BOX_DB}")"
+    ORG_RELAY_NUDGE_HELPER="${ORG_RELAY_NUDGE_HELPER:-$DIR/nudge-deliver}" ORG_RELAY_DB="${ORG_RELAY_DB:-$BOX_DB}" nohup "$B" >>"${TMPDIR:-/tmp}/org-relay.$PORT.log" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 1
+    alive && echo "org-relay: started on :$PORT (pid $(cat "$PIDFILE"); ad-hoc — prefer install-daemon)" || { echo "org-relay: failed to start; see ${TMPDIR:-/tmp}/org-relay.$PORT.log" >&2; exit 1; }
+    ;;
+  stop)
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && { echo "org-relay: daemon stopped ($LABEL)"; exit 0; }
+    if [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null; then
+      rm -f "$PIDFILE"; echo "org-relay: stopped"
+    else
+      PID=$(lsof -ti tcp:"$PORT" 2>/dev/null | head -1)
+      [ -n "${PID:-}" ] && kill "$PID" && echo "org-relay: stopped (pid $PID)" || echo "org-relay: not running"
+    fi
+    ;;
+  status)
+    if alive; then
+      echo "org-relay: serving on :$PORT"
+      # rmcp streamable HTTP needs an MCP handshake per session, so the CLI
+      # reads the plain GET /status mirror (never guide-gated); it now carries
+      # the daemon's own build attestation.
+      curl -s -m 5 "http://127.0.0.1:$PORT/status" 2>/dev/null
+      echo
+    else
+      echo "org-relay: not running on :$PORT"; exit 1
+    fi
+    ;;
+  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback" >&2; exit 2 ;;
+esac

@@ -1,0 +1,24 @@
+id = "skylence.aw-context"
+name = "ActivityWatch Context"
+version = "0.4.0"
+description = "Gives LLM agents accurate desktop-activity context from the local ActivityWatch server: current window and presence, recent window history, AFK-filtered per-app time summaries, raw event/query passthrough, and category-tree/settings management (with automatic backups). Agents run the bundled awctx CLI or the actions below; nothing is pushed into panes."
+min_herdr_version = "0.7.4"
+platforms = ["macos", "linux"]
+
+# Pull-only plugin: no [[events]] and no [[startup]] — awctx reads aw-server
+# on demand. Actions cover the arg-less defaults; parameterized queries
+# (awctx recent 10, awctx summary 2, ...) go through the script directly.
+[[actions]]
+id = "doctor"
+title = "Check aw-context"
+command = ["sh", "awctx", "doctor"]
+
+[[actions]]
+id = "now"
+title = "Current activity"
+command = ["sh", "awctx", "now"]
+
+[[actions]]
+id = "summary"
+title = "Activity summary (last 6h)"
+command = ["sh", "awctx", "summary"]

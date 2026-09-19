@@ -1,0 +1,308 @@
+{
+  "classes": [
+    {
+      "data": {
+        "color": "#0F0",
+        "score": 10
+      },
+      "name": [
+        "Work"
+      ],
+      "rule": {
+        "regex": "Google Docs|libreoffice|ReText",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Programming"
+      ],
+      "rule": {
+        "regex": "GitHub|Stack Overflow|BitBucket|Gitlab|vim|Spyder|kate|Ghidra|Scite",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Programming",
+        "ActivityWatch"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "ActivityWatch|aw-",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Image"
+      ],
+      "rule": {
+        "regex": "GIMP|Inkscape",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Video"
+      ],
+      "rule": {
+        "regex": "Kdenlive",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Audio"
+      ],
+      "rule": {
+        "regex": "Audacity",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "3D"
+      ],
+      "rule": {
+        "regex": "Blender",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#F33"
+      },
+      "name": [
+        "Media"
+      ],
+      "rule": {
+        "type": "none"
+      }
+    },
+    {
+      "data": {
+        "color": "#F80"
+      },
+      "name": [
+        "Media",
+        "Games"
+      ],
+      "rule": {
+        "regex": "Minecraft|RimWorld",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#F33"
+      },
+      "name": [
+        "Media",
+        "Video"
+      ],
+      "rule": {
+        "regex": "YouTube|Plex|VLC",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#FCC400"
+      },
+      "name": [
+        "Media",
+        "Social Media"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "reddit|Facebook|Twitter|Instagram|devRant",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#A8FC00"
+      },
+      "name": [
+        "Media",
+        "Music"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "Spotify|Deezer",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#9FF"
+      },
+      "name": [
+        "Comms"
+      ],
+      "rule": {
+        "type": "none"
+      }
+    },
+    {
+      "name": [
+        "Comms",
+        "IM"
+      ],
+      "rule": {
+        "regex": "Messenger|Telegram|Signal|WhatsApp|Rambox|Slack|Riot|Element|Discord|Nheko|NeoChat|Mattermost",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Comms",
+        "Email"
+      ],
+      "rule": {
+        "regex": "Gmail|Thunderbird|mutt|alpine",
+        "type": "regex"
+      }
+    },
+    {
+      "data": {
+        "color": "#CCC"
+      },
+      "name": [
+        "Uncategorized"
+      ],
+      "rule": {
+        "type": null
+      }
+    },
+    {
+      "data": {
+        "color": "#7C4DFF"
+      },
+      "name": [
+        "Work",
+        "Agents"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "herdr|claude|codex|grok|aider|copilot",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Agents",
+        "Herdr"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "herdr",
+        "type": "regex"
+      }
+    },
+    {
+      "name": [
+        "Work",
+        "Agents",
+        "Claude"
+      ],
+      "rule": {
+        "ignore_case": true,
+        "regex": "claude",
+        "type": "regex"
+      }
+    }
+  ],
+  "settings": {
+    "startOfDay": "04:00",
+    "startOfWeek": "Monday",
+    "durationDefault": 14400,
+    "theme": "dark",
+    "views": [
+      {
+        "elements": [
+          {
+            "size": 3,
+            "type": "top_apps"
+          },
+          {
+            "size": 3,
+            "type": "top_titles"
+          },
+          {
+            "size": 3,
+            "type": "timeline_barchart"
+          },
+          {
+            "size": 3,
+            "type": "top_categories"
+          },
+          {
+            "size": 3,
+            "type": "category_tree"
+          },
+          {
+            "size": 3,
+            "type": "category_sunburst"
+          }
+        ],
+        "id": "summary",
+        "name": "Summary"
+      },
+      {
+        "elements": [
+          {
+            "size": 3,
+            "type": "top_apps"
+          },
+          {
+            "size": 3,
+            "type": "top_titles"
+          }
+        ],
+        "id": "window",
+        "name": "Window"
+      },
+      {
+        "elements": [
+          {
+            "size": 3,
+            "type": "top_domains"
+          },
+          {
+            "size": 3,
+            "type": "top_urls"
+          }
+        ],
+        "id": "browser",
+        "name": "Browser"
+      },
+      {
+        "elements": [
+          {
+            "size": 3,
+            "type": "top_editor_files"
+          },
+          {
+            "size": 3,
+            "type": "top_editor_projects"
+          },
+          {
+            "size": 3,
+            "type": "top_editor_languages"
+          }
+        ],
+        "id": "editor",
+        "name": "Editor"
+      }
+    ]
+  }
+}

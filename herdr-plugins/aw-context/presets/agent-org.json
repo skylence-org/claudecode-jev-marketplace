@@ -1,0 +1,15 @@
+[
+  {
+    "name": ["Work", "Agents"],
+    "rule": { "type": "regex", "regex": "herdr|claude|codex|grok|aider|copilot", "ignore_case": true },
+    "data": { "color": "#7C4DFF" }
+  },
+  {
+    "name": ["Work", "Agents", "Herdr"],
+    "rule": { "type": "regex", "regex": "herdr", "ignore_case": true }
+  },
+  {
+    "name": ["Work", "Agents", "Claude"],
+    "rule": { "type": "regex", "regex": "claude", "ignore_case": true }
+  }
+]
