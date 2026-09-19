@@ -55,8 +55,8 @@ Two facts change how you use this surface when the agent on either end is Claude
 # preserve focus and cwd
 herdr pane split --current --direction right --cwd "$PWD" --no-focus
 # read .result.pane.pane_id from the JSON
-herdr agent start reviewer --kind claude --pane <pane_id> -- --model sonnet --permission-mode bypassPermissions
-herdr agent prompt reviewer "Review the diff on PR #123." --wait --timeout 120000
+herdr agent start reviewer --kind claude --pane <pane_id> -- --model sonnet --permission-mode bypassPermissions "Review the diff on PR #123."
+herdr agent wait reviewer --until idle --until done --until blocked --timeout 120000
 herdr agent read reviewer --source visible --lines 120
 ```
 
@@ -73,9 +73,9 @@ herdr agent send-keys reviewer esc
 herdr agent get reviewer
 ```
 
-`agent prompt --wait` waits for a settled `idle`, `done`, or `blocked` by default. A prompt from a non-working state that never advances the lifecycle returns `agent_prompt_stalled` within about 5s: that is your verify-after-send signal, not a transient.
+The first prompt rides the launch arguments (the trailing quoted string after `--` above): Claude Code auto-submits it as the first message, so nothing is ever typed into the composer.
 
-Messaging a live CLAUDE session: prefer the native ping (`SendMessage`, target resolved from a `ListAgents` row; CC >= 2.1.224) — it touches no composer, arrives attributed, and starts a turn in an idle session. `agent prompt` remains the path for non-Claude kinds, launch-time delivery, and lifecycle-coupled sends (`--wait` semantics); when each applies is orchestrator doctrine (L6/L11).
+Messaging a live CLAUDE session: the native ping only (`SendMessage`, target resolved from a `ListAgents` row; CC >= 2.1.224); it touches no composer, arrives attributed, and starts a turn in an idle session. Anything that must be on the record goes over the org-relay (`relay_send`). `herdr agent prompt` and text-bearing `send-keys` are banned in this org for communication (orchestrator L11); `send-keys <name> esc` stays as the content-free interrupt.
 
 Ordinary commands (tests, servers) go through the pane, not the agent:
 
@@ -103,7 +103,7 @@ Agent names match `[a-z][a-z0-9_-]{0,31}` and must be unique among live agents; 
 
 ## Safety
 
-- Classify the target's input line before ANY send (no-fusion law). `scripts/ghost-probe.sh` is the classifier; on Herdr use `live` then `probe`. Native `SendMessage` pings bypass the composer entirely and need no classification.
+- Never send into another agent's composer (orchestrator L11): `relay_send` for the record, native `SendMessage` pings as the wake, launch arguments for a fresh agent's first prompt.
 - Use `--no-focus` for background work unless the operator asked to switch context.
 - Address `--current`, an explicit pane ID, or a unique agent name; never another client's focused pane.
 - Do not close workspaces, tabs, or panes you did not create unless asked.

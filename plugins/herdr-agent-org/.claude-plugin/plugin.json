@@ -1,6 +1,6 @@
 {
   "name": "herdr-agent-org",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Skylence agent-org on the Herdr substrate, for Claude Code, with TypeSafe Jev measuring two laws the orchestrator used to judge from memory. Forked from multi-llm-marketplace's herdr-agent-org-claude 2.4.1 (seven role skills: orchestrator, herdr-worker, replacer, org-audit, architect, fleet, herdr control surface; filesystem board CLI; org-relay MCP bus; native ping plane; three session-discipline hooks) — all of that is unchanged. Added: scripts/tier-gauge, called by dispatch-worker before any pane exists (L17 TIER BY BRIEF, measured: one Jev request over the brief — work tier as a Choice over descriptions of the work, risk, brief-template lint — refuses a cheap tier on a non-mechanical brief, warns on a hard brief below the top tier, never auto-upgrades, files [TIER-GAUGE: ...] on the todo); scripts/review-gate-check at ACCEPT step 1 (L10 REVIEW GATE, measured: changed lines counted in code, four surface Nouls over the review package, MANDATORY-REVIEW / WAIVABLE / WAIVABLE-UNGAUGED); and scripts/jev, the shared POSIX-sh door to the API (fail-open, cached, audited, stub mode). One Jev request per lane per event, never per tool call; no TYPESAFE_API_KEY means the org runs exactly as upstream. Install INSTEAD OF herdr-agent-org-claude, not beside it. Requires herdr >= 0.7 and HERDR_ENV=1.",
   "author": {
     "name": "Skylence",

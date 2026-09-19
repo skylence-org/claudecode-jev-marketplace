@@ -17,5 +17,5 @@ Incidents: report upward IMMEDIATELY, BEFORE attempting recovery. Crashes, panic
 
 Blocked: post [BLOCKER] on your todo naming exactly what you need, keep independent work moving, and never spin on a dead end.
 
-No-fusion: before any send into another pane or agent, classify its input line (`scripts/ghost-probe.sh`, using tails from `herdr agent read` or `herdr pane read`), because a rendered tail cannot tell a Claude suggestion ghost from real operator typing. Unsubmitted text on the line means route to a durable channel (a board comment) instead. Never type into the operator's live input.
+No composer: never type into another pane or agent, and never into the operator's live input. Communicate over the org-relay (`relay_send`) and the native `SendMessage` ping only; a fresh agent gets its first prompt as a launch argument.
 <!-- END herdr-agent-org:worker-guidance -->

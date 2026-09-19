@@ -13,11 +13,10 @@
 # orchestrator (rows of at most 2). An explicit --direction forces a legacy
 # split of the current pane and skips the layout logic.
 #
-# Defaults to --kind claude. The doctrinal default model/effort is filled in
+# Lane kind is claude (L11). The doctrinal default model is filled in
 # when you did not pass one, so silence at dispatch cannot resolve to whatever
 # the box happens to be installed at (marketplace#32):
-#   --kind claude  and no --model             -> --model sonnet
-#   --kind grok    and no --effort            -> --effort medium
+#   no --model -> --model sonnet
 # Asking for anything above that default REQUIRES --upgrade-reason; the reason
 # is filed on the lane todo as [MODEL: ...] / [EFFORT: ...] per L17.
 # An --advisor <m> in the agent args is likewise above the default (none) and
@@ -25,7 +24,7 @@
 #
 # TIER GAUGE (herdr-agent-org): with --todo, the brief is measured once by
 # scripts/tier-gauge (one Jev request: work tier, risk, brief-template lint)
-# before the pane is split. A cheap tier (--model haiku / --effort low) on a
+# before the pane is split. A cheap tier (--model haiku) on a
 # brief the gauge reads as not mechanical is REFUSED (exit 2), the same hard
 # stop as a missing --upgrade-reason; a hard brief on a non-top tier and any
 # missing template item only warn. The verdict line is filed on the todo as
@@ -44,10 +43,9 @@
 # the sidebar after its agent is reaped (L18).
 # Board side-effects when --todo is set: set-owner, set-status in_progress, and
 # the upgrade filing when there is one.
-# After the prompt send, dispatch-worker verifies the agent started working
-# within 4s; on timeout it retries with an empty submit (up to 8s), then a
-# single re-send of the original prompt (up to 8s); reports
-# submit=clean|recovered|reprompted|failed in the JSON summary.
+# After the launch, dispatch-worker waits up to 15s for the agent to reach
+# working and reports submit=launch-arg|launch-arg-unconfirmed in the JSON
+# summary; unconfirmed means read the pane, then reap and re-dispatch (L11).
 # With --wake-target (or HERDR_ORG_WAKER_TARGET set) and the org-waker herdr
 # plugin installed, the lane is registered so its settle, block, or death
 # rings the conductor (L6); optional --beat-note TEXT is stored with the
@@ -111,6 +109,10 @@ fi
   echo "dispatch-worker: HERDR_ENV!=1, run inside a Herdr-managed pane" >&2
   exit 1
 }
+[ "$KIND" = "claude" ] || {
+  echo "dispatch-worker: --kind $KIND is not dispatchable: the pointer rides the launch arguments and only the claude CLI takes one; nothing is ever typed into a composer (L11)." >&2
+  exit 2
+}
 
 MODEL=$(arg_value --model "$EXTRA_ARGS")
 EFFORT=$(arg_value --effort "$EXTRA_ARGS")
@@ -124,13 +126,6 @@ case "$KIND" in
       MODEL=sonnet
       EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--model sonnet"
       DEFAULTED="model=sonnet"
-    fi
-    ;;
-  grok)
-    if [ -z "$EFFORT" ]; then
-      EFFORT=medium
-      EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--effort medium"
-      DEFAULTED="effort=medium"
     fi
     ;;
 esac
@@ -253,24 +248,14 @@ pane_id=$(printf '%s\n' "$split_json" | jq -r '.result.pane.pane_id // empty')
 # a short backoff instead of racing the shell prompt.
 tries=0
 while :; do
-  # LAUNCH-ARG POINTER (claude kind, 2026-08-05): `claude "prompt"` starts
-  # the interactive TUI with the prompt auto-submitted as the first message
-  # (documented CLI behavior), so the pointer never touches the composer and
-  # the first-prompt swallow race (#126; measured 4/9 dispatches needing
-  # recovery in one program) cannot occur. Other kinds keep the composer
-  # send + verify ladder below.
-  if [ "$KIND" = "claude" ]; then
-    if [ -n "$EXTRA_ARGS" ]; then
-      # shellcheck disable=SC2086
-      start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- $EXTRA_ARGS "$PROMPT" 2>&1) && break
-    else
-      start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- "$PROMPT" 2>&1) && break
-    fi
-  elif [ -n "$EXTRA_ARGS" ]; then
+  # The pointer rides the launch arguments: `claude "prompt"` starts the TUI
+  # with the prompt auto-submitted as the first message (documented CLI
+  # behavior), so nothing is typed into the composer (L11).
+  if [ -n "$EXTRA_ARGS" ]; then
     # shellcheck disable=SC2086
-    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- $EXTRA_ARGS 2>&1) && break
+    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- $EXTRA_ARGS "$PROMPT" 2>&1) && break
   else
-    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" 2>&1) && break
+    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- "$PROMPT" 2>&1) && break
   fi
   # Only the fresh-pane readiness race is worth retrying; every other failure
   # is deterministic, and retrying it 10x buries the real error herdr already
@@ -305,36 +290,10 @@ if [ -n "$WAKE_TARGET" ] && [ -x "$WCTL" ] && "$WCTL" present 2>/dev/null; then
   fi
 fi
 
-if [ "$KIND" = "claude" ]; then
-  # The pointer rode the launch args; there is nothing to type and nothing
-  # to recover. Confirm the session actually started processing it.
-  SUBMIT="launch-arg"
-  $HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1 || SUBMIT="launch-arg-unconfirmed"
-else
-  # Point the worker at the brief (composer path for kinds whose CLI has no
-  # documented launch-arg prompt).
-  $HERDR agent prompt "$NAME" "$PROMPT" >/dev/null
-
-  # VERIFY-AFTER-SEND: a fresh agent can swallow its first prompt two ways --
-  # typed into an already-drafted composer (recovered by an empty submit) or
-  # typed before the input box exists and discarded entirely (recovered only
-  # by re-sending the prompt; field data hit both variants live). Escalate
-  # through wait, empty-submit, then a single re-send before giving up.
-  SUBMIT="failed"
-  if $HERDR agent wait "$NAME" --until working --timeout 4000 >/dev/null 2>&1; then
-    SUBMIT="clean"
-  else
-    $HERDR pane run "$pane_id" "" >/dev/null 2>&1 || true
-    if $HERDR agent wait "$NAME" --until working --timeout 8000 >/dev/null 2>&1; then
-      SUBMIT="recovered"
-    else
-      $HERDR agent prompt "$NAME" "$PROMPT" >/dev/null 2>&1 || true
-      if $HERDR agent wait "$NAME" --until working --timeout 8000 >/dev/null 2>&1; then
-        SUBMIT="reprompted"
-      fi
-    fi
-  fi
-fi
+# The pointer rode the launch args; there is nothing to type and nothing to
+# recover (L11). Confirm the session actually started processing it.
+SUBMIT="launch-arg"
+$HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1 || SUBMIT="launch-arg-unconfirmed"
 
 # Report the state the caller should sanity-check instead of assuming the
 # send landed.

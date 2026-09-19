@@ -53,8 +53,6 @@ Jev call is fail-open: hooks allow, dispatches go ungauged, and one stderr line 
 
 ## What is deliberately NOT on Jev
 
-- `ghost-probe` (the no-fusion classifier): a deterministic diff of two pane tails. Must stay
-  deterministic; Jev reads literally and is text-only.
 - `writing-guard`: every Write/Edit. Hot path.
 - The org-relay nudge watchdog: timing, nothing semantic.
 - `run-conduct.sh`: a live model under pressure *is* the subject under test.

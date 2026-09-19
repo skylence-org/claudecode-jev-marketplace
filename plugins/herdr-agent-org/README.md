@@ -6,11 +6,11 @@ Claude Code port of the Skylence agent-org, running on **[Herdr](https://herdr.d
 
 One Jev request per lane per **event**, never per tool call, and nothing changes when there is no key:
 
-- **`scripts/tier-gauge`**, called by `dispatch-worker` before any pane exists (L17 TIER BY BRIEF, measured). One request over the brief: the work tier as a Choice over *descriptions of the work* (mechanical / ordinary / hard — never model names), a `risky` Noul over the L10 surfaces, and three brief-template lint Nouls (lane-tree path, milestone comments, inlined board calls). A cheap tier (`--model haiku`, grok `--effort low`) on a brief the gauge reads as not mechanical is **refused** (exit 2 from `dispatch-worker`, the same hard stop as a missing `--upgrade-reason`); a hard brief below the top tier only warns; it never auto-upgrades. The verdict is filed on the todo as `[TIER-GAUGE: jev-1.13.0 tier=… conf=… risky=… verdict=…]`. `--no-gauge` skips it; file the L13 reason.
+- **`scripts/tier-gauge`**, called by `dispatch-worker` before any pane exists (L17 TIER BY BRIEF, measured). One request over the brief: the work tier as a Choice over *descriptions of the work* (mechanical / ordinary / hard — never model names), a `risky` Noul over the L10 surfaces, and three brief-template lint Nouls (lane-tree path, milestone comments, inlined board calls). A cheap tier (`--model haiku`) on a brief the gauge reads as not mechanical is **refused** (exit 2 from `dispatch-worker`, the same hard stop as a missing `--upgrade-reason`); a hard brief below the top tier only warns; it never auto-upgrades. The verdict is filed on the todo as `[TIER-GAUGE: jev-1.13.0 tier=… conf=… risky=… verdict=…]`. `--no-gauge` skips it; file the L13 reason.
 - **`scripts/review-gate-check <slug> --cwd <lane-tree> --base <base> --head <tip>`** at ACCEPT SEQUENCE step 1 (L10 REVIEW GATE, measured). Changed lines are counted in code (≥ 150 is MANDATORY before Jev is asked at all); below that, one request over the review package (`/tmp/<slug>_review.diff` when it fits, else paths + commit subjects) answers four surface Nouls. Prints exactly one line to paste on the todo: `MANDATORY-REVIEW: …` (exit 3), `WAIVABLE: …` (exit 0; the `[REVIEW-WAIVED]` filing is still yours), or `WAIVABLE-UNGAUGED` (no Jev; judge the surfaces yourself).
 - **`scripts/jev`** and **`scripts/jev-questions.json`**: the shared door to the API and the one file holding every question and threshold. Byte-identical to `core`'s copy (`tools/check-parity.sh` enforces it). Fail-open, cached by request checksum, one audit line per call in `~/.claude/jev-audit.jsonl`, `JEV_STUB_ANSWERS` for tests. Tune thresholds in `~/.claude/jev-questions.json`.
 
-Not on Jev, on purpose: `ghost-probe.sh` (the no-fusion classifier must stay a deterministic diff), the org-relay nudge watchdog (timing), the reviewer lane (needs generation), the architect dry-read gate (the gauge must be the priced worker tier), and `tests/conduct` (a live model under pressure is the subject under test).
+Not on Jev, on purpose: the org-relay nudge watchdog (timing), the reviewer lane (needs generation), the architect dry-read gate (the gauge must be the priced worker tier), and `tests/conduct` (a live model under pressure is the subject under test).
 
 Setup: put the key in `~/.config/typesafe/api_key` (one line, `chmod 600`). `jev` reads that file when `TYPESAFE_API_KEY` is not in the environment, and a file is what makes the org work: split panes inherit the herdr *server's* env, not yours, and a skyline-routed shell call runs inside a detached daemon — neither sees a shell export, both read a file owned by the same user. The env-variable route still works (pane shell before `claude` starts, or the tool call's `env` parameter per the SKYLINE-ROUTED SHELL GOTCHA), it just has to be repeated per process. `sh scripts/jev doctor` prints which source it found.
 
@@ -42,7 +42,6 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
   - `board` is the filesystem board (todos, comments, pads, blockers); `set-status` best-effort publishes the lane's status into the herdr sidebar pane (`pane report-metadata`), `ready` lists unblocked pending todos, `create --tags`/`list --tags` tag and filter todos, `query <text>` case-insensitively searches todo files, `list`/`ready`/`get` support `--json`, and every mutating command snapshots a best-effort silent git commit when git is available
   - `dispatch-worker` splits a pane (auto layout: first worker below the orchestrator, later workers rightward in rows of at most 2, a fresh row per 2; explicit `--direction` overrides), starts a named agent, sends the pointer prompt, and reports the post-send state; optional `--beat-note TEXT` is forwarded to waker registration so settle/block/death rings carry the orchestrator's beat script
   - `build-slot` is the machine-wide compile serializer
-  - `ghost-probe.sh` is the no-fusion input-line classifier
   - `tier-gauge` measures a brief's worker tier, risk, and template completeness (L17; one Jev request, called by `dispatch-worker`)
   - `review-gate-check` measures the L10 review gate at accept (lines in code, surfaces by one Jev request)
   - `jev` is the shared door to the TypeSafe API; `jev-questions.json` holds every question and threshold
@@ -131,7 +130,7 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 | --- | --- |
 | Board and todos | Filesystem board (`scripts/board`) |
 | Worker PTYs | `herdr pane split` plus `agent start` |
-| Read and steer | `herdr agent read` / `agent prompt` |
+| Read and steer | `herdr agent read` / `SendMessage` ping and `relay_send`; never the composer (L11) |
 | Idle wake | org-relay `relay_await` (task-backed); fallback `herdr agent wait` |
 | Agent state | Herdr semantic states plus sidebar |
 | MCP required | org-relay for messaging; the board itself is CLI only |
@@ -150,7 +149,6 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 
 - Hook markers live at `/tmp/claude-herdr-org-lanes-<session_id>`, one file per session.
 - The stop gate follows two rules, both field-driven (2026-07-21): the premise follows recorded evidence (a session that only armed waits is not told it dispatched workers), and an answered sweep settles until org state actually moves.
-- `ghost-probe.sh` on a pure Herdr box: use `live` then `probe`. `zero-touch` needs a source that strips a suggestion ghost's styling to an empty prompt line, which Herdr does not provide.
 - Prefer `${HERDR_BIN_PATH:-herdr}`; Herdr injects that variable inside managed panes.
 - Pair with `core-claude` for the baseline guidelines and judge-hook, and with `skyline-claude` for hash-guarded edits.
 - `tests/conduct/` pressure-tests the role skills' conduct clauses on a live model (superpowers-style RED/GREEN doctrine testing): `sh tests/conduct/run-conduct.sh` is BILLED; `--self-test` (stubbed, free) runs in CI; `--without-skill` captures baseline rationalizations to close in the skills' tables.
