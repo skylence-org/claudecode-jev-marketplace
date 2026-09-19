@@ -1,0 +1,371 @@
+#!/bin/sh
+# dispatch-worker: split a sibling pane, start a named agent, send a pointer
+# prompt, and report what the agent actually came up as.
+#
+# Usage:
+#   dispatch-worker --name NAME [--kind KIND] [--cwd PATH] [--direction right|down] \
+#                   [--todo SLUG] [--prompt TEXT] [--timeout MS] \
+#                   [--wake-target ORCH] [--beat-note TEXT] [--upgrade-reason TEXT] [--no-gauge] [-- agent-args...]
+#
+# With no --direction, placement is automatic: the first worker splits the
+# orchestrator pane DOWN, later workers split the last live worker pane
+# RIGHT, and after every 2 live workers a fresh row is seeded below the
+# orchestrator (rows of at most 2). An explicit --direction forces a legacy
+# split of the current pane and skips the layout logic.
+#
+# Defaults to --kind claude. The doctrinal default model/effort is filled in
+# when you did not pass one, so silence at dispatch cannot resolve to whatever
+# the box happens to be installed at (marketplace#32):
+#   --kind claude  and no --model             -> --model sonnet
+#   --kind grok    and no --effort            -> --effort medium
+# Asking for anything above that default REQUIRES --upgrade-reason; the reason
+# is filed on the lane todo as [MODEL: ...] / [EFFORT: ...] per L17.
+# An --advisor <m> in the agent args is likewise above the default (none) and
+# requires --upgrade-reason; it is filed on the lane todo as [ADVISOR: ...].
+#
+# TIER GAUGE (herdr-agent-org): with --todo, the brief is measured once by
+# scripts/tier-gauge (one Jev request: work tier, risk, brief-template lint)
+# before the pane is split. A cheap tier (--model haiku / --effort low) on a
+# brief the gauge reads as not mechanical is REFUSED (exit 2), the same hard
+# stop as a missing --upgrade-reason; a hard brief on a non-top tier and any
+# missing template item only warn. The verdict line is filed on the todo as
+# [TIER-GAUGE: ...]. Jev unavailable (no TYPESAFE_API_KEY) means ungauged and
+# the dispatch proceeds as before. --no-gauge skips it; file the L13 reason.
+#
+# A Claude lane worker also needs full-auto args, which are NOT applied for you:
+#   dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
+#     -- --permission-mode bypassPermissions
+#
+# The --cwd should be the lane tree the orchestrator already created MCP-first
+# (skyline_workspace_create with an absolute from_path), not a bare checkout.
+#
+# Requires HERDR_ENV=1. Prints a JSON summary on stdout.
+# Also labels the new pane "<name>: <todo>" so the lane stays identifiable in
+# the sidebar after its agent is reaped (L18).
+# Board side-effects when --todo is set: set-owner, set-status in_progress, and
+# the upgrade filing when there is one.
+# After the prompt send, dispatch-worker verifies the agent started working
+# within 4s; on timeout it retries with an empty submit (up to 8s), then a
+# single re-send of the original prompt (up to 8s); reports
+# submit=clean|recovered|reprompted|failed in the JSON summary.
+# With --wake-target (or HERDR_ORG_WAKER_TARGET set) and the org-waker herdr
+# plugin installed, the lane is registered so its settle, block, or death
+# rings the conductor (L6); optional --beat-note TEXT is stored with the
+# registration and appended to every wake ring as `NOTE: <text>`.
+# Absent wake-target or plugin, dispatch proceeds unregistered.
+set -eu
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+NAME=""
+KIND="claude"
+CWD=""
+DIR=""   # empty = auto layout (down below orchestrator, then right, rows of 2)
+TODO=""
+PROMPT=""
+TIMEOUT="60000"
+UPGRADE_REASON=""
+WAKE_TARGET="${HERDR_ORG_WAKER_TARGET:-}"
+BEAT_NOTE=""
+EXTRA_ARGS=""
+NO_GAUGE=0
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
+  exit 2
+}
+
+# Value following FLAG in a space-joined argument string, or empty.
+arg_value() {
+  printf '%s\n' "$2" | awk -v f="$1" '{for(i=1;i<=NF;i++) if($i==f && i<NF){print $(i+1); exit}}'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --name) NAME=$2; shift 2 ;;
+    --kind) KIND=$2; shift 2 ;;
+    --cwd) CWD=$2; shift 2 ;;
+    --direction) DIR=$2; shift 2 ;;
+    --todo) TODO=$2; shift 2 ;;
+    --prompt) PROMPT=$2; shift 2 ;;
+    --timeout) TIMEOUT=$2; shift 2 ;;
+    --upgrade-reason) UPGRADE_REASON=$2; shift 2 ;;
+    --wake-target) WAKE_TARGET=$2; shift 2 ;;
+    --beat-note) BEAT_NOTE=$2; shift 2 ;;
+    --no-gauge) NO_GAUGE=1; shift ;;
+    --) shift; EXTRA_ARGS=$*; break ;;
+    -h|--help) usage ;;
+    *) echo "dispatch-worker: unknown arg $1" >&2; usage ;;
+  esac
+done
+
+[ -n "$NAME" ] || { echo "dispatch-worker: --name required" >&2; exit 2; }
+# herdr rejects an invalid agent name immediately with a clear error; catching
+# it before the pane split saves the 10-try retry loop that turned this
+# deterministic input error into a generic failure (marketplace#128).
+if [ "${#NAME}" -gt 32 ] || ! printf '%s' "$NAME" | LC_ALL=C grep -qE '^[a-z][a-z0-9_-]*$'; then
+  echo "dispatch-worker: invalid --name '$NAME' (${#NAME} chars): agent names match ^[a-z][a-z0-9_-]{0,31}$ (1-32 chars)." >&2
+  echo "dispatch-worker: too long? trim the SLUG and keep any i<issue-nr>- prefix (the issue number is what must survive, L18)." >&2
+  exit 2
+fi
+[ "${HERDR_ENV:-}" = "1" ] || {
+  echo "dispatch-worker: HERDR_ENV!=1, run inside a Herdr-managed pane" >&2
+  exit 1
+}
+
+MODEL=$(arg_value --model "$EXTRA_ARGS")
+EFFORT=$(arg_value --effort "$EXTRA_ARGS")
+[ -n "$EFFORT" ] || EFFORT=$(arg_value --reasoning-effort "$EXTRA_ARGS")
+ADVISOR=$(arg_value --advisor "$EXTRA_ARGS")
+
+DEFAULTED=""
+case "$KIND" in
+  claude)
+    if [ -z "$MODEL" ]; then
+      MODEL=sonnet
+      EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--model sonnet"
+      DEFAULTED="model=sonnet"
+    fi
+    ;;
+  grok)
+    if [ -z "$EFFORT" ]; then
+      EFFORT=medium
+      EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--effort medium"
+      DEFAULTED="effort=medium"
+    fi
+    ;;
+esac
+
+# Anything above the doctrine default is an explicit, filed act (L17).
+MODEL_UP=0
+EFFORT_UP=0
+ADVISOR_UP=0
+case "$MODEL" in ""|*sonnet*|*haiku*) ;; *) MODEL_UP=1 ;; esac
+case "$EFFORT" in ""|low|medium) ;; *) EFFORT_UP=1 ;; esac
+[ -n "$ADVISOR" ] && ADVISOR_UP=1
+if [ "$MODEL_UP" -eq 1 ] || [ "$EFFORT_UP" -eq 1 ] || [ "$ADVISOR_UP" -eq 1 ]; then
+  if [ -z "$UPGRADE_REASON" ]; then
+    echo "dispatch-worker: model=${MODEL:-default} effort=${EFFORT:-default} advisor=${ADVISOR:-none} is above the doctrine default." >&2
+    echo "dispatch-worker: pass --upgrade-reason \"<why this lane needs it>\"; it is filed on the todo (L17)." >&2
+    exit 2
+  fi
+fi
+
+MARKERS=""
+[ "$MODEL_UP" -eq 1 ] && MARKERS="[MODEL: $MODEL, $UPGRADE_REASON]"
+[ "$EFFORT_UP" -eq 1 ] && MARKERS="${MARKERS:+$MARKERS }[EFFORT: $EFFORT, $UPGRADE_REASON]"
+[ "$ADVISOR_UP" -eq 1 ] && MARKERS="${MARKERS:+$MARKERS }[ADVISOR: $ADVISOR, $UPGRADE_REASON]"
+
+# TIER GAUGE (L17, measured): one Jev request over the brief, before any pane
+# exists, so a refusal costs nothing to undo. tier-gauge exits 3 to refuse a
+# cheap tier on a non-mechanical brief; any other non-zero (no board, no jq)
+# leaves the lane ungauged and the dispatch proceeds as it always did.
+GAUGE=""
+TG="$(dirname "$0")/tier-gauge"
+if [ -n "$TODO" ] && [ "$NO_GAUGE" -eq 0 ] && [ -x "$TG" ]; then
+  if GAUGE=$("$TG" --todo "$TODO" ${MODEL:+--model "$MODEL"} ${EFFORT:+--effort "$EFFORT"}); then
+    :
+  else
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+      echo "dispatch-worker: refused by tier-gauge (L17): $GAUGE" >&2
+      echo "dispatch-worker: dispatch at the default tier, rewrite the brief to transcription grade, or pass --no-gauge with an [L13 LAW-FRICTION] filing on the todo." >&2
+      exit 2
+    fi
+    GAUGE=""
+  fi
+fi
+
+# Plain text, never a leading slash: a send that STARTS with a slash command is
+# eaten by Claude's command palette and the task text is silently dropped.
+if [ -z "$PROMPT" ] && [ -n "$TODO" ]; then
+  PROMPT="you own todo ${TODO}. Read the board brief (board get ${TODO}), then invoke the herdr-worker skill and implement it. Report milestones with board comment."
+fi
+[ -n "$PROMPT" ] || {
+  echo "dispatch-worker: --prompt or --todo required" >&2
+  exit 2
+}
+
+# Panes are launched by the herdr server and do NOT inherit this process's
+# environment (measured on herdr 0.7.5, 2026-07-28), so the board root and
+# PATH must ride the split explicitly or the worker resolves neither.
+# PLACEMENT (operator orders 2026-07-28): with no explicit --direction the
+# layout is automatic: the first worker splits the orchestrator pane DOWN;
+# later workers split the most recent live worker pane RIGHT; when the live
+# worker count is a multiple of 2 the row is full and a fresh row is seeded
+# by splitting the orchestrator DOWN again. Worker panes are recognized by
+# the '<name>: <todo>' label this script sets (bare '<name>' when the
+# dispatch had no --todo; orch* labels excluded); a
+# reaped pane drops out of the list, so the layout self-heals, no state file.
+if [ -n "$DIR" ]; then
+  set -- pane split --current --direction "$DIR" --no-focus
+else
+  panes_json=$($HERDR pane list ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} 2>/dev/null) || panes_json=""
+  sel=""
+  if [ -n "$panes_json" ]; then
+    sel=$(printf '%s\n' "$panes_json" | jq -r --arg self "${HERDR_PANE_ID:-}" '
+      [.result.panes[]
+       | select(.pane_id != $self)
+       | select((.label // "") | test("^[a-z][a-z0-9_-]*(: |$)"))
+       | select((.label // "") | test("^orch") | not)]
+      | "\(length) \(last | .pane_id // "")"' 2>/dev/null) || sel=""
+  fi
+  [ -n "$sel" ] || sel="0 "
+  n_workers=${sel%% *}
+  last_worker=${sel#* }
+  # command substitution strips the trailing space of "0 ", leaving sel="0":
+  # the suffix parse then yields last_worker="0", so clear it explicitly.
+  [ "$n_workers" -gt 0 ] 2>/dev/null || last_worker=""
+  if [ -n "$last_worker" ] && [ $((n_workers % 2)) -ne 0 ]; then
+    set -- pane split --pane "$last_worker" --direction right --no-focus
+  elif [ -n "${HERDR_PANE_ID:-}" ]; then
+    set -- pane split --pane "$HERDR_PANE_ID" --direction down --no-focus
+  else
+    set -- pane split --current --direction down --no-focus
+  fi
+fi
+if [ -n "$CWD" ]; then
+  set -- "$@" --cwd "$CWD"
+elif [ -n "${PWD:-}" ]; then
+  set -- "$@" --cwd "$PWD"
+fi
+# The worker's board writes silently fall back to ~/.herdr-org/default when
+# this is missing, which reads downstream as "board unavailable" and loses
+# milestones (marketplace#125): fail at spawn time instead. Skyline-routed
+# shells drop the pane env; measure yours once (ps eww -p <claude-pid> |
+# grep '^HERDR_') and pass it via the tool call's env parameter.
+if [ -n "${HERDR_ORG_ROOT:-}" ]; then
+  set -- "$@" --env "HERDR_ORG_ROOT=$HERDR_ORG_ROOT"
+else
+  echo "dispatch-worker: HERDR_ORG_ROOT is not set in this process; refusing to spawn a worker whose board writes would land in ~/.herdr-org/default (marketplace#125)." >&2
+  exit 1
+fi
+set -- "$@" --env "PATH=$PATH"
+split_json=$($HERDR "$@")
+pane_id=$(printf '%s\n' "$split_json" | jq -r '.result.pane.pane_id // empty')
+[ -n "$pane_id" ] || {
+  echo "dispatch-worker: failed to parse pane_id from:" >&2
+  printf '%s\n' "$split_json" >&2
+  exit 1
+}
+
+# A freshly split pane's shell needs a beat before `agent start` accepts it
+# (agent_pane_busy: "not an available shell"; hit live 2026-07-28). Retry with
+# a short backoff instead of racing the shell prompt.
+tries=0
+while :; do
+  # LAUNCH-ARG POINTER (claude kind, 2026-08-05): `claude "prompt"` starts
+  # the interactive TUI with the prompt auto-submitted as the first message
+  # (documented CLI behavior), so the pointer never touches the composer and
+  # the first-prompt swallow race (#126; measured 4/9 dispatches needing
+  # recovery in one program) cannot occur. Other kinds keep the composer
+  # send + verify ladder below.
+  if [ "$KIND" = "claude" ]; then
+    if [ -n "$EXTRA_ARGS" ]; then
+      # shellcheck disable=SC2086
+      start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- $EXTRA_ARGS "$PROMPT" 2>&1) && break
+    else
+      start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- "$PROMPT" 2>&1) && break
+    fi
+  elif [ -n "$EXTRA_ARGS" ]; then
+    # shellcheck disable=SC2086
+    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" -- $EXTRA_ARGS 2>&1) && break
+  else
+    start_out=$($HERDR agent start "$NAME" --kind "$KIND" --pane "$pane_id" --timeout "$TIMEOUT" 2>&1) && break
+  fi
+  # Only the fresh-pane readiness race is worth retrying; every other failure
+  # is deterministic, and retrying it 10x buries the real error herdr already
+  # reported cleanly (marketplace#128).
+  case "$start_out" in
+    *agent_pane_busy*|*"not an available shell"*) ;;
+    *)
+      echo "dispatch-worker: agent start failed on pane $pane_id: $start_out" >&2
+      exit 1
+      ;;
+  esac
+  tries=$((tries + 1))
+  if [ "$tries" -ge 10 ]; then
+    echo "dispatch-worker: agent start failed after $tries tries on pane $pane_id: $start_out" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+# L18: label the pane too. The agent name carries sidebar identity while the
+# agent lives; the pane label outlives it, so a reaped lane stays legible.
+$HERDR pane rename "$pane_id" "${NAME}${TODO:+: $TODO}" >/dev/null 2>&1 || true
+
+# org-waker (L6): a registered lane's settle, block, or death rings the
+# conductor. Soft dependency: skipped without a --wake-target or the plugin;
+# the fallback-wait doctrine covers that org.
+WAKER="skipped"
+WCTL="$(dirname "$0")/waker-ctl"
+if [ -n "$WAKE_TARGET" ] && [ -x "$WCTL" ] && "$WCTL" present 2>/dev/null; then
+  if "$WCTL" register --pane "$pane_id" --lane "$NAME" --target "$WAKE_TARGET" ${TODO:+--todo "$TODO"} ${BEAT_NOTE:+--beat-note "$BEAT_NOTE"} >/dev/null 2>&1; then
+    WAKER="registered"
+  fi
+fi
+
+if [ "$KIND" = "claude" ]; then
+  # The pointer rode the launch args; there is nothing to type and nothing
+  # to recover. Confirm the session actually started processing it.
+  SUBMIT="launch-arg"
+  $HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1 || SUBMIT="launch-arg-unconfirmed"
+else
+  # Point the worker at the brief (composer path for kinds whose CLI has no
+  # documented launch-arg prompt).
+  $HERDR agent prompt "$NAME" "$PROMPT" >/dev/null
+
+  # VERIFY-AFTER-SEND: a fresh agent can swallow its first prompt two ways --
+  # typed into an already-drafted composer (recovered by an empty submit) or
+  # typed before the input box exists and discarded entirely (recovered only
+  # by re-sending the prompt; field data hit both variants live). Escalate
+  # through wait, empty-submit, then a single re-send before giving up.
+  SUBMIT="failed"
+  if $HERDR agent wait "$NAME" --until working --timeout 4000 >/dev/null 2>&1; then
+    SUBMIT="clean"
+  else
+    $HERDR pane run "$pane_id" "" >/dev/null 2>&1 || true
+    if $HERDR agent wait "$NAME" --until working --timeout 8000 >/dev/null 2>&1; then
+      SUBMIT="recovered"
+    else
+      $HERDR agent prompt "$NAME" "$PROMPT" >/dev/null 2>&1 || true
+      if $HERDR agent wait "$NAME" --until working --timeout 8000 >/dev/null 2>&1; then
+        SUBMIT="reprompted"
+      fi
+    fi
+  fi
+fi
+
+# Report the state the caller should sanity-check instead of assuming the
+# send landed.
+state=$($HERDR agent get "$NAME" 2>/dev/null | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null || echo unknown)
+
+BOARD=""
+if command -v board >/dev/null 2>&1; then
+  BOARD="board"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/scripts/board" ]; then
+  BOARD="$CLAUDE_PLUGIN_ROOT/scripts/board"
+fi
+if [ -n "$TODO" ] && [ -n "$BOARD" ]; then
+  # Silenced: stdout is the JSON summary contract, board chatter must not join it.
+  "$BOARD" set-owner "$TODO" "$NAME" >/dev/null || true
+  "$BOARD" set-status "$TODO" in_progress >/dev/null || true
+  [ -n "$MARKERS" ] && { "$BOARD" comment "$TODO" "**$MARKERS** dispatched as $NAME (kind $KIND, pane $pane_id)" >/dev/null || true; }
+  # The gauge verdict is the L17/L10 evidence the board used to get only as prose.
+  [ -n "$GAUGE" ] && { "$BOARD" comment "$TODO" "**[$GAUGE]** at dispatch of $NAME" >/dev/null || true; }
+fi
+
+printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s}\n' \
+  "$(printf '%s' "$NAME" | jq -Rs .)" \
+  "$(printf '%s' "$pane_id" | jq -Rs .)" \
+  "$(printf '%s' "$KIND" | jq -Rs .)" \
+  "$(printf '%s' "$TODO" | jq -Rs .)" \
+  "$(printf '%s' "$state" | jq -Rs .)" \
+  "$(printf '%s' "$MODEL" | jq -Rs .)" \
+  "$(printf '%s' "$EFFORT" | jq -Rs .)" \
+  "$(printf '%s' "$ADVISOR" | jq -Rs .)" \
+  "$(printf '%s' "$DEFAULTED" | jq -Rs .)" \
+  "$(printf '%s' "$MARKERS" | jq -Rs .)" \
+  "$(printf '%s' "$GAUGE" | jq -Rs .)" \
+  "$(printf '%s' "$WAKER" | jq -Rs .)" \
+  "$(printf '%s' "$SUBMIT" | jq -Rs .)"

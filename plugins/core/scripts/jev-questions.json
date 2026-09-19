@@ -1,0 +1,65 @@
+{
+  "_comment": "Every Jev question and threshold core uses, in one reviewable place. Each set is one request: its questions run in parallel over the same state and cannot see each other's answers, so speculative questions are cheap and a caller reads only the ones its branch needs. Question ids are never sent to the model; the instructions carry the whole meaning. Thresholds are STARTING POINTS tuned on the vendor's cookbooks, not measurements from this box: read ~/.claude/jev-audit.jsonl for a week, then move them in the overlay (~/.claude/jev-questions.json, same shape, recursively merged) rather than here.",
+  "_model_note": "Written against jev-1.13.0. A Noul is the probability of YES with no separate confidence; a Choice carries probabilities over the options plus a confidence derived from how peaked they are. Do not carry a Noul threshold over to a Choice or expect a question and its negation to sum to 1 (vendor jaggedness page, 'structural invariants').",
+  "sets": {
+    "research-nudge": {
+      "_used_by": "hooks/jev-research-nudge.sh (Stop)",
+      "questions": {
+        "hedged_fact": {
+          "type": "noul",
+          "instructions": {
+            "question": "Does `assistant_text` assert a factual, externally checkable claim while hedging it, without saying the claim was verified?",
+            "factual_claim_means": [
+              "how an API, CLI flag, or config option behaves",
+              "a version number or release date",
+              "a library or tool capability",
+              "a default value",
+              "a historical fact, or who did what"
+            ],
+            "hedge_means": ["might", "may", "probably", "possibly", "I think", "I believe", "should be", "as far as I know", "if I recall", "presumably", "likely"]
+          },
+          "criteria": {
+            "true": "A checkable fact is stated with a hedge and nothing says it was looked up or tested.",
+            "false": "The hedge concerns the user's own intent or preference ('you may want to'), a design suggestion, a plan, an opinion, or the claim is presented as verified with a source or a test."
+          }
+        }
+      },
+      "thresholds": {
+        "nudge": 0.7
+      }
+    },
+    "deps-pin": {
+      "_used_by": "hooks/jev-intent-gate.sh (PreToolUse) for the two dependency rules core-claude's judge-hook ships as class=escalate",
+      "questions": {
+        "lookup_seen": {
+          "type": "noul",
+          "instructions": {
+            "question": "Do `recent_user_messages` or `tool_input` show that the pinned package version was taken from a registry lookup or from the project's own lockfile or manifest, rather than recalled from memory?",
+            "lookup_means": [
+              "npm view <pkg> version, npm show <pkg>",
+              "composer show <pkg>, composer show <pkg> --all",
+              "consulting npmjs.com or packagist.org",
+              "a version copied from package-lock.json, yarn.lock, pnpm-lock.yaml, composer.lock, package.json, or composer.json"
+            ]
+          },
+          "criteria": {
+            "true": "A lookup command, a registry page, or a lockfile/manifest source for that exact version is visible in the messages or the tool input.",
+            "false": "No lookup or source is visible; the version appears to be recalled."
+          }
+        },
+        "raises_version": {
+          "type": "noul",
+          "instructions": "Does `tool_input` add a new dependency or move an existing dependency's version constraint upward?",
+          "criteria": {
+            "true": "A dependency line is added, or a version constraint is raised.",
+            "false": "Dependency versions are unchanged: the edit touches scripts, metadata, formatting, or lowers or removes a constraint."
+          }
+        }
+      },
+      "thresholds": {
+        "lookup_seen": 0.6,
+        "raises_version": 0.6
+      }
+    }
+  }
+}

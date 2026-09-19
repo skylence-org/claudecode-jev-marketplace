@@ -21,28 +21,32 @@ and threshold lives in one `jev-questions.json` per plugin, overridable per box.
 
 ## Plugins
 
-- **`jev-core`** — the `jev` shell helper and two hooks that replace `claude -p` subprocess
-  judgments in core-claude: `jev-intent-gate` (PreToolUse: is this pinned dependency version
-  backed by a registry lookup?) and `jev-research-nudge` (Stop: did the last turn hedge a
-  checkable fact?). [README](plugins/jev-core/README.md).
-- **`herdr-agent-org-jev`** — the Skylence herdr agent-org, forked from
+- **`core`** — the full Claude Code baseline, forked from `core-claude` 0.9.8:
+  `/core:setup` (judge-hook rules engine, writing-guard, core-hud statusline, CLAUDE.md
+  guidelines, bypass posture gated by the judge), `/core:doctor`, and the `jev` shell
+  helper. Two judgments core-claude spent a `claude -p` subprocess on are Jev's:
+  `jev-intent-gate` (PreToolUse: is this pinned dependency version backed by a registry
+  lookup?) and `jev-research-nudge` (Stop: did the last turn hedge a checkable fact?).
+  Replaces core-claude; never install both. [README](plugins/core/README.md).
+- **`herdr-agent-org`** — the Skylence herdr agent-org, forked from
   `herdr-agent-org-claude` 2.4.1, with Jev at two event boundaries: `tier-gauge` inside
   `dispatch-worker` (L17 TIER BY BRIEF, measured) and `review-gate-check` at accept (L10 review
   gate, measured). Everything else is the upstream org unchanged.
-  [README](plugins/herdr-agent-org-jev/README.md).
+  [README](plugins/herdr-agent-org/README.md).
 
 ## Install
 
 ```
 /plugin marketplace add skylence-org/claudecode-jev-marketplace
-/plugin install jev-core@claudecode-jev-marketplace
-/plugin install herdr-agent-org-jev@claudecode-jev-marketplace   # instead of herdr-agent-org-claude
+/plugin install core@claudecode-jev-marketplace              # instead of core-claude
+/plugin install herdr-agent-org@claudecode-jev-marketplace   # instead of herdr-agent-org-claude
+/core:setup
 ```
 
 Set `TYPESAFE_API_KEY` in your shell environment (a key from
 https://console.typesafe.ai/keys; never paste it into a chat) and restart Claude Code. Without
 a key every Jev call is fail-open: hooks allow, dispatches go ungauged, and one stderr line
-says so. `sh plugins/jev-core/scripts/jev doctor` checks the setup.
+says so. `sh plugins/core/scripts/jev doctor` checks the setup.
 
 ## What is deliberately NOT on Jev
 
@@ -60,9 +64,9 @@ says so. `sh plugins/jev-core/scripts/jev doctor` checks the setup.
 
 ```bash
 sh tools/check-parity.sh                                  # jev twins byte-identical, wiring phrases present
-bash plugins/jev-core/tests/jev.test.sh                   # stub-driven, no key, no tokens
-bash plugins/herdr-agent-org-jev/tests/jev/gauge.test.sh  # same
-sh plugins/herdr-agent-org-jev/tests/conduct/run-conduct.sh --self-test
+bash plugins/core/tests/jev.test.sh                   # stub-driven, no key, no tokens
+bash plugins/herdr-agent-org/tests/jev/gauge.test.sh  # same
+sh plugins/herdr-agent-org/tests/conduct/run-conduct.sh --self-test
 git config core.hooksPath .githooks                       # once per clone
 ```
 

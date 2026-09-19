@@ -1,0 +1,49 @@
+{
+  "description": "core baseline guards, registered BY THE PLUGIN so they update with it (forked from core-claude 0.9.8). PreToolUse: judge-hook on every tool call (the deny/allow/gated/escalate rules engine; its complete ruleset ships in judge-rules.json beside it, ~/.claude/judge-rules.json is an overlay) and jev-intent-gate on Bash/Edit/Write plus their skyline equivalents (the two dependency-pin rules core-claude judges with a `claude -p` subprocess, decided here by ONE Jev request after a regex pre-match; they are removed from this plugin's judge-rules.json so nothing fires twice). PostToolUse: writing-guard on write/edit tools plus their skyline equivalents. Stop: jev-research-nudge (a regex hedge gate, then ONE Jev request; silent in agent-org sessions) in place of core-claude's `claude -p` research-nudge. Every Jev call fails open: no TYPESAFE_API_KEY, a timeout, or an unparseable reply allows and logs one stderr line. Do not install core-claude beside this plugin.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/judge-hook.sh\"",
+            "statusMessage": "judge-hook"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Edit|Write|mcp__.*skyline_(run|create|edit)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/jev-intent-gate.sh\"",
+            "statusMessage": "jev-intent-gate"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|mcp__.*skyline_(create|edit)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/writing-guard.sh\"",
+            "statusMessage": "writing-guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/jev-research-nudge.sh\"",
+            "statusMessage": "jev-research-nudge"
+          }
+        ]
+      }
+    ]
+  }
+}

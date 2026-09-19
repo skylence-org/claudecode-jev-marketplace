@@ -24,7 +24,7 @@ jobs:
       # The checker follows the SHEBANG, not the extension.
       - name: shell syntax
         run: |
-          for f in plugins/*/hooks/*.sh plugins/*/scripts/* plugins/*/tests/*.sh plugins/*/tests/*/*.sh tools/*.sh .githooks/*; do
+          for f in plugins/*/hooks/*.sh plugins/*/scripts/* plugins/*/statusline/*.sh plugins/*/skills/*/*.sh plugins/*/tests/*.sh plugins/*/tests/*/*.sh tools/*.sh .githooks/*; do
             [ -f "$f" ] || continue
             case "$(head -1 "$f")" in
               *bash*) bash -n "$f" || { echo "invalid bash: $f"; exit 1; } ;;
@@ -42,20 +42,28 @@ jobs:
       - name: parity (jev twins, wiring phrases)
         run: sh tools/check-parity.sh
 
-      - name: jev-core suite
-        run: bash plugins/jev-core/tests/jev.test.sh
+      - name: core suite
+        run: bash plugins/core/tests/jev.test.sh
 
-      - name: herdr-agent-org-jev gauge suite
-        run: bash plugins/herdr-agent-org-jev/tests/jev/gauge.test.sh
+      - name: herdr-agent-org gauge suite
+        run: bash plugins/herdr-agent-org/tests/jev/gauge.test.sh
 
       - name: conduct harness self-test (stubbed, no LLM call)
-        run: sh plugins/herdr-agent-org-jev/tests/conduct/run-conduct.sh --self-test
+        run: sh plugins/herdr-agent-org/tests/conduct/run-conduct.sh --self-test
 
-      # The suites drive the model through JEV_STUB_ANSWERS and never export a
-      # key. If that ever stops being true this job starts costing money, which
-      # is worth noticing.
-      - name: assert the suites made no live Jev call
+      # macOS only, matching upstream: the judge-hook suite leans on BSD/GNU
+      # fallbacks (stat -f vs -c, base64 -D vs -d) and is only ever verified on
+      # the platform it ships to. It stubs the claude CLI for the escalate paths.
+      - name: judge-hook suite (unchanged from core-claude)
+        if: matrix.os == 'macos-latest'
+        run: bash plugins/core/hooks/judge-hook.test.sh
+
+      # The suites drive the models through stubs and never export a key. If
+      # that ever stops being true these jobs start costing money, which is
+      # worth noticing.
+      - name: assert the suites made no live model call
         run: |
-          grep -q 'JEV_STUB_ANSWERS' plugins/jev-core/tests/jev.test.sh || { echo "jev-core suite no longer stubs Jev"; exit 1; }
-          grep -q 'JEV_STUB_ANSWERS' plugins/herdr-agent-org-jev/tests/jev/gauge.test.sh || { echo "gauge suite no longer stubs Jev"; exit 1; }
-          grep -q 'unset TYPESAFE_API_KEY' plugins/jev-core/tests/jev.test.sh || { echo "jev-core suite does not clear the key"; exit 1; }
+          grep -q 'JEV_STUB_ANSWERS' plugins/core/tests/jev.test.sh || { echo "core suite no longer stubs Jev"; exit 1; }
+          grep -q 'JEV_STUB_ANSWERS' plugins/herdr-agent-org/tests/jev/gauge.test.sh || { echo "gauge suite no longer stubs Jev"; exit 1; }
+          grep -q 'unset TYPESAFE_API_KEY' plugins/core/tests/jev.test.sh || { echo "core suite does not clear the key"; exit 1; }
+          grep -q 'stub_claude' plugins/core/hooks/judge-hook.test.sh || { echo "judge-hook suite no longer stubs the CLI"; exit 1; }

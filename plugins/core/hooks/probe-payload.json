@@ -1,0 +1,7 @@
+{
+  "_comment": "Fixture for the gate probe in /core:setup and /core:doctor. It exists as a FILE because the probe has to be run from a shell command, and a command line that spells out a privilege word is itself denied by the rule it is testing. Piping this file in keeps the trigger text out of the command. Feed it to the hook and expect exit 2: `cat probe-payload.json | bash judge-hook.sh`. Keep the command matched to the privilege.sudo rule, and pick one exactly one shipped rule catches, so an overlay that disables that single rule is what the probe reports on.",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "sudo ls /root"
+  }
+}
