@@ -361,7 +361,7 @@ cmd_get() {
 
     comment_count=$(sed -n '/^## Comments$/,$p' "$p" | awk '/^### / { count++ } END { print count+0 }')
 
-    printf '{\"slug\":\"%s\",\"title\":\"%s\",\"status\":\"%s\",\"owner\":\"%s\",\"tags\":%s,\"blockers\":%s,\"comment_count\":%d,\"body\":\"%s\"}\n' \
+    printf '{"slug":"%s","title":"%s","status":"%s","owner":"%s","tags":%s,"blockers":%s,"comment_count":%d,"body":"%s"}\n' \
       "$(json_escape "$slug")" "$(json_escape "$ti")" "$(json_escape "$st")" "$(json_escape "$ow")" \
       "$(json_array "$tags_raw")" "$(json_array "$blockers_raw")" "$comment_count" "$(json_escape "$body")"
   else
