@@ -1,6 +1,6 @@
 # herdr-agent-org
 
-Claude Code port of the Skylence agent-org, running on **[Herdr](https://herdr.dev)** instead of Solo — forked from [multi-llm-marketplace](https://github.com/skylence-org/multi-llm-marketplace)'s `herdr-agent-org-claude` 2.4.1, with [TypeSafe Jev](https://docs.typesafe.ai) measuring two laws the orchestrator used to judge from memory. Install this **instead of** `herdr-agent-org-claude`, never beside it: both carry the same role skills and hooks.
+Claude Code port of the Skylence agent-org, running on **[Herdr](https://herdr.dev)**, forked from [multi-llm-marketplace](https://github.com/skylence-org/multi-llm-marketplace)'s `herdr-agent-org-claude` 2.4.1, with [TypeSafe Jev](https://docs.typesafe.ai) measuring two laws the orchestrator used to judge from memory. Install this **instead of** `herdr-agent-org-claude`, never beside it: both carry the same role skills and hooks.
 
 ## What Jev adds (and where it deliberately is not)
 
@@ -18,7 +18,7 @@ Setup: put the key in `~/.config/typesafe/api_key` (one line, `chmod 600`). `jev
 
 The rest of this README is the upstream `herdr-agent-org-claude` document, unchanged except the install commands.
 
-Herdr is the agent multiplexer: real terminal panes, semantic agent state (`working` / `blocked` / `done` / `idle`), and CLI plus socket control so agents can orchestrate each other. This plugin maps the Skylence conductor-and-workers doctrine onto those primitives plus a **filesystem board**, so no Solo MCP server is involved.
+Herdr is the agent multiplexer: real terminal panes, semantic agent state (`working` / `blocked` / `done` / `idle`), and CLI plus socket control so agents can orchestrate each other. This plugin maps the Skylence conductor-and-workers doctrine onto those primitives plus a **filesystem board**, so the board needs no MCP server.
 
 ## Prerequisites
 
@@ -125,20 +125,18 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 
 `dispatch-worker` fills in the doctrinal default itself (`--model sonnet` for a Claude worker, `--effort medium` for a grok one) when you pass none, so silence at dispatch cannot resolve to whatever the box is installed at. Going above that default requires `--upgrade-reason "<why>"`, which the script refuses to skip and files on the lane todo as `[MODEL: ...]` or `[EFFORT: ...]`. A bare `herdr agent start` has no such protection, so pass the setting yourself there. Both rules come from [issue #32](https://github.com/skylence-org/multi-llm-marketplace/issues/32).
 
-## Solo vs Herdr substrate
+## The Herdr substrate at a glance
 
-| Concern | soloterm-agent-org | herdr-agent-org-claude |
-| --- | --- | --- |
-| Board and todos | Solo MCP todos and pads | Filesystem board (`scripts/board`) |
-| Worker PTYs | `spawn_agent` | `herdr pane split` plus `agent start` |
-| Read and steer | `get_process_output` / `send_input` | `herdr agent read` / `agent prompt` |
-| Idle wake | `timer_fire_when_idle` | org-waker ring (event-driven prompt); fallback `herdr agent wait` |
-| Agent state | Process status | Herdr semantic states plus sidebar |
-| MCP required | Solo stdio MCP | None, CLI only |
-| Run location | Any terminal Solo manages | **Must** be `HERDR_ENV=1` |
-| Peer discovery | `list_projects` | `herdr session list` plus per-session agent list |
-
-Doctrine (LAWS, compile monopoly, no-fusion, verify-before-accept, MCP-first lane trees) is shared with the Solo siblings; only the control plane changes.
+| Concern | herdr-agent-org |
+| --- | --- |
+| Board and todos | Filesystem board (`scripts/board`) |
+| Worker PTYs | `herdr pane split` plus `agent start` |
+| Read and steer | `herdr agent read` / `agent prompt` |
+| Idle wake | org-relay `relay_await` (task-backed); fallback `herdr agent wait` |
+| Agent state | Herdr semantic states plus sidebar |
+| MCP required | org-relay for messaging; the board itself is CLI only |
+| Run location | **Must** be `HERDR_ENV=1` |
+| Peer discovery | `herdr session list` plus per-session agent list |
 
 ## Typical flow
 
@@ -150,9 +148,9 @@ Doctrine (LAWS, compile monopoly, no-fusion, verify-before-accept, MCP-first lan
 
 ## Notes
 
-- Hook markers live at `/tmp/claude-herdr-org-lanes-<session_id>`, so they do not collide with the Solo sibling's `/tmp/claude-org-lanes-<session_id>`.
-- The stop gate carries both fixes the Solo sibling landed 2026-07-21: the premise follows recorded evidence (a session that only armed waits is not told it dispatched workers), and an answered sweep settles until org state actually moves.
-- `ghost-probe.sh` on a pure Herdr box: use `live` then `probe`. `zero-touch` needs a source that strips a suggestion ghost's styling to an empty prompt line, which Solo provided and Herdr does not.
+- Hook markers live at `/tmp/claude-herdr-org-lanes-<session_id>`, one file per session.
+- The stop gate follows two rules, both field-driven (2026-07-21): the premise follows recorded evidence (a session that only armed waits is not told it dispatched workers), and an answered sweep settles until org state actually moves.
+- `ghost-probe.sh` on a pure Herdr box: use `live` then `probe`. `zero-touch` needs a source that strips a suggestion ghost's styling to an empty prompt line, which Herdr does not provide.
 - Prefer `${HERDR_BIN_PATH:-herdr}`; Herdr injects that variable inside managed panes.
 - Pair with `core-claude` for the baseline guidelines and judge-hook, and with `skyline-claude` for hash-guarded edits.
 - `tests/conduct/` pressure-tests the role skills' conduct clauses on a live model (superpowers-style RED/GREEN doctrine testing): `sh tests/conduct/run-conduct.sh` is BILLED; `--self-test` (stubbed, free) runs in CI; `--without-skill` captures baseline rationalizations to close in the skills' tables.

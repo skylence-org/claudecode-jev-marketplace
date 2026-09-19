@@ -1,5 +1,5 @@
 #!/bin/sh
-# SessionStart hook, two events, one contract (soloterm #38, backported).
+# SessionStart hook, two events, one contract.
 #
 # startup/resume: prime the role-skill contract before the first beat. A
 # dispatch pointer names the role skill, but a pointer is prose a model can
@@ -10,7 +10,7 @@
 # degraded agent, and a half-remembered skill is exactly where clauses go
 # optional.
 #
-# Herdr has no per-worker env marker the way Solo has SOLO_PROCESS_ID: every
+# Herdr has no per-worker env marker: every
 # pane carries HERDR_ENV=1, orchestrator and worker alike, so this arms for
 # any Herdr-managed Claude session (or any session that dispatched).
 # Over-arming costs one paragraph that no-ops in a session with no org role.

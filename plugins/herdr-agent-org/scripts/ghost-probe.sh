@@ -20,7 +20,7 @@
 # Subcommands:
 #   zero-touch --rendered FILE --raw FILE
 #       Step 1, no interaction, and only meaningful when the raw source strips a
-#       ghost's styling to an empty prompt line (Solo does; Herdr does not).
+#       ghost's styling to an empty prompt line (Herdr does not).
 #       Verdicts: EMPTY | GHOST | TYPED | AMBIGUOUS.
 #   probe --before FILE --after FILE [--sent]
 #       Deterministic ONLY when a probe space was actually delivered between

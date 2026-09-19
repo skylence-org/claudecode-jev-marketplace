@@ -9,20 +9,20 @@ You conduct and plan; workers implement. You never narrate routine beats, and yo
 
 Every part of this skill binds: the LAWS carry the fingerprints and authority stamps, the PLAYBOOK carries the procedures that honor them, and neither half is advisory (L0). Discretion is legal ONLY where a JUDGMENT marker grants it; an unmarked situation means comply or file (L13), never improvise. Cite laws by number in verdicts, comments, and filings. The org moves at the speed of its least compliant role: each role's output is the next role's only input, so a step you drop lands downstream as missing state or missing evidence, and it lands there long after you have moved on.
 
-## Substrate map (Solo to Herdr)
+## Instruments
 
-| Solo concept | Herdr equivalent |
+| Need | Herdr instrument |
 | --- | --- |
-| todo_list / todo_get / todo_comment | `board list` / `board get` / `board comment` |
-| scratchpad | `board pad list|get|append|write` |
-| spawn_agent plus PTY | `scripts/dispatch-worker`, or `pane split` then `agent start` |
-| send_input | `SendMessage` native ping for a live Claude session (L6); `herdr agent prompt` / `agent send-keys` for non-Claude kinds and process-level steering (after the no-fusion check) |
-| get_process_output | `herdr agent read` / `pane read` (frame plus scrollback, see READS AND WHAT SURVIVES) |
-| list_processes | `herdr agent list` plus `herdr pane list` |
-| timer_fire_when_idle | `relay_await(agent=<you>)` — task-backed coverage armed as the turn's LAST call; the settled task starts your next turn; fallback one-shot `herdr agent wait` |
-| close_process | worker idles resident at [DONE]; you unregister (L6) then reap the pane (L4) |
-| SOLO_PROCESS_ID | `HERDR_PANE_ID` plus the agent name |
-| project_id override | `HERDR_SESSION` when sweeping peer Herdr sessions |
+| List, read, comment on todos | `board list` / `board get` / `board comment` |
+| Scratch notes | `board pad list|get|append|write` |
+| Spawn a worker | `scripts/dispatch-worker`, or `pane split` then `agent start` |
+| Steer a worker | `SendMessage` native ping for a live Claude session (L6); `herdr agent prompt` / `agent send-keys` for non-Claude kinds and process-level steering (after the no-fusion check) |
+| Read a worker | `herdr agent read` / `pane read` (frame plus scrollback, see READS AND WHAT SURVIVES) |
+| List workers | `herdr agent list` plus `herdr pane list` |
+| Wait for a wake | `relay_await(agent=<you>)`, task-backed coverage armed as the turn's LAST call; the settled task starts your next turn; fallback one-shot `herdr agent wait` |
+| Retire a worker | worker idles resident at [DONE]; you unregister (L6) then reap the pane (L4) |
+| Your identity | `HERDR_PANE_ID` plus the agent name |
+| Peer sessions | `HERDR_SESSION` when sweeping peer Herdr sessions |
 
 ## LAWS (invariant; fingerprint; authority)
 
@@ -285,7 +285,7 @@ The board IS the status surface; sweep at every ANCHOR and before succession. TO
 
 ### Rationalizations (observed)
 
-Every row is a deviation this substrate or its Solo sibling actually produced; the local story always sounds reasonable, and the story itself is the alarm (L0).
+Every row is a deviation this org actually produced; the local story always sounds reasonable, and the story itself is the alarm (L0).
 
 | Story | Reality |
 | --- | --- |

@@ -4,7 +4,7 @@
 # prove. Read by org-stop-gate.sh.
 #
 # Herdr has no MCP tool surface (dispatch, steer, and wait are shell commands),
-# so this hook cannot arm on a tool NAME the way the Solo sibling does. It fires
+# so this hook cannot arm on a tool NAME. It fires
 # on every Bash/skyline_run call and classifies the command text itself:
 #   dispatch  worker started (dispatch-worker, herdr agent start)
 #   wait      lifecycle wait armed (herdr agent wait)

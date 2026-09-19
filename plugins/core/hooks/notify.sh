@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # notify.sh — desktop notifications for Claude Code lifecycle events.
-# Not wired by any skill in this plugin (upstream wired it from a Solo skill; Solo is retired, herdr replaced it). Kept for a manual hook entry. Handles only events
+# Not wired by any skill in this plugin; kept for a manual hook entry. Handles only events
 # Claude Code actually emits: PreCompact, Notification (idle), Stop.
 payload=$(cat)
 event=$(echo "$payload" | jq -r '.hook_event_name // "Unknown"')

@@ -5,7 +5,7 @@ description: Successor pickup on the Herdr substrate. Inherit a predecessor work
 
 # Replacer (successor pickup)
 
-Your context is fresh; the predecessor's knowledge survives only in artifacts. Trust artifacts, never prose. On Herdr this bites harder than on Solo: your predecessor's pane was reaped and its scrollback went with it, so the board todo and git are all there is.
+Your context is fresh; the predecessor's knowledge survives only in artifacts. Trust artifacts, never prose. On Herdr your predecessor's pane was reaped and its scrollback went with it, so the board todo and git are all there is.
 
 ## This skill is a contract, not a menu
 
