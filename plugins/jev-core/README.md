@@ -28,7 +28,7 @@ spends a model judgment, and nowhere on the per-tool-call hot path.
 ## Install
 
 ```
-/plugin marketplace add skylence-be/claudecode-jev-marketplace
+/plugin marketplace add skylence-org/claudecode-jev-marketplace
 /plugin install jev-core@claudecode-jev-marketplace
 ```
 

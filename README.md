@@ -6,9 +6,9 @@ Jev is a System One model: send a state and typed questions (Choice, Score, Noul
 answers and calibrated probabilities back. No generated text, no parsing, ~100 ms, output
 tokens free. That makes it a decision primitive a shell hook can call the way it calls `jq`,
 and this marketplace is the place that gets built out. The sibling
-[multi-llm-marketplace](https://github.com/skylence-be/multi-llm-marketplace) stays as it is.
+[multi-llm-marketplace](https://github.com/skylence-org/multi-llm-marketplace) stays as it is.
 
-Owner: Skylence (github.com/skylence-be).
+Owner: Skylence (github.com/skylence-org).
 
 ## Principle
 
@@ -34,7 +34,7 @@ and threshold lives in one `jev-questions.json` per plugin, overridable per box.
 ## Install
 
 ```
-/plugin marketplace add skylence-be/claudecode-jev-marketplace
+/plugin marketplace add skylence-org/claudecode-jev-marketplace
 /plugin install jev-core@claudecode-jev-marketplace
 /plugin install herdr-agent-org-jev@claudecode-jev-marketplace   # instead of herdr-agent-org-claude
 ```

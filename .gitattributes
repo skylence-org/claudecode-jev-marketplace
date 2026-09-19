@@ -1,0 +1,5 @@
+# Shell scripts and hooks are executed by Claude Code on macOS/Linux and by Git Bash on
+# Windows; a CRLF shebang line breaks the former. Keep every text file LF in the working copy.
+* text=auto eol=lf
+*.png binary
+*.webp binary

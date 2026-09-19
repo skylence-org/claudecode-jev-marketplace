@@ -1,6 +1,6 @@
 # herdr-agent-org-jev
 
-Claude Code port of the Skylence agent-org, running on **[Herdr](https://herdr.dev)** instead of Solo — forked from [multi-llm-marketplace](https://github.com/skylence-be/multi-llm-marketplace)'s `herdr-agent-org-claude` 2.4.1, with [TypeSafe Jev](https://docs.typesafe.ai) measuring two laws the orchestrator used to judge from memory. Install this **instead of** `herdr-agent-org-claude`, never beside it: both carry the same role skills and hooks.
+Claude Code port of the Skylence agent-org, running on **[Herdr](https://herdr.dev)** instead of Solo — forked from [multi-llm-marketplace](https://github.com/skylence-org/multi-llm-marketplace)'s `herdr-agent-org-claude` 2.4.1, with [TypeSafe Jev](https://docs.typesafe.ai) measuring two laws the orchestrator used to judge from memory. Install this **instead of** `herdr-agent-org-claude`, never beside it: both carry the same role skills and hooks.
 
 ## What Jev adds (and where it deliberately is not)
 
@@ -26,7 +26,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
 2. Orchestrator and workers must run **inside Herdr panes** (`HERDR_ENV=1`).
 3. `jq` on PATH (the hooks and `dispatch-worker` parse Herdr's JSON).
 4. Optional: `herdr integration install claude`. See the caveat below before assuming it does more than it does.
-5. Recommended: the **org-waker** herdr plugin (`herdr plugin install skylence-be/multi-llm-marketplace/herdr-plugins/org-waker`). It is the event-driven wake mechanism L6 builds on; without it the org runs on fallback waits alone.
+5. Recommended: the **org-waker** herdr plugin (`herdr plugin install skylence-org/multi-llm-marketplace/herdr-plugins/org-waker`). It is the event-driven wake mechanism L6 builds on; without it the org runs on fallback waits alone.
 
 ## What it provides
 
@@ -57,7 +57,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
 ## Install
 
 ```
-/plugin marketplace add skylence-be/claudecode-jev-marketplace
+/plugin marketplace add skylence-org/claudecode-jev-marketplace
 /plugin install herdr-agent-org-jev@claudecode-jev-marketplace
 ```
 
@@ -123,7 +123,7 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
   -- --permission-mode bypassPermissions
 ```
 
-`dispatch-worker` fills in the doctrinal default itself (`--model sonnet` for a Claude worker, `--effort medium` for a grok one) when you pass none, so silence at dispatch cannot resolve to whatever the box is installed at. Going above that default requires `--upgrade-reason "<why>"`, which the script refuses to skip and files on the lane todo as `[MODEL: ...]` or `[EFFORT: ...]`. A bare `herdr agent start` has no such protection, so pass the setting yourself there. Both rules come from [issue #32](https://github.com/skylence-be/multi-llm-marketplace/issues/32).
+`dispatch-worker` fills in the doctrinal default itself (`--model sonnet` for a Claude worker, `--effort medium` for a grok one) when you pass none, so silence at dispatch cannot resolve to whatever the box is installed at. Going above that default requires `--upgrade-reason "<why>"`, which the script refuses to skip and files on the lane todo as `[MODEL: ...]` or `[EFFORT: ...]`. A bare `herdr agent start` has no such protection, so pass the setting yourself there. Both rules come from [issue #32](https://github.com/skylence-org/multi-llm-marketplace/issues/32).
 
 ## Solo vs Herdr substrate
 

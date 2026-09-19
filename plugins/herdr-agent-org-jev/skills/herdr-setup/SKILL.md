@@ -40,7 +40,7 @@ ls -d <abs-path-to-repo>/herdr-plugins/org-relay
 ```
 If the checkout is gone, re-clone it to the same path before linking. Then: `herdr plugin link <abs-path-to-repo>/herdr-plugins/org-relay`
 
-**Consumer box:** `herdr plugin install skylence-be/multi-llm-marketplace/herdr-plugins/org-relay --yes`
+**Consumer box:** `herdr plugin install skylence-org/multi-llm-marketplace/herdr-plugins/org-relay --yes`
 
 Then daemonize and wire the client, from the installed plugin dir (`herdr plugin list` prints it; `relay-ctl` needs `cargo` on PATH for the first build):
 
@@ -98,7 +98,7 @@ LINKED means the plugin runs the WORKING TREE, not a frozen snapshot. Keep that 
 
 **Consumer box** (no local checkout, just want the wake mechanism installed):
 ```bash
-herdr plugin install skylence-be/multi-llm-marketplace/herdr-plugins/org-waker
+herdr plugin install skylence-org/multi-llm-marketplace/herdr-plugins/org-waker
 ```
 
 Verify either path landed:
@@ -118,7 +118,7 @@ for t in herdr-plugins/org-waker/test/*.sh; do sh "$t"; done
 ```
 Each suite prints its own `<name>.sh: OK` line at the end when every case passes. Don't hardcode a suite count or name list here — the set grows (8 suites measured 2026-08-16: ack_path, classify_composer, coalesce_hold, drain_sent_preserve, parked_retry, pasted_placeholder, sent_no_resend, verify_clear_gate, up from 6 at waker 0.3.0). Instead grep the run's combined output for `\.sh: (OK|FAIL)` and confirm every matched line says `OK`. Anything else means stop before dispatching: the wake mechanism's classification, dedup, or retry logic is broken, and lanes will hang silently or ring stale bursts instead of waking the orchestrator cleanly.
 
-**Consumer box (no repo checkout):** you cannot run those suites from a path that does not exist. Either clone `skylence-be/multi-llm-marketplace` long enough to run them from its root, or treat the doctor action above plus the S5 live probe as your gate. Do not invent a substitute shell check.
+**Consumer box (no repo checkout):** you cannot run those suites from a path that does not exist. Either clone `skylence-org/multi-llm-marketplace` long enough to run them from its root, or treat the doctor action above plus the S5 live probe as your gate. Do not invent a substitute shell check.
 
 ## S2c Native session-ping wiring (Claude <-> Claude, the composer-free wake)
 
@@ -191,7 +191,7 @@ aw-watcher-afk) first, or skip this section.
 Same dev/consumer split as S2, same stale-link warning for the dev form:
 ```bash
 herdr plugin link <abs-path-to-repo>/herdr-plugins/aw-context                    # dev box
-herdr plugin install skylence-be/multi-llm-marketplace/herdr-plugins/aw-context  # consumer box
+herdr plugin install skylence-org/multi-llm-marketplace/herdr-plugins/aw-context  # consumer box
 ```
 
 Verify (doctor is async like org-waker's: the invoke returns a `log_id` with
