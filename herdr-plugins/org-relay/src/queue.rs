@@ -475,6 +475,16 @@ pub fn age_ms_since(ts: &str) -> Option<i64> {
 // ── Synchronous tool operations (everything except the await) ───────────────
 // Called from server.rs via spawn_blocking; Ok(payload) or Err(message).
 
+/// What relay_send hands back: the durable id plus whether the recipient
+/// holds live await coverage RIGHT NOW (`awaiter_active`: an in-call hold or
+/// a polled task, not filtered out by the live-agent snapshot). `false`
+/// means this enqueue woke nobody — the sender follows it with ONE native
+/// ping carrying a pointer; `true` means the awaiter wakes in-process and a
+/// ping would only cost the recipient a second turn (marketplace#1).
+pub fn send_result(id: i64, to: &str) -> Value {
+    json!({"id": id, "queued_for": to, "live_await": awaiter_active(to)})
+}
+
 pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
     let conn = open_db().map_err(|e| format!("db open failed: {e}"))?;
     match name {
@@ -493,7 +503,7 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
             log_event("audit", json!({"event":"send","id":id,"sender":sender,"recipient":to,
                 "lane":lane,"kind":kind,"body_bytes":body.len()}));
             notify_recipient(&to);
-            Ok(json!({"id": id, "queued_for": to}))
+            Ok(send_result(id, &to))
         }
         "relay_inbox" => {
             let agent = req_str(args, "agent")?;
@@ -712,5 +722,17 @@ mod tests {
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
         set_live_agents(None);
+    }
+
+    #[test]
+    fn send_result_reports_live_coverage() {
+        let _serial = snapshot_lock().lock().unwrap();
+        set_live_agents(None);
+        let cold = send_result(7, "send-probe");
+        assert_eq!(cold["id"], 7);
+        assert_eq!(cold["queued_for"], "send-probe");
+        assert_eq!(cold["live_await"], false, "no hold: the sender must ping");
+        let _g = AwaitGuard::new("send-probe");
+        assert_eq!(send_result(8, "send-probe")["live_await"], true, "a hold: no ping needed");
     }
 }

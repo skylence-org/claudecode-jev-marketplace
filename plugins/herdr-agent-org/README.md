@@ -131,7 +131,8 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 | Board and todos | Filesystem board (`scripts/board`) |
 | Worker PTYs | `herdr pane split` plus `agent start` |
 | Read and steer | `herdr agent read` / `SendMessage` ping and `relay_send`; never the composer (L11) |
-| Idle wake | org-relay `relay_await` (task-backed); fallback `herdr agent wait` |
+| Wake with lanes in flight | org-relay `relay_await` (task-backed), armed as the turn's last call; fallback `herdr agent wait` |
+| Idle wake | nothing armed: a native `SendMessage` ping (pointer plus relay id) or the nudge net starts the turn; `relay_send` returns `live_await`, ping only when it is false |
 | Agent state | Herdr semantic states plus sidebar |
 | MCP required | org-relay for messaging; the board itself is CLI only |
 | Run location | **Must** be `HERDR_ENV=1` |
