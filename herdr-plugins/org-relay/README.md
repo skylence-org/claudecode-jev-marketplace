@@ -30,8 +30,9 @@ Default `timeout_s` 1800 (max 3600); a timeout returns cleanly with
 a loop. In-process `Notify` wakes a live awaiter the instant `relay_send`
 commits; a 2s poll covers writers that bypass the daemon. `relay_send` returns
 `{id, queued_for, live_await}`: `live_await` is the awaiter registry's answer
-at commit time, and the sender pings once only when it is false (or absent:
-an older daemon).
+at commit time; a sender that stays awake pings once only when it is false (or
+absent: an older daemon), a sender whose turn ends with the send (a worker's
+doorbell) pings once regardless.
 
 **Guide gate (1.0):** `relay_send / relay_inbox / relay_consume / relay_await`
 refuse until the session reads `relay://guide` (resources/read, or the

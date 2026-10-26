@@ -16,13 +16,13 @@
 #     stall turn ended onto a settled fingerprint while [DONE]/[BLOCKER]
 #     messages rotted for 3h23m.
 #   AWAIT COVERAGE (org-relay 1.0; LANES IN FLIGHT ONLY since marketplace#2):
-#     with a lane in flight — a recorded `dispatch <slug>` that the relay has
-#     no `doorbell` ([DONE]) from since, or a dispatch recorded without a
-#     slug — a stop while this agent holds no live relay_await (GET /status
-#     .awaiting, no MCP handshake needed) re-blocks once with the
-#     arm-coverage instruction, the mechanical form of L6. With every
-#     dispatched lane done, coverage is neither asked for nor part of the
-#     fingerprint: an idle orchestrator arms nothing (marketplace#1).
+#     with a lane in flight — a marker line `dispatch <todo> <name>` the relay
+#     holds no `doorbell` ([DONE]) for since, from either key, or a dispatch
+#     line with no key at all — a stop while this agent holds no live
+#     relay_await (GET /status .awaiting, no MCP handshake needed) re-blocks
+#     once with the arm-coverage instruction, the mechanical form of L6. With
+#     every dispatched lane done, coverage is neither asked for nor part of
+#     the fingerprint: an idle orchestrator arms nothing (marketplace#1).
 #     Fail-open: an unreachable daemon never blocks a stop; an unreadable
 #     relay DB counts every dispatch as in flight.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -46,21 +46,30 @@ if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$relay_db" ] && command -v sqlite3 >/dev
     fi
   fi
 fi
-# A lane is in flight from its `dispatch <slug>` line until the relay holds a
-# `doorbell` from that slug stamped at or after that dispatch (both stamps are
-# ISO-8601 UTC, so string order is time order; a blocker does not end the
-# flight). No slug on a dispatch line, or no readable relay DB: in flight.
+# Each marker line `<ts> dispatch <todo> <name>` is in flight until the relay
+# holds a `doorbell` whose sender is that lane's todo slug or its agent name
+# (`-` = unknown; older lines carry one field or none) stamped at or after the
+# line's own stamp (both ISO-8601 UTC, so string order is time order; a blocker
+# does not end the flight; a re-dispatch is a new line). A line with no key, a
+# failed query, or no readable relay DB: in flight.
 in_flight=0
 if grep -Eq ' dispatch( |$)' "$marker" 2>/dev/null; then
-  if grep -q ' dispatch$' "$marker" 2>/dev/null || ! { [ -f "$relay_db" ] && command -v sqlite3 >/dev/null 2>&1; }; then
+  if ! { [ -f "$relay_db" ] && command -v sqlite3 >/dev/null 2>&1; }; then
     in_flight=1
   else
-    for slug in $(awk '$2=="dispatch" && $3!="" {print $3}' "$marker" | sort -u); do
-      since=$(awk -v s="$slug" '$2=="dispatch" && $3==s {t=$1} END {print t}' "$marker")
-      slug_sql=$(printf '%s' "$slug" | sed "s/'/''/g")
-      done_n=$(sqlite3 -readonly "$relay_db" "SELECT COUNT(*) FROM messages WHERE sender='$slug_sql' AND kind='doorbell' AND ts >= '$since';" 2>/dev/null)
+    while read -r since ev todo name; do
+      [ "$ev" = "dispatch" ] || continue
+      keys=""
+      for k in "$todo" "$name"; do
+        case "$k" in
+          ""|-) ;;
+          *) keys="${keys:+$keys,}'$(printf '%s' "$k" | sed "s/'/''/g")'" ;;
+        esac
+      done
+      [ -n "$keys" ] || { in_flight=1; break; }
+      done_n=$(sqlite3 -readonly "$relay_db" "SELECT COUNT(*) FROM messages WHERE sender IN ($keys) AND kind='doorbell' AND ts >= '$since';" 2>/dev/null </dev/null)
       [ "${done_n:-0}" -gt 0 ] 2>/dev/null || { in_flight=1; break; }
-    done
+    done < "$marker"
   fi
 fi
 cov_fp=""
@@ -78,7 +87,7 @@ fi
 
 relay_line=""
 if [ -n "$backlog" ] && [ "$backlog" -gt 0 ] 2>/dev/null; then
-  relay_line="RELAY BACKLOG: $backlog unconsumed relay message(s) queued for '$me' — relay_inbox(agent: $me), act, consume, and leave coverage armed BEFORE idling. "
+  relay_line="RELAY BACKLOG: $backlog unconsumed relay message(s) queued for '$me' — relay_inbox(agent: $me), act, consume, and end the turn; arm coverage only if a lane is still in flight (the next line says when). "
 fi
 if [ "$covered" = "0" ] && [ "$in_flight" = "1" ]; then
   relay_line="${relay_line}NO AWAIT COVERAGE: a dispatched lane has sent no [DONE] doorbell yet and '$me' holds no live relay_await — arm ONE long relay_await(agent: $me, timeout_s: 1800) as the LAST call before idling (L6); with every lane done this line does not appear and an idle session arms nothing. "

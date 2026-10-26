@@ -96,9 +96,13 @@ queue, never instead of it:
   (a pointer plus the relay id); never both, never a second relay_send. A
   result WITHOUT the field (an older daemon) counts as false: ping. And true
   is a prediction, not a receipt: a hold the client aborted (operator Esc in
-  the pre-background window) keeps registering until it times out, so if
-  relay_status still shows your message queued for the recipient ~2 minutes
-  later, ping once then.
+  the pre-background window) keeps registering until it times out. So the
+  rule splits by who sends. A sender that STAYS AWAKE (an orchestrator
+  answering, a peer mid-exchange) pings on false or absent, and pings once
+  more if relay_status still shows the message queued ~2 minutes later. A
+  sender whose TURN ENDS with the send (a worker's doorbell or blocker, an
+  architect's handoff) pings once whenever it holds an address, whatever the
+  result says: it can never re-check.
 - Pings are Claude-only and undurable: names auto-derive from a session's cwd
   (resolve from a fresh ListAgents row), first contact needs the row's
   "[ref]", and a non-Claude producer cannot deliver one. Everything the queue
@@ -108,8 +112,9 @@ queue, never instead of it:
 
 - relay_send(sender, to, kind, body, lane?) — durable enqueue + in-process
   wake of any live awaiter. kind: doorbell | ring | blocker | incident |
-  peer | operator | other. Returns {id, queued_for, live_await}: ping ONCE
-  when live_await is false or absent, never when it is true.
+  peer | operator | other. Returns {id, queued_for, live_await}: a sender
+  that stays awake pings ONCE when live_await is false or absent; a sender
+  whose turn ends with the send pings once regardless.
 - relay_inbox(agent, include_consumed?) — list queued messages.
 - relay_consume(agent, ids) — mark handled AFTER acting.
 - relay_await(agent, timeout_s?) — task-backed coverage; see the wake model.
