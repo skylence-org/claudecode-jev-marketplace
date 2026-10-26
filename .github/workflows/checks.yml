@@ -51,6 +51,9 @@ jobs:
       - name: herdr-agent-org dispatch-worker suite (stubbed herdr)
         run: bash plugins/herdr-agent-org/tests/jev/dispatch.test.sh
 
+      - name: herdr-agent-org stop-gate suite (fake herdr, fake daemon, temp relay DB)
+        run: sh plugins/herdr-agent-org/tests/hooks/org-stop-gate.test.sh
+
       - name: conduct harness self-test (stubbed, no LLM call)
         run: sh plugins/herdr-agent-org/tests/conduct/run-conduct.sh --self-test
 

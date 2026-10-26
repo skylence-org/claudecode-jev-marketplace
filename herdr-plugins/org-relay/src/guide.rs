@@ -9,7 +9,7 @@
 pub const GUIDE_URI: &str = "relay://guide";
 
 /// Sent in `initialize` as the server's instructions field.
-pub const SERVER_INSTRUCTIONS: &str = "Read relay://guide (resources/read, or the relay_guide tool) BEFORE using the messaging tools — relay_send / relay_inbox / relay_consume / relay_await refuse until this session has read it (enforced on sessionful transports; a stateless SEP-2567 client is trusted to read it first); relay_status and the observability tools are never gated. The guide is the org's wake-plane contract: task-backed awaiting (arm ONE long relay_await as the LAST call of a turn; never a 50s re-arm loop), inbox-first turn entry, consume ONLY after acting, and what a [RELAY-NUDGE] means. The gate is per-session by design — every session reads the contract once; it is short on purpose.";
+pub const SERVER_INSTRUCTIONS: &str = "Read relay://guide (resources/read, or the relay_guide tool) BEFORE using the messaging tools — relay_send / relay_inbox / relay_consume / relay_await refuse until this session has read it (enforced on sessionful transports; a stateless SEP-2567 client is trusted to read it first); relay_status and the observability tools are never gated. The guide is the org's wake-plane contract: task-backed awaiting (arm ONE long relay_await as the LAST call of a turn, and only while you expect a message — an idle session arms none; never a 50s re-arm loop), inbox-first turn entry, consume ONLY after acting, ping only when relay_send says live_await is false, and what a [RELAY-NUDGE] means. The gate is per-session by design — every session reads the contract once; it is short on purpose.";
 
 pub const GUIDE_RESOURCE: &str = r#"# org-relay guide — the org's message bus and wake plane
 
@@ -22,7 +22,13 @@ apart.
 ## The wake model (task-backed awaiting)
 
 `relay_await(agent=<you>, timeout_s=1800)` is armed as the LAST tool call of
-a turn, once, with a LONG timeout. What happens next depends on your client:
+a turn, once, with a LONG timeout, and ONLY while you expect a message: an
+orchestrator with lanes in flight, a worker with a blocker pending, a peer
+mid-exchange. An idle role (nothing in flight, nothing pending) arms NOTHING
+and is woken by a native ping or the nudge net: every timeout of an idle
+await is a turn that replays your whole context just to re-arm
+(marketplace#1 measured four of them in one idle afternoon). What happens
+next depends on your client:
 
 - Client with the MCP tasks extension (`io.modelcontextprotocol/tasks`,
   SEP-2663): the call returns a TASK HANDLE immediately (`resultType:
@@ -33,28 +39,31 @@ a turn, once, with a LONG timeout. What happens next depends on your client:
   background task — your turn ends, the operator's composer is free, and the
   result arrives later as a task notification that starts your next turn.
 
-Either way: ONE await covers you for the whole idle period. The pre-1.0
+Either way: ONE await covers you for the whole waiting period. The pre-1.0
 doctrine of 50-second re-arm loops is RETIRED — it existed for a transport
 whose silent holds clients aborted at ~60s. Do not re-create it. A timeout
-returns cleanly with `retry: true`: re-arm ONE new long await, as the last
-call of that turn.
+returns cleanly with `retry: true`: re-arm ONE new long await as the last
+call of that turn if you still expect a message; with nothing in flight any
+more, end the turn with no await.
 
 Rules that keep the org deaf-proof:
 
-1. ARM AS LAST CALL. An await armed mid-turn blocks the rest of your beat
-   for up to 2 minutes. Do your work first; arm coverage as the final call
-   before the turn would otherwise end.
+1. ARM AS LAST CALL, AND ONLY WITH SOMETHING TO WAIT FOR. An await armed
+   mid-turn blocks the rest of your beat for up to 2 minutes; an await armed
+   idle wakes you for nothing. Do your work first; arm coverage as the final
+   call before the turn would otherwise end, when a message is expected.
 2. INBOX FIRST ON TURN ENTRY. Whatever started this turn — an await result,
-   a [RELAY-NUDGE], an operator message — while any lane is in flight your
-   first bus action is relay_inbox(agent=<you>): interrupts kill turns,
-   never queues, and this check re-finds what a killed turn was about to
-   handle.
+   a [RELAY-NUDGE], a native ping, an operator message — while any lane is
+   in flight, and whenever a ping or a nudge woke you, your first bus action
+   is relay_inbox(agent=<you>): interrupts kill turns, never queues, and this
+   check re-finds what a killed turn was about to handle.
 3. CONSUME ONLY AFTER ACTING. relay_consume marks ids handled. A crash
    between reading and acting must lose nothing; consumed-but-unacted is the
    one state the queue cannot protect you from.
-4. ENQUEUE IS NOT DELIVERY. relay_send returning {"id":N} means durably
-   queued, not read. The recipient's await (or the nudge net) is what turns
-   it into a mind reading it.
+4. ENQUEUE IS NOT DELIVERY. relay_send returning {"id":N,"live_await":b}
+   means durably queued, not read. The recipient's await (or the nudge net,
+   or your ping (when live_await is false, or always for a sender whose turn
+   ends with the send)) is what turns it into a mind reading it.
 
 ## The nudge net (last resort, not the primary)
 
@@ -66,8 +75,9 @@ register), and no recent consume gets a short composer ring:
 
 A nudge is content-free and idempotent: run relay_inbox, act, consume. It is
 the net for sessions whose await died (crash, operator interrupt during the
-pre-background window, expired timeout never re-armed) — with a live await
-armed you will never see one.
+pre-background window, expired timeout never re-armed) and, since idle roles
+arm nothing, the backlog net for an idle session nobody pinged — with a live
+await armed you will never see one.
 
 ## Native pings (a WAKE accelerator, not the record)
 
@@ -79,9 +89,20 @@ queue, never instead of it:
 - The QUEUE stays the record. relay_send is what is durable, audited, and
   consumable; a ping carries only a pointer ("doorbell queued: board get
   <slug>") and the recipient acts from relay_inbox, never from ping text.
-- A ping is the coverage-gap wake. With a live relay_await armed you are
-  already covered and need no ping; it helps a peer whose await lapsed, doing
-  the nudge net's job without the composer.
+- A ping is the coverage-gap wake, and relay_send tells you whether there is
+  a gap: its result carries `live_await`. true: the recipient's await woke
+  in-process the moment your send committed, and a ping would only cost it a
+  second turn for the same event. false: nobody is listening — send ONE ping
+  (a pointer plus the relay id); never both, never a second relay_send. A
+  result WITHOUT the field (an older daemon) counts as false: ping. And true
+  is a prediction, not a receipt: a hold the client aborted (operator Esc in
+  the pre-background window) keeps registering until it times out. So the
+  rule splits by who sends. A sender that STAYS AWAKE (an orchestrator
+  answering, a peer mid-exchange) pings on false or absent, and pings once
+  more if relay_status still shows the message queued ~2 minutes later. A
+  sender whose TURN ENDS with the send (a worker's doorbell or blocker, an
+  architect's handoff) pings once whenever it holds an address, whatever the
+  result says: it can never re-check.
 - Pings are Claude-only and undurable: names auto-derive from a session's cwd
   (resolve from a fresh ListAgents row), first contact needs the row's
   "[ref]", and a non-Claude producer cannot deliver one. Everything the queue
@@ -91,7 +112,9 @@ queue, never instead of it:
 
 - relay_send(sender, to, kind, body, lane?) — durable enqueue + in-process
   wake of any live awaiter. kind: doorbell | ring | blocker | incident |
-  peer | operator | other.
+  peer | operator | other. Returns {id, queued_for, live_await}: a sender
+  that stays awake pings ONCE when live_await is false or absent; a sender
+  whose turn ends with the send pings once regardless.
 - relay_inbox(agent, include_consumed?) — list queued messages.
 - relay_consume(agent, ids) — mark handled AFTER acting.
 - relay_await(agent, timeout_s?) — task-backed coverage; see the wake model.

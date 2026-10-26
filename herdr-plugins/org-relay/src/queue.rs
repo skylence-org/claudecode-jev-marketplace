@@ -475,6 +475,17 @@ pub fn age_ms_since(ts: &str) -> Option<i64> {
 // ── Synchronous tool operations (everything except the await) ───────────────
 // Called from server.rs via spawn_blocking; Ok(payload) or Err(message).
 
+/// What relay_send hands back: the durable id plus whether the recipient
+/// held live await coverage when the row committed (`live`: `awaiter_active`
+/// sampled BEFORE `notify_recipient`, so a hold that is already waking still
+/// counts). `false` means this enqueue woke nobody — the sender follows it
+/// with ONE native ping carrying a pointer; `true` means the awaiter wakes
+/// in-process and a ping would only cost the recipient a second turn
+/// (marketplace#1).
+pub fn send_result(id: i64, to: &str, live: bool) -> Value {
+    json!({"id": id, "queued_for": to, "live_await": live})
+}
+
 pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
     let conn = open_db().map_err(|e| format!("db open failed: {e}"))?;
     match name {
@@ -492,8 +503,9 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
             let id = conn.last_insert_rowid();
             log_event("audit", json!({"event":"send","id":id,"sender":sender,"recipient":to,
                 "lane":lane,"kind":kind,"body_bytes":body.len()}));
+            let live = awaiter_active(&to);
             notify_recipient(&to);
-            Ok(json!({"id": id, "queued_for": to}))
+            Ok(send_result(id, &to, live))
         }
         "relay_inbox" => {
             let agent = req_str(args, "agent")?;
@@ -711,6 +723,35 @@ mod tests {
         set_live_agents(Some(s));
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
+        set_live_agents(None);
+    }
+
+    #[test]
+    fn send_result_reports_live_coverage() {
+        let _serial = snapshot_lock().lock().unwrap();
+        set_live_agents(None);
+        let cold = send_result(7, "send-probe", awaiter_active("send-probe"));
+        assert_eq!(cold["id"], 7);
+        assert_eq!(cold["queued_for"], "send-probe");
+        assert_eq!(cold["live_await"], false, "no hold: the sender must ping");
+        let _g = AwaitGuard::new("send-probe");
+        assert_eq!(
+            send_result(8, "send-probe", awaiter_active("send-probe"))["live_await"],
+            true,
+            "a hold: no ping needed"
+        );
+        let _t = TaskCoverGuard::new("task-probe", "task-probe");
+        assert_eq!(
+            send_result(9, "task-probe", awaiter_active("task-probe"))["live_await"],
+            true,
+            "a polled task cover counts as coverage"
+        );
+        set_live_agents(Some(["someone-else".to_string()].into_iter().collect()));
+        assert_eq!(
+            send_result(10, "send-probe", awaiter_active("send-probe"))["live_await"],
+            false,
+            "a hold whose agent the live snapshot proves dead is no coverage"
+        );
         set_live_agents(None);
     }
 }

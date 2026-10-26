@@ -12,7 +12,8 @@ org (`~/.config/herdr/org-relay/relay.db`, set as ORG_RELAY_DB by the launchd
 plist; the `$HERDR_ORG_ROOT/relay.db` fallback only applies to ad-hoc runs
 without that env), messages `{sender, to, lane, kind, body}`, explicit
 consume. Wake plane = **task-backed `relay_await`**, armed once with a LONG
-timeout as the LAST call of a turn:
+timeout as the LAST call of a turn — and ONLY while a message is expected; an
+idle role arms nothing and is woken by a native ping or the nudge net:
 
 - A client declaring the MCP tasks extension (`io.modelcontextprotocol/tasks`,
   SEP-2663) gets a **task handle back immediately** (`resultType: "task"`,
@@ -25,9 +26,13 @@ timeout as the LAST call of a turn:
   what `relay_status.awaiting` reports and what suppresses the nudge.
 
 Default `timeout_s` 1800 (max 3600); a timeout returns cleanly with
-`retry: true` — one re-arm per wake, never a loop. In-process `Notify` wakes
-a live awaiter the instant `relay_send` commits; a 2s poll covers writers
-that bypass the daemon.
+`retry: true` — one re-arm per wake while a message is still expected, never
+a loop. In-process `Notify` wakes a live awaiter the instant `relay_send`
+commits; a 2s poll covers writers that bypass the daemon. `relay_send` returns
+`{id, queued_for, live_await}`: `live_await` is the awaiter registry's answer
+at commit time; a sender that stays awake pings once only when it is false (or
+absent: an older daemon), a sender whose turn ends with the send (a worker's
+doorbell) pings once regardless.
 
 **Guide gate (1.0):** `relay_send / relay_inbox / relay_consume / relay_await`
 refuse until the session reads `relay://guide` (resources/read, or the
