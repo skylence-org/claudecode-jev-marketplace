@@ -6,7 +6,10 @@
 # Herdr has no MCP tool surface (dispatch, steer, and wait are shell commands),
 # so this hook cannot arm on a tool NAME. It fires
 # on every Bash/skyline_run call and classifies the command text itself:
-#   dispatch  worker started (dispatch-worker, herdr agent start)
+#   dispatch  worker started (dispatch-worker, herdr agent start); a
+#             dispatch-worker line also records its --todo slug, which
+#             org-stop-gate.sh matches against relay doorbells to tell an
+#             in-flight lane from a done one
 #   wait      lifecycle wait armed (herdr agent wait)
 # Anything else leaves no mark, so the gate stays inert in ordinary sessions.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -39,5 +42,11 @@ event=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk '
   END { print ev }')
 [ -n "$event" ] || exit 0
 
-printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" >> "/tmp/claude-herdr-org-lanes-$sid"
+# The dispatched lane's slug: the token after dispatch-worker's own `--todo`
+# flag, quotes stripped (a `herdr agent start` dispatch records none).
+slug=""
+if [ "$event" = "dispatch" ]; then
+  slug=$(printf '%s\n' "$cmd" | tr '\n' ' ' | awk '{for(i=1;i<NF;i++) if($i=="--todo"){print $(i+1); exit}}' | tr -d "\"'")
+fi
+printf '%s %s%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "${slug:+ $slug}" >> "/tmp/claude-herdr-org-lanes-$sid"
 exit 0

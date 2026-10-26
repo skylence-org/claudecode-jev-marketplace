@@ -53,16 +53,17 @@ Rules that keep the org deaf-proof:
    idle wakes you for nothing. Do your work first; arm coverage as the final
    call before the turn would otherwise end, when a message is expected.
 2. INBOX FIRST ON TURN ENTRY. Whatever started this turn — an await result,
-   a [RELAY-NUDGE], an operator message — while any lane is in flight your
-   first bus action is relay_inbox(agent=<you>): interrupts kill turns,
-   never queues, and this check re-finds what a killed turn was about to
-   handle.
+   a [RELAY-NUDGE], a native ping, an operator message — while any lane is
+   in flight, and whenever a ping or a nudge woke you, your first bus action
+   is relay_inbox(agent=<you>): interrupts kill turns, never queues, and this
+   check re-finds what a killed turn was about to handle.
 3. CONSUME ONLY AFTER ACTING. relay_consume marks ids handled. A crash
    between reading and acting must lose nothing; consumed-but-unacted is the
    one state the queue cannot protect you from.
-4. ENQUEUE IS NOT DELIVERY. relay_send returning {"id":N} means durably
-   queued, not read. The recipient's await (or the nudge net) is what turns
-   it into a mind reading it.
+4. ENQUEUE IS NOT DELIVERY. relay_send returning {"id":N,"live_await":b}
+   means durably queued, not read. The recipient's await (or the nudge net,
+   or your ping when live_await is false) is what turns it into a mind
+   reading it.
 
 ## The nudge net (last resort, not the primary)
 
@@ -74,8 +75,9 @@ register), and no recent consume gets a short composer ring:
 
 A nudge is content-free and idempotent: run relay_inbox, act, consume. It is
 the net for sessions whose await died (crash, operator interrupt during the
-pre-background window, expired timeout never re-armed) — with a live await
-armed you will never see one.
+pre-background window, expired timeout never re-armed) and, since idle roles
+arm nothing, the backlog net for an idle session nobody pinged — with a live
+await armed you will never see one.
 
 ## Native pings (a WAKE accelerator, not the record)
 
@@ -91,7 +93,12 @@ queue, never instead of it:
   a gap: its result carries `live_await`. true: the recipient's await woke
   in-process the moment your send committed, and a ping would only cost it a
   second turn for the same event. false: nobody is listening — send ONE ping
-  (a pointer plus the relay id); never both, never a second relay_send.
+  (a pointer plus the relay id); never both, never a second relay_send. A
+  result WITHOUT the field (an older daemon) counts as false: ping. And true
+  is a prediction, not a receipt: a hold the client aborted (operator Esc in
+  the pre-background window) keeps registering until it times out, so if
+  relay_status still shows your message queued for the recipient ~2 minutes
+  later, ping once then.
 - Pings are Claude-only and undurable: names auto-derive from a session's cwd
   (resolve from a fresh ListAgents row), first contact needs the row's
   "[ref]", and a non-Claude producer cannot deliver one. Everything the queue
@@ -102,7 +109,7 @@ queue, never instead of it:
 - relay_send(sender, to, kind, body, lane?) — durable enqueue + in-process
   wake of any live awaiter. kind: doorbell | ring | blocker | incident |
   peer | operator | other. Returns {id, queued_for, live_await}: ping ONCE
-  when live_await is false, never when it is true.
+  when live_await is false or absent, never when it is true.
 - relay_inbox(agent, include_consumed?) — list queued messages.
 - relay_consume(agent, ids) — mark handled AFTER acting.
 - relay_await(agent, timeout_s?) — task-backed coverage; see the wake model.

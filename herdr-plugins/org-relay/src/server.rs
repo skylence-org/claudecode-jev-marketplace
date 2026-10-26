@@ -142,7 +142,7 @@ fn tool_defs() -> Value {
          "outputSchema": {"type": "object", "properties": {
              "guide": {"type": "string"}, "guide_hash": {"type": "string"}}}},
         {"name": "relay_send",
-         "description": "Queue a durable message for another org agent (replaces doorbell/ring). Enqueue is not delivery: the recipient's relay_await (in-call or task-backed) or the nudge net turns it into a read. A live awaiter wakes in-process the moment this returns, and the result says so: live_await true means no ping is needed; live_await false means nobody is listening right now — follow with ONE native SendMessage ping carrying a pointer and this id, never with a second relay_send.",
+         "description": "Queue a durable message for another org agent (replaces doorbell/ring). Enqueue is not delivery: the recipient's relay_await (in-call or task-backed) or the nudge net turns it into a read. A live awaiter wakes in-process the moment this returns, and the result says so: live_await true means no ping is needed; live_await false means nobody is listening right now — follow with ONE native SendMessage ping carrying a pointer and this id, never with a second relay_send. A result without live_await (an older daemon) counts as false. true is a prediction, not a receipt: if relay_status still shows the message queued for the recipient ~2 minutes later, ping once then.",
          "inputSchema": {"type": "object", "required": ["sender", "to", "kind", "body"], "properties": {
              "sender": s("your agent name"),
              "to": s("recipient agent name (e.g. orch-<feature>)"),

@@ -17,6 +17,6 @@ TARGETING (measured, 2026-08-03): attack the NEATEST claim in the report first â
 
 VERDICT, forced, exactly one: `READY: yes` | `READY: with-fixes` | `READY: no`, plus a two-line reason. No verdict means the review is not done.
 
-REPORT: the full report is ONE milestone comment on `<slug>` (`**[REVIEW-OK]**` when READY: yes, otherwise `**[REVIEW-FINDINGS]**`), then the [DONE] footer per worker conduct, then the doorbell to `<orchestrator-agent>` over `relay_send` (durable, composer-free), with the native ping follow-up when the dispatch handshake gave you an address.
+REPORT: the full report is ONE milestone comment on `<slug>` (`**[REVIEW-OK]**` when READY: yes, otherwise `**[REVIEW-FINDINGS]**`), then the [DONE] footer per worker conduct, then the doorbell to `<orchestrator-agent>` over `relay_send` (durable, composer-free), with the native ping follow-up only when the relay_send result says `live_await: false` (or has no `live_await` field: an older daemon, count it as false) and the dispatch handshake gave you an address; `live_await: true` means no ping.
 
 NEVER: "looks good" without the requirement map; nitpicks ranked Critical; findings on code you did not read; vague fixes ("improve error handling"); withholding the verdict.
