@@ -21,7 +21,7 @@ sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 # One line per command: Bash's .command as typed; each skyline_run .argv array
 # and each run_batch .argv_list array as ONE shell-quoted line (@sh), so a
 # prompt argument keeps its spaces inside one quoted token.
-cmd=$(printf '%s' "$input" | jq -r '(.tool_input? // {}) | [(.command? // empty), (.argv? // empty | @sh), ((.argv_list? // [])[] | @sh)] | join("\n")' 2>/dev/null || true)
+cmd=$(printf '%s' "$input" | jq -r '(.tool_input? // {}) | [(.command? // empty), (.argv? // empty | @sh), ((.argv_list? // [])[] | @sh), ((.argv?, (.argv_list? // [])[]) | select(type=="array" and ((.[0]|tostring)|test("(^|/)(ba|z)?sh$")) and ((.[1]|tostring)|test("^-[a-z]*c$"))) | .[2] // empty)] | join("\n")' 2>/dev/null || true)
 [ -n "$cmd" ] || exit 0
 
 # Classify by the PROGRAM each pipeline stage runs, not by substring: a sed,

@@ -104,6 +104,9 @@ reset
 mark skyline_run_batch '{"argv_list":[["dispatch-worker","--todo=lane-p","--name=wp"],["dispatch-worker","--todo","lane-q"]]}'
 expect_marker "argv_list form, --todo= and --name= forms: one line per array, - for a missing name" "dispatch lane-p wp;dispatch lane-q -;"
 reset
+mark skyline_run '{"argv":["sh","-c","dispatch-worker --todo lane-z --name w9 \"p x\""]}'
+expect_marker "argv sh -c form: the inner command is classified" "dispatch lane-z w9;"
+reset
 mark Bash '{"command":"herdr agent start w3 && herdr agent wait w3"}'
 expect_marker "herdr agent start records the agent name as the key; herdr agent wait records wait" "dispatch - w3;wait;"
 reset

@@ -62,8 +62,8 @@ Rules that keep the org deaf-proof:
    one state the queue cannot protect you from.
 4. ENQUEUE IS NOT DELIVERY. relay_send returning {"id":N,"live_await":b}
    means durably queued, not read. The recipient's await (or the nudge net,
-   or your ping when live_await is false) is what turns it into a mind
-   reading it.
+   or your ping (when live_await is false, or always for a sender whose turn
+   ends with the send)) is what turns it into a mind reading it.
 
 ## The nudge net (last resort, not the primary)
 
