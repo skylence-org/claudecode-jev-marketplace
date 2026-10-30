@@ -114,6 +114,25 @@ denies "sudo with a value flag" "sudo invocation" Bash "$(bash_cmd 'sudo -u root
 blocked "sudo via skyline_run argv" mcp__skyline__skyline_run \
   '{"argv":["sudo","rm","-rf","/x"]}'
 
+# The skyline plugin names its tools mcp__plugin_skyline-claude_skyline__run,
+# with a DOUBLE underscore before the tool, not mcp__skyline__skyline_run.
+# Measured 2026-10-30: every rule skipped that route, so a recursive delete or a
+# force push through the plugin's run tool was allowed, and the plugin's own
+# hook redirects Bash calls there. run_batch and run_job execute commands too;
+# git_remote and git_commit run git, so the git rules must see them as git.
+blocked "sudo via the skyline plugin's run" mcp__plugin_skyline-claude_skyline__run \
+  '{"argv":["sudo","rm","-rf","/x"]}'
+denies "force push via the skyline plugin's run_batch" "force push" mcp__plugin_skyline-claude_skyline__run_batch \
+  '{"argv_list":[["git","status"],["git","push","--force","origin","main"]]}'
+denies "power command via the skyline plugin's run_job" "system power command" mcp__plugin_skyline-claude_skyline__run_job \
+  '{"argv":["shutdown","-h","now"]}'
+denies "force push via the skyline plugin's git_remote" "force push" mcp__plugin_skyline-claude_skyline__git_remote \
+  '{"subcommand":"push","args":["--force","origin","main"]}'
+allows "plain commit via the skyline plugin's git_commit" mcp__plugin_skyline-claude_skyline__git_commit \
+  '{"subcommand":"commit","args":["-m","fix: typo"]}'
+allows "run_query is read-only and never normalized" mcp__plugin_skyline-claude_skyline__run_query \
+  '{"path":"/tmp/raw.txt","pattern":"sudo reboot"}'
+
 echo "--- must DENY: sneaky wrapper forms ----------------------------------"
 
 denies "env-wrapped sudo" "sudo invocation" Bash "$(bash_cmd 'env sudo reboot')"
@@ -707,6 +726,12 @@ denies "Edit an existing memory file" "memory is disabled" Edit \
   '{"file_path":"/Users/x/.claude/projects/-Users-x-proj/memory/note.md","old_string":"a","new_string":"b"}'
 denies "skyline_edit into memory" "memory is disabled" mcp__skyline__skyline_edit \
   '{"patch":"¶/Users/x/.claude/projects/-Users-x-proj/memory/note.md#AB12\nreplace 1..1:\n+remembered"}'
+denies "the skyline plugin's create into memory" "memory is disabled" mcp__plugin_skyline-claude_skyline__create \
+  '{"path":"/Users/x/.claude/projects/-Users-x-proj/memory/note.md","content":"remember"}'
+denies "the skyline plugin's edit into memory" "memory is disabled" mcp__plugin_skyline-claude_skyline__edit \
+  '{"patch":"¶/Users/x/.claude/projects/-Users-x-proj/memory/note.md#AB12\nreplace 1..1:\n+remembered"}'
+denies "the skyline plugin's create of a .env file" ".env-style secret file" mcp__plugin_skyline-claude_skyline__create \
+  '{"path":"/Users/x/proj/.env","content":"API_KEY=x"}'
 denies "shell redirect into memory" "memory is disabled" Bash \
   "$(bash_cmd 'echo remember > /Users/x/.claude/projects/-Users-x-proj/memory/note.md')"
 denies "tee into memory" "memory is disabled" Bash \

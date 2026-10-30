@@ -122,6 +122,28 @@ run_gate Edit '{"file_path":"/repo/package.json","old_string":"x","new_string":"
 run_gate mcp__skyline__skyline_run '{"argv":["pnpm","add","zod@3.22.4"]}' '{"lookup_seen":{"noul":0.05}}'
 [ $RC -eq 2 ] && ok "skyline_run argv is normalised like Bash" || bad "skyline_run" "rc=$RC $STDERR"
 
+# The skyline plugin's real tool names carry a double underscore
+# (mcp__plugin_skyline-claude_skyline__run); measured 2026-10-30, the gate and
+# its hooks.json matcher both missed them.
+run_gate mcp__plugin_skyline-claude_skyline__run '{"argv":["pnpm","add","zod@3.22.4"]}' '{"lookup_seen":{"noul":0.05}}'
+[ $RC -eq 2 ] && ok "the skyline plugin's run is normalised like Bash" || bad "skyline plugin run" "rc=$RC $STDERR"
+
+# hooks.json matchers must select those names, and nothing read-only.
+HJ="$PLUGIN/hooks/hooks.json"
+gm=$(jq -r '.hooks.PreToolUse[] | select(any(.hooks[]; .command | test("jev-intent-gate"))) | .matcher' "$HJ")
+wm=$(jq -r '.hooks.PostToolUse[] | select(any(.hooks[]; .command | test("writing-guard"))) | .matcher' "$HJ")
+for t in Bash Write Edit mcp__skyline__skyline_run mcp__plugin_skyline-claude_skyline__run \
+         mcp__plugin_skyline-claude_skyline__run_batch mcp__plugin_skyline-claude_skyline__run_job \
+         mcp__plugin_skyline-claude_skyline__create mcp__plugin_skyline-claude_skyline__edit; do
+  printf '%s' "$t" | grep -qE "$gm" && ok "intent-gate matcher selects $t" || bad "intent-gate matcher misses $t" "$gm"
+done
+printf '%s' mcp__plugin_skyline-claude_skyline__run_query | grep -qE "$gm" \
+  && bad "intent-gate matcher selects run_query" "$gm" || ok "intent-gate matcher skips read-only run_query"
+for t in Write Edit mcp__skyline__skyline_create mcp__plugin_skyline-claude_skyline__create \
+         mcp__plugin_skyline-claude_skyline__edit; do
+  printf '%s' "$t" | grep -qE "$wm" && ok "writing-guard matcher selects $t" || bad "writing-guard matcher misses $t" "$wm"
+done
+
 # The lookup is a TOOL CALL in the transcript, not a user message: a visible
 # `npm view` settles the gate in code, no Jev call at all.
 tr="$TMP/gate-transcript.jsonl"
