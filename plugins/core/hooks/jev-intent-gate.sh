@@ -39,24 +39,25 @@ TOOL_INPUT_JSON=$(printf '%s' "$PARSED" | cut -f2 | { base64 -d 2>/dev/null || b
 TRANSCRIPT=$(printf '%s' "$PARSED" | cut -f3)
 [ -n "$RAW_TOOL" ] || exit 0
 
-# Skyline-aware normalisation, same as judge-hook: a skyline_run carries argv
-# rather than a command string, skyline_create/edit carry path/patch.
+# Skyline-aware normalisation, same as judge-hook: a skyline run tool carries
+# argv rather than a command string, skyline create/edit carry path/patch. Both
+# namings: mcp__skyway__skyline_run and mcp__plugin_skyline-claude_skyline__run.
 CLASS="$RAW_TOOL"
 MATCH_TEXT="$TOOL_INPUT_JSON"
 case "$RAW_TOOL" in
-  *skyline_run)
+  *skyline_run|*skyline__run|*skyline__run_batch|*skyline__run_job)
     CLASS=Bash
     CMDS=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '((.argv // []) | join(" ")), ((.argv_list // [])[] | join(" "))' 2>/dev/null) || CMDS=""
     [ -n "$CMDS" ] && MATCH_TEXT="$TOOL_INPUT_JSON
 $(printf '%s\n' "$CMDS" | sed 's/^/cmd: /')"
     ;;
-  *skyline_create)
+  *skyline_create|*skyline__create)
     CLASS=Write
     FP=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '.path // empty' 2>/dev/null) || FP=""
     [ -n "$FP" ] && MATCH_TEXT="$TOOL_INPUT_JSON
 \"file_path\":\"$FP\""
     ;;
-  *skyline_edit)
+  *skyline_edit|*skyline__edit)
     CLASS=Edit
     FPS=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '.patch // empty' 2>/dev/null | sed -n 's/^¶\([^#]*\)#.*/\1/p') || FPS=""
     [ -n "$FPS" ] && MATCH_TEXT="$TOOL_INPUT_JSON

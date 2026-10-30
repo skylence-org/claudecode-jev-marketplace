@@ -19,10 +19,18 @@
 # SKYLINE-AWARE TOOL NORMALIZATION: rules keyed on the classic tool names also
 # bind their skyline MCP equivalents, so routing through skyline cannot bypass
 # a rule:
-#   Bash  ⇐ *skyline_run    (match text gains one "cmd: <argv joined>" line
+#   Bash  ⇐ *skyline_run, *skyline__run, *skyline__run_batch, *skyline__run_job
+#                            (match text gains one "cmd: <argv joined>" line
 #                            per argv/argv_list entry)
-#   Write ⇐ *skyline_create (match text gains "file_path":"<path>")
-#   Edit  ⇐ *skyline_edit   (match text gains one "file_path":"<p>" per ¶ header)
+#   Bash  ⇐ *skyline__git_remote, *skyline__git_commit
+#                            (match text gains "cmd: git <subcommand> <args>")
+#   Write ⇐ *skyline_create, *skyline__create (match text gains "file_path":"<path>")
+#   Edit  ⇐ *skyline_edit, *skyline__edit (one "file_path":"<p>" per ¶ header)
+# Both namings are real: skyway's proxy exposes mcp__skyway__skyline_run, while
+# the skyline plugin exposes mcp__plugin_skyline-claude_skyline__run (a DOUBLE
+# underscore before the tool). Until 2026-10-30 only the first was matched, so
+# every rule was skipped on the plugin's route, and the plugin redirects Bash
+# calls to it.
 # A rule may still name an MCP tool exactly; exact tool match is checked first.
 #
 # ESCALATE rules receive the last few user messages from the transcript, so
@@ -95,20 +103,29 @@ TRANSCRIPT=$(printf '%s' "$PARSED" | cut -f3)
 CLASS_TOOL="$RAW_TOOL"
 MATCH_TEXT="$TOOL_INPUT_JSON"
 case "$RAW_TOOL" in
-  *skyline_run)
+  *skyline_run|*skyline__run|*skyline__run_batch|*skyline__run_job)
     CLASS_TOOL="Bash"
     CMDS=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r \
       '((.argv // []) | join(" ")), ((.argv_list // [])[] | join(" "))' 2>/dev/null) || CMDS=""
     [ -n "$CMDS" ] && MATCH_TEXT="$TOOL_INPUT_JSON
 $(printf '%s\n' "$CMDS" | sed 's/^/cmd: /')"
     ;;
-  *skyline_create)
+  *skyline__git_remote|*skyline__git_commit)
+    # {subcommand, args} is a git invocation; the git rules (force push,
+    # protected branch, reset --hard) must read it as one.
+    CLASS_TOOL="Bash"
+    CMDS=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r \
+      'select(.subcommand) | (["git", .subcommand] + (.args // [])) | join(" ")' 2>/dev/null) || CMDS=""
+    [ -n "$CMDS" ] && MATCH_TEXT="$TOOL_INPUT_JSON
+cmd: $CMDS"
+    ;;
+  *skyline_create|*skyline__create)
     CLASS_TOOL="Write"
     FP=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '.path // empty' 2>/dev/null) || FP=""
     [ -n "$FP" ] && MATCH_TEXT="$TOOL_INPUT_JSON
 \"file_path\":\"$FP\""
     ;;
-  *skyline_edit)
+  *skyline_edit|*skyline__edit)
     CLASS_TOOL="Edit"
     FPS=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '.patch // empty' 2>/dev/null \
       | sed -n 's/^¶\([^#]*\)#.*/\1/p') || FPS=""
@@ -566,11 +583,13 @@ mark() if $inert_text_priv && $has_exec_stage;
 print "uncertain: 1\n" if $uncertain;
 PERL_EOF
   # @sh shell-quotes each argv element, so a pre-tokenized skyline_run call and
-  # a raw Bash string go through one and the same tokenizer.
+  # a raw Bash string go through one and the same tokenizer. A skyline git_*
+  # call is tokenized as the git argv it stands for.
   ARGV_TEXT=$(printf '%s' "$TOOL_INPUT_JSON" | jq -r '
     [ (.command? // empty),
       ((.argv? // []) | select(length > 0) | @sh),
-      ((.argv_list? // [])[] | @sh) ]
+      ((.argv_list? // [])[] | @sh),
+      (if (.subcommand? | type) == "string" then (["git", .subcommand] + (.args? // [])) | @sh else empty end) ]
     | .[] | tostring | @base64' 2>/dev/null \
     | perl -e "$ARGV_SCAN_PL" 2>/dev/null) || ARGV_UNCERTAIN=1
   if printf '%s' "$ARGV_TEXT" | grep -q '^uncertain: 1$'; then

@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "Bash|Edit|Write|mcp__.*skyline_(run|create|edit)",
+        "matcher": "Bash|Edit|Write|mcp__.*skyline__?(run|run_batch|run_job|create|edit)$",
         "hooks": [
           {
             "type": "command",
@@ -24,7 +24,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|mcp__.*skyline_(create|edit)",
+        "matcher": "Write|Edit|mcp__.*skyline__?(create|edit)$",
         "hooks": [
           {
             "type": "command",
