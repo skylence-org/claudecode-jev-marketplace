@@ -85,7 +85,7 @@ sh "$CLAUDE_PLUGIN_ROOT/scripts/jev" doctor \
 
 ## Step 3: wire settings.json (backup first; idempotent)
 
-Sets the statusline, the full-bypass posture, `disableWorkflows: true`, `awaySummaryEnabled: false` (disables the session recap), and `promptSuggestionEnabled: false` (no inline ghost text in the input box; it also reads as typed text to any agent classifying a pane's input line, so org send-safety checks get cleaner without it). The settings key is not respected in some builds (anthropics/claude-code#15709), so the undocumented env var `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` is also pinned in `env` and the shell profile alongside it. Adaptive thinking and Claude's auto-memory have no settings key, so they go in `env` AND are pinned in the shell profile (next block). It also STRIPS the legacy copy-based hook entries: the plugin registers those three hooks itself now, and leaving a settings.json entry beside it runs each hook twice. Existing unrelated hooks and the deny list are preserved.
+Sets the statusline, the full-bypass posture, `disableWorkflows: true`, `awaySummaryEnabled: false` (disables the session recap), and `promptSuggestionEnabled: false` (no inline ghost text in the input box; it also reads as typed text to any agent classifying a pane's input line, so org send-safety checks get cleaner without it). The settings key is not respected in some builds (anthropics/claude-code#15709), so the undocumented env var `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` is also pinned in `env` and the shell profile alongside it. Adaptive thinking, Claude's auto-memory and the "How is Claude doing?" rating survey have no settings key, so they go in `env` AND are pinned in the shell profile (next block); the survey switch is `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`. It also STRIPS the legacy copy-based hook entries: the plugin registers those three hooks itself now, and leaving a settings.json entry beside it runs each hook twice. Existing unrelated hooks and the deny list are preserved.
 
 ```bash
 SETTINGS=~/.claude/settings.json
@@ -103,6 +103,7 @@ jq '
   | .env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = "false"
   | .env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1"
   | .env.CLAUDE_CODE_DISABLE_ORG_MEMORY = "1"
+  | .env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = "1"
   | .permissions = (.permissions // {})
   | .permissions.defaultMode = "bypassPermissions"
   | .hooks = (.hooks // {})
@@ -119,6 +120,8 @@ jq '
 # "off", and neither is discoverable from `claude --help`: they were found in
 # the shipped binary's strings, alongside the --bare description which lists
 # auto-memory among the things that mode skips.
+# CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 turns off the "How is Claude doing?"
+# rating prompt; also found in the binary's strings (2.1.314).
 # The settings `env` block is read at
 # startup but has had reliability bugs (anthropics/claude-code #5202, #8500,
 # #20112), and a shell export wins over it regardless, so also pin it in the
@@ -135,10 +138,10 @@ touch "$PROFILE"
 cp "$PROFILE" "$PROFILE.bak.$(date +%Y%m%d%H%M%S)"
 ptmp=$(mktemp)
 awk '/# >>> core:env >>>/{s=1} !s{print} /# <<< core:env <<</{s=0; next}' "$PROFILE" > "$ptmp"
-{ cat "$ptmp"; printf '\n# >>> core:env >>>\nexport CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1\nexport CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false\nexport CLAUDE_CODE_DISABLE_AUTO_MEMORY=1\nexport CLAUDE_CODE_DISABLE_ORG_MEMORY=1\n# <<< core:env <<<\n'; } > "$PROFILE"
+{ cat "$ptmp"; printf '\n# >>> core:env >>>\nexport CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1\nexport CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false\nexport CLAUDE_CODE_DISABLE_AUTO_MEMORY=1\nexport CLAUDE_CODE_DISABLE_ORG_MEMORY=1\nexport CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1\n# <<< core:env <<<\n'; } > "$PROFILE"
 rm -f "$ptmp"
-echo "settings.json wired: core-hud, bypassPermissions, disableWorkflows, recap off, prompt suggestions off (settings key + CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false), adaptive-thinking off, memory off; legacy copy-based hook entries stripped (the plugin registers them)"
-echo "shell profile pinned: adaptive-thinking + prompt-suggestion + auto-memory + org-memory disabled ($PROFILE)"
+echo "settings.json wired: core-hud, bypassPermissions, disableWorkflows, recap off, prompt suggestions off (settings key + CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false), adaptive-thinking off, memory off, rating survey off; legacy copy-based hook entries stripped (the plugin registers them)"
+echo "shell profile pinned: adaptive-thinking + prompt-suggestion + auto-memory + org-memory + rating survey disabled ($PROFILE)"
 
 echo '--- verify ---'
 jq -e '.permissions.defaultMode == "bypassPermissions"' "$SETTINGS" >/dev/null && echo 'defaultMode: OK' || echo 'defaultMode: FAILED'
@@ -215,8 +218,8 @@ Jev key                        set via env | file | keychain, jev doctor live | 
 ~/.claude/core-hud.sh          installed (statusline; the one file still copied)
 ~/.claude/judge-rules.json     empty overlay written | existing overlay kept | full copy retired to .fullcopy.bak
 ~/.claude/*.sh.retired.*       legacy hook copies retired, if any were present
-~/.claude/settings.json        wired + VERIFIED (bypassPermissions, disableWorkflows, recap off, prompt suggestions off via settings key and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, adaptive-thinking off, auto-memory + org-memory off, legacy hook entries stripped, judge-hook proven live by a real deny)
-~/.zshrc | ~/.bashrc           pinned CLAUDE_CODE_DISABLE_{ADAPTIVE_THINKING,AUTO_MEMORY,ORG_MEMORY}=1 and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (shell beats the settings env block)
+~/.claude/settings.json        wired + VERIFIED (bypassPermissions, disableWorkflows, recap off, prompt suggestions off via settings key and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, adaptive-thinking off, auto-memory + org-memory off, rating survey off, legacy hook entries stripped, judge-hook proven live by a real deny)
+~/.zshrc | ~/.bashrc           pinned CLAUDE_CODE_DISABLE_{ADAPTIVE_THINKING,AUTO_MEMORY,ORG_MEMORY,FEEDBACK_SURVEY}=1 and CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (shell beats the settings env block)
 ~/.claude/CLAUDE.md            guidelines written + cross-checked against the shipped example
 ~/.claude/.core-version stamped
 ```
