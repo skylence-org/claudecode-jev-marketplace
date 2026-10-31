@@ -56,6 +56,7 @@ events=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk -v q="'" '
         else if (v ~ /^--todo=/) todo = substr(v, 8)
         else if (v == "--name" && j < n) name = bare(t[j + 1])
         else if (v ~ /^--name=/) name = substr(v, 8)
+        else if (v == "--relaunch" && j < n) name = bare(t[j + 1])
       }
       if (todo == "") todo = "-"
       if (name == "") name = "-"

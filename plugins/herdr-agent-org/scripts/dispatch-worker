@@ -4,9 +4,11 @@
 #
 # Usage:
 #   dispatch-worker --name NAME [--kind KIND] [--cwd PATH] [--direction right|down] \
-#                   [--todo SLUG] [--prompt TEXT] [--timeout MS] \
+#                   [--todo SLUG] [--prompt TEXT] [--timeout MS] [--model M] \
 #                   [--wake-target ORCH] [--beat-note TEXT] [--upgrade-reason TEXT] [--no-gauge] \
-#                   [--accept-trust] [-- agent-args...]
+#                   [--keep-tier TEXT] [--accept-trust] [-- agent-args...]
+#   dispatch-worker --relaunch NAME [--model M] (--upgrade-reason TEXT | --keep-tier TEXT) \
+#                   [--todo SLUG] [--cwd PATH] [--accept-trust] [-- agent-args...]
 #
 # With no --direction, placement is automatic: the first worker splits the
 # orchestrator pane DOWN, later workers split the last live worker pane
@@ -27,10 +29,25 @@
 # scripts/tier-gauge (one Jev request: work tier, risk, brief-template lint)
 # before the pane is split. A cheap tier (--model haiku) on a
 # brief the gauge reads as not mechanical is REFUSED (exit 2), the same hard
-# stop as a missing --upgrade-reason; a hard brief on a non-top tier and any
-# missing template item only warn. The verdict line is filed on the todo as
+# stop as a missing --upgrade-reason. A HARD brief on a non-top tier
+# (verdict line `upgrade=advised`) also stops before any pane exists, until
+# the orchestrator chooses: --model opus --upgrade-reason "<why>" (files
+# [MODEL: ...]) or --keep-tier "<why>" (files [TIER-KEPT: <tier>, <why>]).
+# The gauge never auto-upgrades. A missing template item only warns. The
+# verdict line is filed on the todo as
 # [TIER-GAUGE: ...]. Jev unavailable (no TYPESAFE_API_KEY) means ungauged and
 # the dispatch proceeds as before. --no-gauge skips it; file the L13 reason.
+#
+# RELAUNCH (change a just-started worker's model without a composer /model):
+# --relaunch NAME reaps that lane's current pane and starts the same agent
+# name in the same lane tree (the agent's cwd unless --cwd) with the same
+# todo (its '<name>: <todo>' pane label unless --todo) and the default launch
+# pointer. --model M is shorthand for `-- --model M`; with no agent args the
+# relaunch passes --permission-mode bypassPermissions. An upgrade needs
+# --upgrade-reason ([MODEL: ...]); anything else needs --keep-tier
+# ([TIER-KEPT: <model>, <why>]); both file [RELAUNCH: <old pane> -> <new
+# pane>, <why>]. Refused when the todo is verified/complete or the lane tree
+# is missing.
 #
 # A Claude lane worker also needs full-auto args, which are NOT applied for you:
 #   dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
@@ -80,7 +97,18 @@ BEAT_NOTE=""
 EXTRA_ARGS=""
 NO_GAUGE=0
 ACCEPT_TRUST=0
+KEEP_TIER=""
+RELAUNCH=""
+TOP_MODEL=""
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BOARD=""
+if command -v board >/dev/null 2>&1; then
+  BOARD="board"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/scripts/board" ]; then
+  BOARD="$CLAUDE_PLUGIN_ROOT/scripts/board"
+elif [ -x "$HERE/board" ]; then
+  BOARD="$HERE/board"
+fi
 
 usage() {
   awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
@@ -102,6 +130,9 @@ while [ "$#" -gt 0 ]; do
     --prompt) PROMPT=$2; shift 2 ;;
     --timeout) TIMEOUT=$2; shift 2 ;;
     --upgrade-reason) UPGRADE_REASON=$2; shift 2 ;;
+    --keep-tier) KEEP_TIER=$2; shift 2 ;;
+    --relaunch) RELAUNCH=$2; NAME=$2; shift 2 ;;
+    --model) TOP_MODEL=$2; shift 2 ;;
     --wake-target) WAKE_TARGET=$2; shift 2 ;;
     --beat-note) BEAT_NOTE=$2; shift 2 ;;
     --no-gauge) NO_GAUGE=1; shift ;;
@@ -129,6 +160,35 @@ fi
   echo "dispatch-worker: --kind $KIND is not dispatchable: the pointer rides the launch arguments and only the claude CLI takes one; nothing is ever typed into a composer (L11)." >&2
   exit 2
 }
+
+if [ -n "$TOP_MODEL" ]; then
+  [ -z "$(arg_value --model "$EXTRA_ARGS")" ] || { echo "dispatch-worker: --model given both as a flag and in the agent args" >&2; exit 2; }
+  EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--model $TOP_MODEL"
+fi
+
+# RELAUNCH: resolve the live lane before anything is measured or spawned.
+OLD_PANE=""
+if [ -n "$RELAUNCH" ]; then
+  agent_json=$($HERDR agent get "$NAME" 2>/dev/null) || agent_json=""
+  OLD_PANE=$(printf '%s' "$agent_json" | jq -r '.result.agent.pane_id // empty' 2>/dev/null) || OLD_PANE=""
+  [ -n "$OLD_PANE" ] || { echo "dispatch-worker: --relaunch $NAME: no live agent by that name (herdr agent get); dispatch it fresh instead." >&2; exit 2; }
+  if [ -z "$CWD" ]; then
+    CWD=$(printf '%s' "$agent_json" | jq -r '.result.agent.cwd // empty' 2>/dev/null) || CWD=""
+  fi
+  if [ -z "$TODO" ]; then
+    label=$($HERDR pane list ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} 2>/dev/null | jq -r --arg p "$OLD_PANE" '.result.panes[]? | select(.pane_id == $p) | .label // empty' 2>/dev/null | head -1) || label=""
+    case "$label" in "$NAME: "*) TODO=${label#"$NAME: "} ;; esac
+  fi
+  [ -n "$TODO" ] || { echo "dispatch-worker: --relaunch $NAME: pane $OLD_PANE carries no '$NAME: <todo>' label; pass --todo." >&2; exit 2; }
+  { [ -n "$CWD" ] && [ -d "$CWD" ]; } || { echo "dispatch-worker: --relaunch $NAME: lane tree '${CWD}' is missing; refusing to relaunch into nothing." >&2; exit 2; }
+  [ -n "$BOARD" ] || { echo "dispatch-worker: --relaunch needs the board CLI to read todo $TODO" >&2; exit 1; }
+  st=$("$BOARD" get "$TODO" --json 2>/dev/null | jq -r '.status // empty' 2>/dev/null) || st=""
+  case "$st" in
+    verified|complete) echo "dispatch-worker: --relaunch $NAME: todo $TODO is $st; a finished lane is reaped, never relaunched (L4)." >&2; exit 2 ;;
+    "") echo "dispatch-worker: --relaunch $NAME: todo $TODO not found on the board (HERDR_ORG_ROOT=${HERDR_ORG_ROOT:-unset})." >&2; exit 2 ;;
+  esac
+  case " $EXTRA_ARGS " in *" --permission-mode "*) ;; *) EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--permission-mode bypassPermissions" ;; esac
+fi
 
 MODEL=$(arg_value --model "$EXTRA_ARGS")
 EFFORT=$(arg_value --effort "$EXTRA_ARGS")
@@ -160,6 +220,10 @@ if [ "$MODEL_UP" -eq 1 ] || [ "$EFFORT_UP" -eq 1 ] || [ "$ADVISOR_UP" -eq 1 ]; t
     exit 2
   fi
 fi
+if [ -n "$RELAUNCH" ] && [ "$MODEL_UP" -eq 0 ] && [ "$EFFORT_UP" -eq 0 ] && [ "$ADVISOR_UP" -eq 0 ] && [ -z "$KEEP_TIER" ]; then
+  echo "dispatch-worker: --relaunch $NAME at model=$MODEL is no upgrade: pass --keep-tier \"<why>\" (files [TIER-KEPT: ...], L17)." >&2
+  exit 2
+fi
 
 MARKERS=""
 [ "$MODEL_UP" -eq 1 ] && MARKERS="[MODEL: $MODEL, $UPGRADE_REASON]"
@@ -185,6 +249,16 @@ if [ -n "$TODO" ] && [ "$NO_GAUGE" -eq 0 ] && [ -x "$TG" ]; then
     GAUGE=""
   fi
 fi
+# A HARD brief below the top tier is a choice the orchestrator makes before
+# the pane exists, never a warning read after the worker has started.
+KEPT_TIER="$MODEL"
+case "$GAUGE" in
+  *"upgrade=advised"*)
+    [ -n "$KEEP_TIER" ] || { echo "dispatch-worker: tier-gauge reads the brief as HARD below the top tier ($GAUGE): pass --model opus --upgrade-reason \"<why>\" or --keep-tier \"<why>\" (L17)." >&2; exit 2; }
+    KEPT_TIER=$(printf '%s' "$GAUGE" | sed -n 's/.* tier=\([a-z]*\).*/\1/p')
+    ;;
+esac
+[ -n "$KEEP_TIER" ] && MARKERS="${MARKERS:+$MARKERS }[TIER-KEPT: ${KEPT_TIER:-$MODEL}, $KEEP_TIER]"
 
 # The worker's board writes silently fall back to ~/.herdr-org/default when
 # this is missing, which reads downstream as "board unavailable" and loses
@@ -207,6 +281,15 @@ fi
   echo "dispatch-worker: --prompt or --todo required" >&2
   exit 2
 }
+
+# RELAUNCH: the old lane goes before the layout is read, so its pane is not
+# counted and its name is free for the new agent.
+if [ -n "$OLD_PANE" ]; then
+  [ -x "$HERE/waker-ctl" ] && { "$HERE/waker-ctl" unregister --lane "$NAME" >/dev/null 2>&1 || true; }
+  $HERDR pane close "$OLD_PANE" >/dev/null 2>&1 || { echo "dispatch-worker: --relaunch $NAME: herdr pane close $OLD_PANE failed" >&2; exit 1; }
+  i=0
+  while [ "$i" -lt 10 ] && $HERDR agent get "$NAME" >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
+fi
 
 # Panes are launched by the herdr server and do NOT inherit this process's
 # environment (measured on herdr 0.7.5, 2026-07-28), so the board root and
@@ -366,24 +449,17 @@ case "$TRUST" in
     ;;
 esac
 
-BOARD=""
-if command -v board >/dev/null 2>&1; then
-  BOARD="board"
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/scripts/board" ]; then
-  BOARD="$CLAUDE_PLUGIN_ROOT/scripts/board"
-elif [ -x "$HERE/board" ]; then
-  BOARD="$HERE/board"
-fi
 if [ -n "$TODO" ] && [ -n "$BOARD" ]; then
   # Silenced: stdout is the JSON summary contract, board chatter must not join it.
   "$BOARD" set-owner "$TODO" "$NAME" >/dev/null || true
   "$BOARD" set-status "$TODO" in_progress >/dev/null || true
   [ -n "$MARKERS" ] && { "$BOARD" comment "$TODO" "**$MARKERS** dispatched as $NAME (kind $KIND, pane $pane_id)" >/dev/null || true; }
+  [ -n "$OLD_PANE" ] && { "$BOARD" comment "$TODO" "**[RELAUNCH: $OLD_PANE -> $pane_id, ${UPGRADE_REASON:-$KEEP_TIER}]** $NAME relaunched at model=$MODEL" >/dev/null || true; }
   # The gauge verdict is the L17/L10 evidence the board used to get only as prose.
   [ -n "$GAUGE" ] && { "$BOARD" comment "$TODO" "**[$GAUGE]** at dispatch of $NAME" >/dev/null || true; }
 fi
 
-printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s,"trust":%s}\n' \
+printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s,"trust":%s,"relaunched_from":%s}\n' \
   "$(printf '%s' "$NAME" | jq -Rs .)" \
   "$(printf '%s' "$pane_id" | jq -Rs .)" \
   "$(printf '%s' "$KIND" | jq -Rs .)" \
@@ -397,4 +473,5 @@ printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effo
   "$(printf '%s' "$GAUGE" | jq -Rs .)" \
   "$(printf '%s' "$WAKER" | jq -Rs .)" \
   "$(printf '%s' "$SUBMIT" | jq -Rs .)" \
-  "$(printf '%s' "$TRUST" | jq -Rs .)"
+  "$(printf '%s' "$TRUST" | jq -Rs .)" \
+  "$(printf '%s' "$OLD_PANE" | jq -Rs .)"

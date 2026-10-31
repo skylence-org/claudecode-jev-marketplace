@@ -142,6 +142,9 @@ expect_marker "herdr agent start --help leaves no mark" ""
 reset
 mark Bash '{"command":"sh /x/run-dispatch.sh"}'
 expect_marker "a script-run dispatch is invisible to the hook" ""
+reset
+mark Bash '{"command":"dispatch-worker --relaunch w5 --model opus --upgrade-reason x"}'
+expect_marker "dispatch-worker --relaunch records the relaunched agent name" "dispatch - w5;"
 # --- dispatch-worker records its own line (the script-run case)
 dwscript="$tmp/run-dispatch.sh"
 printf '#!/bin/sh\nsh "%s" --name w-s --todo lane-s --no-gauge --prompt go\n' "$here/../../scripts/dispatch-worker" > "$dwscript"
