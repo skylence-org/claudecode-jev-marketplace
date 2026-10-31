@@ -106,8 +106,21 @@ agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"
 expect 0 "shape B: an unnamed idle operator pane does not hold a keyless line in flight" "$(run_gate_ws w1)"
 reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
 agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p2","name":"w-d","workspace_id":"w1","agent_status":"done"},{"pane_id":"p3","name":"w-i","workspace_id":"w1","agent_status":"idle"}]}}'
-msg 2026-10-26T10:05:00Z w-i doorbell
-expect 0 "shape C: a done worker and an idle worker past its [DONE] do not hold a keyless line" "$(run_gate_ws w1)"
+msg 2026-10-26T10:05:00Z w-i doorbell; msg 2026-10-26T10:06:00Z w-d doorbell
+expect 0 "shape C: a done and an idle worker, each past its own [DONE], do not hold a keyless line" "$(run_gate_ws w1)"
+# herdr `done` = idle plus unseen output: a mid-lane worker whose turn ended (review I2)
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p2","name":"w-d","workspace_id":"w1","agent_status":"done"}]}}'
+expect 1 "a done-status worker with no [DONE] doorbell still holds a keyless line" "$(run_gate_ws w1)"
+# a previous round's [DONE] does not finish a re-dispatched worker (review M1, FN5)
+reset; printf '%s\n' "2026-10-26T10:00:00Z dispatch - -" "2026-10-26T11:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p3","name":"w-i","workspace_id":"w1","agent_status":"idle"}]}}'
+msg 2026-10-26T10:30:00Z w-i doorbell
+expect 1 "FN5: a [DONE] older than the newest dispatch line does not finish the worker" "$(run_gate_ws w1)"
+# HERDR_WORKSPACE_ID unset: scope to this pane's own workspace, never all (review M3)
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p9","name":"w-o","workspace_id":"w2","agent_status":"working"}]}}'
+expect 0 "orig-B: no HERDR_WORKSPACE_ID, a working lane in another workspace does not hold the line" "$(run_gate)"
 reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
 agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p9","name":"w-o","workspace_id":"w2","agent_status":"working"}]}}'
 expect 0 "shape D: a working lane in another workspace does not hold a keyless line" "$(run_gate_ws w1)"
@@ -120,6 +133,18 @@ expect 0 "shape F: herdr agent start of a non-lane agent, agent no longer listed
 reset; echo "2026-10-26T10:00:00Z dispatch - helper" > "$marker"
 agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test"},{"pane_id":"p5","name":"helper","agent_status":"working"}]}}'
 expect 1 "control: the same keyed line while the agent is still listed: in flight" "$(run_gate)"
+# A partial list (herdr rehydrating, this pane's own agent missing) never ends keyed lanes (review M2, FN3b)
+expect_dbg() { # expect_dbg <in_flight 0|1> <case name>
+  got=$(printf '{"session_id":"%s","stop_hook_active":false}' "$sid" | ORG_STOP_GATE_DEBUG=1 sh "$gate" 2>&1 >/dev/null | sed -n 's/.*in_flight=\([01]\).*/\1/p')
+  if [ "$got" = "$1" ]; then pass=$((pass + 1)); echo "ok   $2"; else fail=$((fail + 1)); echo "FAIL $2 (in_flight=$got, expected $1)"; fi
+}
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p7","name":"someone","workspace_id":"w1","agent_status":"working"}]}}'
+expect_dbg 1 "FN3b: a list without this pane's agent does not end a keyed lane"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; printf 'not json' > "$tmp/agents.json"
+expect_dbg 1 "herdr unreadable: a keyed line without a doorbell stays in flight"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; agents "$one_agent"
+expect_dbg 0 "control: a full list without w-a ends the keyed lane"
 reset; echo "2026-10-26T10:00:00Z wait" > "$marker"
 expect 0 "a lifecycle wait alone asks for no coverage" "$(run_gate)"
 reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; printf '{"awaiting":["orch-test"]}' > "$tmp/www/status"
@@ -174,6 +199,25 @@ expect_marker "then/else stages are classified" "dispatch - w7;dispatch - w8;"
 reset
 mark Bash '{"command":"{ dispatch-worker --name w9 --todo lane-9; }"}'
 expect_marker "a { group } stage is classified" "dispatch lane-9 w9;"
+# --- prefix commands and subshells (PR #9 review M6)
+reset
+mark Bash '{"command":"time dispatch-worker --name w1 --todo l1"}'
+expect_marker "time dispatch-worker: classified" "dispatch l1 w1;"
+reset
+mark Bash '{"command":"(herdr agent start w2)"}'
+expect_marker "(subshell): classified, no ) glued to the name" "dispatch - w2;"
+reset
+mark Bash '{"command":"nohup herdr agent start w3 > /tmp/x.log 2>&1 &"}'
+expect_marker "nohup ... &: classified" "dispatch - w3;"
+reset
+mark Bash '{"command":"env FOO=1 BAR=2 dispatch-worker --name w4 --todo l4"}'
+expect_marker "env VAR=... dispatch-worker: classified" "dispatch l4 w4;"
+reset
+mark Bash '{"command":"exec herdr agent start w5"}'
+expect_marker "exec herdr agent start: classified" "dispatch - w5;"
+reset
+mark Bash '{"command":"out=$(dispatch-worker --name w6 --todo l6)"}'
+expect_marker "a \$( ) capture: classified" "dispatch l6 w6;"
 reset
 mark Bash '{"command":"sh /x/run-dispatch.sh"}'
 expect_marker "a script-run dispatch is invisible to the hook" ""
