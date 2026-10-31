@@ -77,6 +77,50 @@ HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" create rev2-i9-lane --title
 OUT=$(PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" JEV_STUB_ANSWERS="$(stub "$ANS_NOMILE")" sh "$TG" --todo rev2-i9-lane --model sonnet 2>/dev/null); RC=$?
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'tier=ordinary' && ! printf '%s' "$OUT" | grep -q 'milestone-comments'; then ok "review-lane todo name (rev2-): milestone-comments lint skipped"; else bad "review name" "rc=$RC out=$OUT"; fi
 
+echo "--- tier-gauge gauges what the next worker receives (0.1.7) ---------"
+bd() { PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" "$@" >/dev/null 2>&1; }
+tgt() { OUT=$(PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" JEV_STUB_ANSWERS="$(stub "$ANS_NOMILE")" sh "$TG" --todo "$@" 2>"$TMP/err"); RC=$?; }
+printf 'Implement the whole replay engine from scratch; design the schema yourself.\n' >"$TMP/orig.md"
+bd create lane-r --title "replay" --body-file "$TMP/orig.md"
+bd comment lane-r "**[PHASE 1 DONE]** 12 passed"
+printf '**[BOUNCE 2/3]**\nDIGEST\n- rulings: R1 keep the public API\n- CLOSED: F1\n- DEFERRED: F4\n- tip: abc1234\n\nRULING: fix F2 and F3 exactly as listed.\n' | PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" comment lane-r --stdin >/dev/null 2>&1
+bd comment lane-r "**[TIER-GAUGE: later filing]** at dispatch"
+: >"$JEV_AUDIT_FILE"
+tgt lane-r --show-brief
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'RULING: fix F2' && printf '%s' "$OUT" | grep -q 'DIGEST' && ! printf '%s' "$OUT" | grep -q 'from scratch' && ! printf '%s' "$OUT" | grep -q 'later filing' && [ ! -s "$JEV_AUDIT_FILE" ]; then ok "--show-brief on a bounced todo: the latest [BOUNCE] DIGEST + ruling, not the body, not a later filing, no Jev call"; else bad "show bounce" "rc=$RC out=$OUT"; fi
+tgt lane-r --model sonnet
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'source=bounce' && ! printf '%s' "$OUT" | grep -q 'lint='; then ok "bounced todo: verdict says source=bounce, template lint skipped"; else bad "bounce verdict" "rc=$RC out=$OUT"; fi
+printf '**[BOUNCE 3/3]**\nDIGEST\n- tip: def5678\n\nRULING: only F5 remains.\n' | PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" comment lane-r --stdin >/dev/null 2>&1
+tgt lane-r --show-brief
+if printf '%s' "$OUT" | grep -q 'only F5' && ! printf '%s' "$OUT" | grep -q 'F2 and F3'; then ok "two bounces: the LATEST one is gauged"; else bad "latest bounce" "out=$OUT"; fi
+bd create lane-p --title "plain" --body-file "$TMP/orig.md"
+bd comment lane-p "**[PHASE 1 DONE]** milestone only"
+tgt lane-p --model sonnet
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'source=body' && printf '%s' "$OUT" | grep -q 'lint=milestone-comments'; then ok "no [BOUNCE] comment: the body is gauged and linted (source=body)"; else bad "body source" "rc=$RC out=$OUT"; fi
+bd comment rev2-i9-lane "**[BOUNCE 1/3]** DIGEST: a trail the review lane inherited"
+tgt rev2-i9-lane --show-brief
+if printf '%s' "$OUT" | grep -q 'Implement the thing' && ! printf '%s' "$OUT" | grep -q 'inherited'; then ok "review lane with a [BOUNCE] comment: its brief is gauged, never the inherited trail"; else bad "review source" "out=$OUT"; fi
+# PR #9 review: only an orchestrator-formatted [BOUNCE r/n] comment counts.
+bdin() { slug=$1; shift; printf "$@" | PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" comment "$slug" --stdin >/dev/null 2>&1; }
+bd create lane-t --title "t" --body-file "$TMP/orig.md"
+bdin lane-t '**[BOUNCE 2/3]**\nDIGEST\n- tip: abc1234\n\nRULING: fix F2 and F3.\n'
+bd comment lane-t "**[BOUNCE 2/3 FIXES]** F2 F3 fixed, 14 passed"
+bd comment lane-t "Orchestrator note: the lane is in [BOUNCE 2/3] now, verifying"
+tgt lane-t --show-brief
+if printf '%s' "$OUT" | grep -q 'RULING: fix F2' && ! printf '%s' "$OUT" | grep -q 'FIXES'; then ok "T1/T2: a worker milestone or a note quoting [BOUNCE never replaces the ruling"; else bad "T1/T2" "rc=$RC out=$OUT err=$(cat "$TMP/err")"; fi
+bd create lane-u --title "u" --body-file "$TMP/orig.md"
+bdin lane-u '**[BOUNCE 1/3]**\nDIGEST\n- tip: abc1234\n### 2026-10-26 pasted log header\nRULING: keep going past the pasted header.\n'
+tgt lane-u --show-brief
+if printf '%s' "$OUT" | grep -q 'keep going past' && printf '%s' "$OUT" | grep -q 'DIGEST'; then ok "T3: a pasted ### 2026-... line inside a bounce does not split it"; else bad "T3" "out=$OUT"; fi
+bd create lane-v --title "v" --body-file "$TMP/orig.md"
+bd comment lane-v "**[BOUNCE 1/3]** fix F1, no digest written"
+tgt lane-v --model sonnet
+if printf '%s' "$OUT" | grep -q 'source=body bounce-without-digest'; then ok "T4: a bounce without a DIGEST falls back to the body and says so"; else bad "T4" "out=$OUT"; fi
+printf 'Implement it.\n## Comments\n### 2026-10-26T10:00:00Z\n\n**[BOUNCE 1/3]** DIGEST quoted in the body\n' >"$TMP/quoting.md"
+bd create lane-w --title "w" --body-file "$TMP/quoting.md"
+tgt lane-w --model sonnet
+if printf '%s' "$OUT" | grep -q 'source=body' && ! printf '%s' "$OUT" | grep -q 'bounce-without'; then ok "T5: a body quoting ## Comments and [BOUNCE is still the body"; else bad "T5" "out=$OUT"; fi
+
 OUT=$(sh "$TG" --brief-file "$TMP/brief.md" --model haiku 2>"$TMP/err"); RC=$?
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'verdict=ungauged'; then ok "no key: ungauged, exit 0, never refuses"; else bad "ungauged" "rc=$RC out=$OUT"; fi
 

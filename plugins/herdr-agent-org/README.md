@@ -42,6 +42,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
   - `board` is the filesystem board (todos, comments, pads, blockers); `set-status` best-effort publishes the lane's status into the herdr sidebar pane (`pane report-metadata`), `ready` lists unblocked pending todos, `create --tags`/`list --tags` tag and filter todos, `query <text>` case-insensitively searches todo files, `list`/`ready`/`get` support `--json`, and every mutating command snapshots a best-effort silent git commit when git is available
   - `dispatch-worker` splits a pane (auto layout: first worker below the orchestrator, later workers rightward in rows of at most 2, a fresh row per 2; explicit `--direction` overrides), starts a named agent, sends the pointer prompt, and reports the post-send state; optional `--beat-note TEXT` is forwarded to waker registration so settle/block/death rings carry the orchestrator's beat script
     - 0.1.6: a hard brief below the top tier stops the dispatch until `--upgrade-reason` or `--keep-tier "<why>"` (`[TIER-KEPT: ...]`); `--relaunch <name> --model <m>` reaps and relaunches a just-started lane at another model (`[RELAUNCH: ...]`); `--accept-trust` answers Claude Code's startup folder-trust dialog with content-free keys (`state=trust-prompt` without it); the default pointer carries the exact board command (`env HERDR_ORG_ROOT=<root> <abs>/board`); the lane is appended to the session's stop-gate marker even when dispatch-worker runs from a script
+    - 0.1.7: `tier-gauge` gauges what the next worker receives: a todo with a `[BOUNCE n]` comment is gauged on its latest DIGEST + ruling (`source=bounce`, no template lint), anything else on its body (`source=body`); a review lane always on its brief; `--show-brief` prints the gauged text without a Jev call. The stop gate counts only unfinished named lanes in this workspace for a keyless line, ends a keyed line whose agent is gone, and marks `herdr agent start` / `dispatch-worker` stages inside `for … do`, `if … then`, `else` and `{ … }`
   - `build-slot` is the machine-wide compile serializer
   - `tier-gauge` measures a brief's worker tier, risk, and template completeness (L17; one Jev request, called by `dispatch-worker`)
   - `review-gate-check` measures the L10 review gate at accept (lines in code, surfaces by one Jev request)
@@ -53,6 +54,27 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
   - `org-conduct-refresh.sh` (SessionStart, matchers `startup|resume|compact`) primes the role-skill contract in fresh sessions and re-injects the re-read order after compaction
 - **templates/claude-md.md**: worker guidance to paste into `~/.claude/CLAUDE.md` on a machine that runs lane workers.
 - **templates/reviewer-brief.md**: the L10 reviewer-lane dispatch contract — two-stage verdict (spec compliance and artifact quality), severity-ranked findings, forced `READY:` verdict, review-package-as-file.
+
+## Calibration
+
+The tier criteria `tier-gauge` asks Jev about ship in `scripts/jev-questions.json` and change only by PR. Recalibrate them locally first, in the overlay, and promote a change only once it holds on more than one session's briefs.
+
+- **Where the overlay lives.** `JEV_QUESTIONS_OVERLAY`, default `~/.claude/jev-questions.json`: the same shape as the shipped file, deep-merged over it, and ignored (never fatal) when it does not parse. `scripts/jev doctor` prints whether it was merged. Keep a `_calibration` note in it saying what changed, when, and on which sample.
+- **Label briefs from outcomes, not from reading them.** For each finished lane, write `<todo-slug> <tier>` to a labels file, the tier being the one the lane turned out to need: `mechanical` when a transcription-grade brief landed first pass on the cheap tier; `hard` when it took an upgrade, a replacer, or two or more bounces for approach (not typos); `ordinary` otherwise. `tier-gauge --todo <slug> --show-brief` prints the exact text that was gauged (the body, or the latest `[BOUNCE]` DIGEST), so you label what was measured.
+- **Compare runs.** Gauge every labelled slug twice, shipped criteria versus overlay, and count agreements per tier. The request checksum covers the questions, so a changed criterion is never answered from cache:
+
+  ```bash
+  export HERDR_ORG_ROOT=~/.herdr-org/<org>   # board (and so --todo) refuses to guess an org
+  # tier=null in the output means ungauged: no key, no root, or no such todo
+  while read -r slug label; do
+    shipped=$(JEV_QUESTIONS_OVERLAY=/nonexistent tier-gauge --todo "$slug" --json | jq -r .tier)
+    overlay=$(tier-gauge --todo "$slug" --json | jq -r .tier)
+    echo "$slug label=$label shipped=$shipped overlay=$overlay"
+  done < labels.txt
+  ```
+
+  Every call lands in `JEV_AUDIT_FILE` (default `~/.claude/jev-audit.jsonl`, one JSON object per line: `ts`, `set`, `model`, `request_sum`, and `answers`, plus `ms`/`tokens` on live calls, `cache` or `stub` otherwise). The history of a run reads back with `jq -c 'select(.set == "tier-gauge" and (.stub | not)) | {ts, request_sum, tier: .answers.tier.choice, conf: .answers.tier.confidence}' ~/.claude/jev-audit.jsonl`.
+- **Promote** to `scripts/jev-questions.json` only when the overlay wins on labelled briefs from at least two sessions. One session's 18 briefs (worker briefs 1/4 → 4/4 correct, missed hard lanes 3 → 1) are a lead, not a sample.
 
 ## Install
 

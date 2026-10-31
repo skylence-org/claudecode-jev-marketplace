@@ -37,14 +37,21 @@ cmd=$(printf '%s' "$input" | jq -r '(.tool_input? // {}) | [(.command? // empty)
 # grep, or cat that merely mentions dispatch-worker is not a dispatch. Stages
 # split on | ; & and newlines; quoted strings with whitespace (prompt text) are
 # blanked first so their words are never read as flags; leading VAR=value
-# assignments are skipped; `${HERDR_BIN_PATH:-herdr}` counts as herdr.
+# assignments, shell keywords (do then else elif if while until { !) and the
+# prefix commands time / exec / nohup / env (with its VAR=value pairs) are
+# skipped, and ( ) are separators, so a stage inside a loop, a branch, a
+# subshell or a $( ) is classified (0.1.7, PR #9 review M6). Known limit: a
+# dispatch typed inside a heredoc BODY is not seen; dispatch-worker's own
+# marker line covers it. `${HERDR_BIN_PATH:-herdr}` counts as herdr. A name or
+# todo that is a shell expansion (`"$n"` in a loop) is no key: recorded as `-`.
 events=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk -v q="'" '
   function bare(s) { gsub("[\"" q "]", "", s); return s }
   {
     gsub(/(^|[ \t])"[^"]*[ \t][^"]*"/, " \"\"")
     gsub("(^|[ \t])" q "[^" q "]*[ \t][^" q "]*" q, " " q q)
+    gsub(/[()]/, " ")
     n = split($0, t, /[ \t]+/); i = 1
-    while (i <= n && (t[i] == "" || t[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/)) i++
+    while (i <= n && (t[i] == "" || t[i] ~ /^[A-Za-z_][A-Za-z0-9_]*=/ || t[i] ~ /^(do|then|else|elif|if|while|until|\{|!|time|exec|nohup|env)$/)) i++
     if (i > n) next
     p = bare(t[i]); sub(/.*\//, "", p)
     if (p == "dispatch-worker") {
@@ -58,14 +65,14 @@ events=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk -v q="'" '
         else if (v ~ /^--name=/) name = substr(v, 8)
         else if (v == "--relaunch" && j < n) name = bare(t[j + 1])
       }
-      if (todo == "") todo = "-"
-      if (name == "") name = "-"
+      if (todo == "" || todo ~ /\$/) todo = "-"
+      if (name == "" || name ~ /\$/) name = "-"
       print "dispatch " todo " " name; next
     }
     if (p ~ /^(\$\{HERDR_BIN_PATH:-herdr\}|\$HERDR|herdr)$/ && bare(t[i + 1]) == "agent") {
       if (bare(t[i + 2]) == "start") {
         for (j = i + 3; j <= n; j++) { v = bare(t[j]); if (v == "--help" || v == "-h") next }
-        name = bare(t[i + 3]); if (name == "") name = "-"
+        name = bare(t[i + 3]); if (name == "" || name ~ /\$/) name = "-"
         print "dispatch - " name; next
       }
       if (bare(t[i + 2]) == "wait") { print "wait"; next }
