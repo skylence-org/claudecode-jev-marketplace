@@ -194,6 +194,51 @@ S=$(startline)
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.replacer == true and .model == "opus" and .trust == "accepted"' >/dev/null && printf '%s' "$S" | grep -q -- '--model opus' && printf '%s' "$S" | grep -q 'herdr-replacer' && sh "$PLUGIN/scripts/board" get lane-r | grep -q 'MODEL: opus, approach was wrong twice'; then ok "--replacer + --model + --upgrade-reason + --accept-trust: all still apply"; else bad "replacer flags" "rc=$RC out=$OUT err=$ERR"; fi
 dw --name lane-a --todo lane-q --no-gauge -- --permission-mode bypassPermissions
 printf '%s' "$OUT" | jq -e '.replacer == false and .tip == "" and .bounce == null' >/dev/null && ok "fresh dispatch: replacer=false, tip empty, bounce=null" || bad "fresh json" "out=$OUT"
+
+echo "--- one bounce parser, shared with tier-gauge (review I4 m4 m6) ---------"
+TGS="$PLUGIN/scripts/tier-gauge"
+RNAME=$(sed -n 's/^name: *//p' "$PLUGIN/skills/replacer/SKILL.md" | head -1)
+# D1: a body that quotes a trail (its own ## Comments and a bounce) and no
+# real bounce comment: once with one ordinary comment, once with none.
+printf 'Brief.\n\n## Comments\n\n### 2026-01-01T00:00:00Z\n\n**[BOUNCE 9/3]**\nDIGEST\n- quoted from another lane\n' >"$TMP/quote.md"
+bd create lane-d1 --title "d1" --body-file "$TMP/quote.md"
+bd comment lane-d1 "**[ORIENT DONE]** started"
+bd create lane-d1z --title "d1z" --body-file "$TMP/quote.md"
+for l in lane-d1 lane-d1z; do
+  dw --name "$l" --todo "$l" --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+  S=$(startline)
+  [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == null' >/dev/null && ! printf '%s' "$S" | grep -qi 'bounce' && ok "D1 $l: a bounce quoted in the body is no bounce (pointer has no round)" || bad "D1 $l" "rc=$RC out=$OUT start=$S"
+done
+# D2: a real [BOUNCE 1/3], then a prose comment naming another lane's 3/3.
+bd create lane-d2 --title "d2" --body-file "$TMP/brief.md"
+printf '**[BOUNCE 1/3]**\nDIGEST\n- fix F1\n' | bd comment lane-d2 --stdin
+bd comment lane-d2 "note: unlike the [BOUNCE 3/3] on lane-x, this one is small"
+dw --name lane-d2 --todo lane-d2 --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+[ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == 1' >/dev/null && printf '%s' "$S" | grep -qF 'bounce 1/3' && ! printf '%s' "$S" | grep -qF '3/3' && ok "D2: a prose mention of [BOUNCE 3/3] is not a bounce; the round is 1" || bad "D2" "rc=$RC out=$OUT start=$S"
+# Round 4: the ESCALATION comment, never 4/3.
+bd create lane-e4 --title "e4" --body-file "$TMP/brief.md"
+printf '**[BOUNCE 2/3]**\nDIGEST\n- fix F2\n' | bd comment lane-e4 --stdin
+printf '**[BOUNCE 4 / ESCALATION]**\nDIGEST\n- tier-up\n' | bd comment lane-e4 --stdin
+dw --name lane-e4 --todo lane-e4 --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+[ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == 4' >/dev/null && printf '%s' "$S" | grep -qF '[BOUNCE 4 / ESCALATION]' && ! printf '%s' "$S" | grep -qF '4/3' && ok "round 4: the pointer names the [BOUNCE 4 / ESCALATION] comment, never 4/3" || bad "escalation" "rc=$RC out=$OUT start=$S"
+# Parity: dispatch-worker's round is tier-gauge's round, same todo.
+for l in lane-r lane-d1 lane-d1z lane-d2 lane-e4; do
+  tg=$(sh "$TGS" --todo "$l" --round-only 2>/dev/null); tgrc=$?
+  dw --name "$l" --todo "$l" --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+  b=$(printf '%s' "$OUT" | jq -r '.bounce // ""')
+  [ $tgrc -eq 0 ] && [ "$tg" = "$b" ] && ok "parity $l: tier-gauge --round-only '${tg}' == dispatch-worker bounce '${b}'" || bad "parity $l" "tier-gauge rc=$tgrc '$tg' vs dispatch '$b'"
+done
+# m4: --bounce takes 1-3 only.
+for n in 0 4 007 02; do
+  dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --bounce "$n" --no-gauge -- --permission-mode bypassPermissions
+  [ $RC -eq 2 ] && [ ! -s "$HERDR_STUB_LOG" ] && ok "--bounce $n: refused (exit 2), rounds are 1-3" || bad "bounce $n" "rc=$RC err=$ERR"
+done
+# m6: the exact skill phrase, the name read from the replacer skill itself.
+dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+[ -n "$RNAME" ] && printf '%s' "$S" | grep -qF "replacer skill ($RNAME)" && ! printf '%s' "$S" | grep -q 'herdr-worker skill' && ok "pointer says 'replacer skill ($RNAME)' (name from skills/replacer/SKILL.md) and never 'herdr-worker skill'" || bad "skill phrase" "name=$RNAME start=$S"
 echo
 echo "dispatch-worker: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1
