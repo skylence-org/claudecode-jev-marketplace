@@ -89,6 +89,8 @@ jobs:
         run: sh herdr-plugins/org-relay/test/relay_ctl_send.sh
       - name: relay-ctl purge suite (temp db, no daemon)
         run: sh herdr-plugins/org-relay/test/relay_ctl_purge.sh
+      - name: relay-ctl link-cli suite (stub curl, temp bin dir)
+        run: sh herdr-plugins/org-relay/test/relay_ctl_link.sh
       - name: nudge-deliver classify suite
         run: sh herdr-plugins/org-relay/test/nudge_deliver_classify.sh
       - name: concurrency smoke (parallel awaits, fan-out, burst, consume race)

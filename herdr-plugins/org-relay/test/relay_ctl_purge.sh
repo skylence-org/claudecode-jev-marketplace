@@ -46,8 +46,35 @@ for bad_age in 1w 10 d -5d; do
 done
 ok "bad --older-than values (1w, 10, d, -5d): usage errors"
 
+# A quoted recipient must be FOUND, not just survive (review M2).
+sqlite3 "$ORG_RELAY_DB" "INSERT INTO messages (ts, sender, recipient, kind, body) VALUES ($(ago 172800), 'peer', 'o''brien', 'doorbell', 'for o-brien');"
 p --recipient "o'brien" --older-than 1d
-if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'no unconsumed message'; then ok "a quote in the recipient is escaped, not executed"; else bad "quote" "rc=$RC err=$ERR"; fi
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'for o-brien' && printf '%s' "$OUT" | grep -q '1 unconsumed message(s)'; then ok "a quote in the recipient is escaped and its row is listed"; else bad "quote" "rc=$RC out=$OUT err=$ERR"; fi
+
+# --older-than 0 would select everything (review M3).
+for zero in 0s 0d; do
+  p --recipient i531-silent-persist --older-than "$zero"
+  [ $RC -eq 2 ] || bad "zero age $zero" "rc=$RC"
+done
+ok "--older-than 0s / 0d: refused"
+
+# --ids narrows --delete to exactly the reviewed rows (review M3).
+sqlite3 "$ORG_RELAY_DB" "INSERT INTO messages (ts, sender, recipient, kind, body) VALUES ($(ago 172800), 'peer', 'i531-silent-persist', 'doorbell', 'orphan A'), ($(ago 172800), 'peer', 'i531-silent-persist', 'doorbell', 'orphan B');"
+a=$(sqlite3 "$ORG_RELAY_DB" "SELECT id FROM messages WHERE body = 'orphan A';"); b=$(sqlite3 "$ORG_RELAY_DB" "SELECT id FROM messages WHERE body = 'orphan B';")
+p --recipient i531-silent-persist --older-than 1d --ids "$a" --delete
+left=$(sqlite3 "$ORG_RELAY_DB" "SELECT group_concat(body) FROM messages WHERE body LIKE 'orphan %';")
+if [ $RC -eq 0 ] && [ "$left" = "orphan B" ]; then ok "--ids $a --delete removes only that reviewed id"; else bad "--ids" "rc=$RC left=$left out=$OUT"; fi
+p --recipient i531-silent-persist --older-than 1d --ids "1,x"
+[ $RC -eq 2 ] && ok "--ids with a non-id: usage error" || bad "bad ids" "rc=$RC"
+
+# No jq: --delete refuses BEFORE deleting, since it could not audit (review I3).
+mkdir -p "$T/nojq"
+for tool in sqlite3 sed tr grep dirname date cat; do ln -s "$(command -v "$tool")" "$T/nojq/$tool"; done
+OUT=$(PATH="$T/nojq" /bin/sh "$CTL" purge --recipient i531-silent-persist --older-than 1d --delete 2>"$T/err"); RC=$?
+still=$(sqlite3 "$ORG_RELAY_DB" "SELECT COUNT(*) FROM messages WHERE body = 'orphan B';")
+if [ $RC -eq 2 ] && grep -q 'needs jq' "$T/err" && [ "$still" = 1 ]; then ok "no jq: --delete exits 2 and deletes nothing"; else bad "no jq" "rc=$RC still=$still err=$(cat "$T/err")"; fi
+OUT=$(PATH="$T/nojq" /bin/sh "$CTL" purge --recipient i531-silent-persist --older-than 1d 2>"$T/err"); RC=$?
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'orphan B'; then ok "no jq: listing still works"; else bad "no jq list" "rc=$RC err=$(cat "$T/err")"; fi
 
 echo "relay-ctl purge: $pass passed, $fail failed"
 [ "$fail" = 0 ]

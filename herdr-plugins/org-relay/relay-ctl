@@ -7,7 +7,17 @@
 # branch switches, moves) can never touch a running daemon, and rollback is a
 # symlink repoint away. Legacy repo-path deployment is gone on purpose.
 set -u
-DIR=$(cd "$(dirname "$0")" && pwd)
+# Resolve through symlinks: install-daemon links this script into
+# ~/.local/bin, and DIR must still name the crate (target/, nudge-deliver).
+SELF=$0
+while [ -L "$SELF" ]; do
+  link=$(readlink "$SELF")
+  case "$link" in /*) SELF=$link ;; *) SELF=$(dirname "$SELF")/$link ;; esac
+done
+DIR=$(cd "$(dirname "$SELF")" && pwd)
+# Where install-daemon links the CLI, so a job can end with a bare
+# `relay-ctl send ...` (RELAY_CTL_BIN_DIR overrides, for tests).
+CLI_DIR="${RELAY_CTL_BIN_DIR:-$HOME/.local/bin}"
 PORT="${ORG_RELAY_PORT:-7431}"
 BIN="$DIR/target/release/org-relay"
 PIDFILE="${TMPDIR:-/tmp}/org-relay.$PORT.pid"
@@ -85,6 +95,15 @@ verify_serving() {
   fi
   echo "org-relay: serving verified sha $got on :$PORT"
 }
+link_cli() {
+  mkdir -p "$CLI_DIR" 2>/dev/null || { echo "org-relay: cannot create $CLI_DIR; call $DIR/relay-ctl by its absolute path" >&2; return 1; }
+  ln -sfn "$DIR/relay-ctl" "$CLI_DIR/relay-ctl" || { echo "org-relay: cannot link $CLI_DIR/relay-ctl" >&2; return 1; }
+  echo "org-relay: relay-ctl linked at $CLI_DIR/relay-ctl -> $DIR/relay-ctl"
+  case ":$PATH:" in
+    *":$CLI_DIR:"*) ;;
+    *) echo "org-relay: $CLI_DIR is not on PATH: add it, or call $DIR/relay-ctl by its absolute path" ;;
+  esac
+}
 
 case "${1:-status}" in
   run)
@@ -133,6 +152,7 @@ case "${1:-status}" in
         rm -f "$old"
       done
       echo "org-relay: installed $(basename "$SLOT"), db=$BOX_DB"
+      link_cli || true
     else
       if [ -n "$PREV" ] && [ -x "$PREV" ]; then
         echo "org-relay: reverting current -> $(basename "$PREV")" >&2
@@ -187,7 +207,7 @@ case "${1:-status}" in
     # the db directly (sqlite3, WAL-safe with a busy timeout) and appends a
     # purge event to the audit stream beside it.
     shift
-    P_RCPT=""; P_AGE=""; P_DELETE=0
+    P_RCPT=""; P_AGE=""; P_DELETE=0; P_IDS=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --dry-run) shift; continue ;;
@@ -197,23 +217,37 @@ case "${1:-status}" in
       case "$1" in
         --recipient) P_RCPT=$2 ;;
         --older-than) P_AGE=$2 ;;
+        --ids) P_IDS=$2 ;;
         *) echo "relay-ctl purge: unknown argument $1" >&2; exit 2 ;;
       esac
       shift 2
     done
-    usage_p="usage: relay-ctl purge --recipient <name> --older-than <N>s|m|h|d [--dry-run | --delete]"
+    usage_p="usage: relay-ctl purge --recipient <name> --older-than <N>s|m|h|d [--ids <id,id,...>] [--dry-run | --delete]"
     [ -n "$P_RCPT" ] || { echo "relay-ctl purge: --recipient is required; $usage_p" >&2; exit 2; }
+    case "$P_IDS" in
+      "") ;;
+      *[!0-9,]*|,*|*,|*,,*) echo "relay-ctl purge: --ids must be comma-separated message ids; $usage_p" >&2; exit 2 ;;
+    esac
     case "$P_AGE" in
       *[!0-9smhd]*|"") echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;;
     esac
     n=${P_AGE%?}; unit=${P_AGE#"$n"}
     case "$n" in ""|*[!0-9]*) echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;; esac
     case "$unit" in s) secs=$n ;; m) secs=$((n * 60)) ;; h) secs=$((n * 3600)) ;; d) secs=$((n * 86400)) ;; *) echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;; esac
+    [ "$secs" -gt 0 ] || { echo "relay-ctl purge: --older-than must be more than 0 (0 would select every unconsumed message); $usage_p" >&2; exit 2; }
     command -v sqlite3 >/dev/null 2>&1 || { echo "relay-ctl purge: sqlite3 required" >&2; exit 2; }
+    # The audit line is part of a delete: no jq, no delete (checked before
+    # anything is touched).
+    if [ "$P_DELETE" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
+      echo "relay-ctl purge: --delete needs jq to write its audit record; nothing deleted" >&2
+      exit 2
+    fi
     DB="${ORG_RELAY_DB:-$BOX_DB}"
     [ -f "$DB" ] || { echo "relay-ctl purge: no relay db at $DB" >&2; exit 1; }
     rq=$(printf '%s' "$P_RCPT" | sed "s/'/''/g")
     where="consumed_at IS NULL AND recipient = '$rq' AND ts < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-$secs seconds')"
+    # --ids narrows a delete to exactly the rows of a listing you reviewed.
+    [ -n "$P_IDS" ] && where="$where AND id IN ($P_IDS)"
     sq() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }
     ids=$(sq "SELECT group_concat(id) FROM messages WHERE $where;")
     if [ -z "$ids" ]; then
@@ -223,15 +257,14 @@ case "${1:-status}" in
     sq -header -separator ' | ' "SELECT id, ts, sender, kind, substr(replace(body, char(10), ' '), 1, 80) AS body FROM messages WHERE id IN ($ids) ORDER BY id;"
     count=$(printf '%s' "$ids" | tr ',' '\n' | grep -c .)
     if [ "$P_DELETE" -ne 1 ]; then
-      echo "relay-ctl purge: $count unconsumed message(s) for '$P_RCPT' older than $P_AGE listed; nothing deleted (re-run with --delete to remove exactly these)"
+      echo "relay-ctl purge: $count unconsumed message(s) for '$P_RCPT' older than $P_AGE listed; nothing deleted (re-run with --delete, optionally --ids $ids, to remove exactly these)"
       exit 0
     fi
     deleted=$(sq "DELETE FROM messages WHERE id IN ($ids) AND consumed_at IS NULL; SELECT changes();")
-    if command -v jq >/dev/null 2>&1; then
-      jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg r "$P_RCPT" --arg age "$P_AGE" --arg ids "$ids" --argjson n "${deleted:-0}" \
-        '{ts: $ts, event: "purge", recipient: $r, older_than: $age, deleted: $n, ids: ($ids | split(",") | map(tonumber)), by: "relay-ctl"}' \
-        >> "$(dirname "$DB")/audit.jsonl" 2>/dev/null || true
-    fi
+    jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg r "$P_RCPT" --arg age "$P_AGE" --arg ids "$ids" --argjson n "${deleted:-0}" \
+      '{ts: $ts, event: "purge", recipient: $r, older_than: $age, deleted: $n, ids: ($ids | split(",") | map(tonumber)), by: "relay-ctl"}' \
+      >> "$(dirname "$DB")/audit.jsonl" 2>/dev/null \
+      || echo "relay-ctl purge: WARNING: could not append the purge record to $(dirname "$DB")/audit.jsonl" >&2
     echo "relay-ctl purge: deleted ${deleted:-0} unconsumed message(s) for '$P_RCPT' (ids $ids)"
     ;;
   send)
@@ -282,6 +315,11 @@ case "${1:-status}" in
   status)
     if alive; then
       echo "org-relay: serving on :$PORT"
+      if command -v relay-ctl >/dev/null 2>&1; then
+        echo "org-relay: cli $DIR/relay-ctl (on PATH as relay-ctl)"
+      else
+        echo "org-relay: cli $DIR/relay-ctl (not on PATH: call it by this path, or run install-daemon to link it into $CLI_DIR)"
+      fi
       # rmcp streamable HTTP needs an MCP handshake per session, so the CLI
       # reads the plain GET /status mirror (never guide-gated); it carries the
       # daemon's own build attestation, summarized first so a drifted install
@@ -295,5 +333,6 @@ case "${1:-status}" in
       echo "org-relay: not running on :$PORT"; exit 1
     fi
     ;;
-  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback|send|purge" >&2; exit 2 ;;
+  link-cli) link_cli ;;
+  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback|send|purge|link-cli" >&2; exit 2 ;;
 esac
