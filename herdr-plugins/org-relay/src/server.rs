@@ -157,7 +157,8 @@ fn tool_defs() -> Value {
          "description": "List messages queued for an agent (unconsumed only unless include_consumed). The first bus action of any turn entered while lanes are in flight.",
          "inputSchema": {"type": "object", "required": ["agent"], "properties": {
              "agent": s("agent name"),
-             "include_consumed": {"type": "boolean", "description": "default false"}}},
+             "include_consumed": {"type": "boolean", "description": "default false"},
+             "peek": {"type": "boolean", "description": "default false; true when reading ANOTHER agent's queue (triage of an orphan): it then neither counts as that agent being seen nor stamps delivery"}}},
          "outputSchema": inbox_out},
         {"name": "relay_consume",
          "description": "Mark handled message ids consumed, AFTER acting on them. Explicit on purpose: a crash between reading and acting loses nothing.",

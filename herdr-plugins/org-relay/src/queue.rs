@@ -333,10 +333,51 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'delivered_at'")?
         .exists([])?;
     if !has_delivered {
-        // Two openers can race here; the loser's "duplicate column" is benign.
-        let _ = conn.execute_batch("ALTER TABLE messages ADD COLUMN delivered_at TEXT");
+        // Two openers can race here; only the loser's "duplicate column" is
+        // benign. Anything else is reported, still non-fatal: the bus works
+        // without the column, relay_stats just counts no deliveries.
+        if let Err(e) = conn.execute_batch("ALTER TABLE messages ADD COLUMN delivered_at TEXT") {
+            if !e.to_string().contains("duplicate column") {
+                eprintln!("org-relay: adding messages.delivered_at failed (relay_stats will count no deliveries): {e}");
+            }
+        }
     }
     Ok(())
+}
+
+/// relay_inbox. A read by the recipient itself marks it seen and stamps first
+/// delivery; `peek` (triage of another agent's queue, e.g. an orphan) does
+/// neither, so inspecting a queue never makes it read as alive in
+/// relay_status or as delivered in relay_stats.
+pub fn inbox_read(
+    conn: &Connection,
+    agent: &str,
+    include_consumed: bool,
+    peek: bool,
+) -> rusqlite::Result<Vec<Value>> {
+    let msgs = inbox(conn, agent, include_consumed)?;
+    if !peek {
+        mark_seen(agent);
+        let fresh: Vec<i64> = msgs
+            .iter()
+            .filter(|m| m.get("consumed_at").is_some_and(|v| v.is_null()))
+            .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
+            .collect();
+        let _ = mark_delivered(conn, &fresh);
+    }
+    Ok(msgs)
+}
+
+/// relay_await's optional after_id: absent or null means 0 (any unconsumed
+/// message); anything that is not an integer is an error, never a silent 0.
+pub fn parse_after_id(args: &Value) -> Result<i64, String> {
+    match args.get("after_id") {
+        None | Some(Value::Null) => Ok(0),
+        Some(v) => v
+            .as_i64()
+            .map(|n| n.max(0))
+            .ok_or_else(|| format!("after_id must be an integer message id, got {v}")),
+    }
 }
 
 /// Stamp the first hand-over of each row to its recipient (relay_inbox, or a
@@ -659,16 +700,10 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
         }
         "relay_inbox" => {
             let agent = req_str(args, "agent")?;
-            mark_seen(&agent);
             let all = args.get("include_consumed").and_then(|v| v.as_bool()).unwrap_or(false);
-            let msgs = inbox(&conn, &agent, all).map_err(|e| e.to_string())?;
-            let fresh: Vec<i64> = msgs
-                .iter()
-                .filter(|m| m.get("consumed_at").is_some_and(|v| v.is_null()))
-                .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
-                .collect();
-            let _ = mark_delivered(&conn, &fresh);
-            Ok(json!({"agent": agent, "count": msgs.len(), "messages": msgs}))
+            let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
+            let msgs = inbox_read(&conn, &agent, all, peek).map_err(|e| e.to_string())?;
+            Ok(json!({"agent": agent, "count": msgs.len(), "messages": msgs, "peek": peek}))
         }
         "relay_consume" => {
             let agent = req_str(args, "agent")?;
@@ -801,7 +836,7 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
         .and_then(|v| v.as_u64())
         .unwrap_or(AWAIT_DEFAULT_S)
         .clamp(1, AWAIT_MAX_S);
-    let after_id = args.get("after_id").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let after_id = parse_after_id(args)?;
     let _guard = direct_cover.then(|| AwaitGuard::new(&agent));
     mark_seen(&agent);
     log_event("audit", json!({"event":"await_start","agent":agent,"timeout_s":timeout_s,
@@ -932,6 +967,33 @@ mod tests {
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
         set_live_agents(None);
+    }
+
+    #[test]
+    fn peek_reads_leave_no_seen_and_no_delivery_stamp() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        c.execute_batch("INSERT INTO messages (ts, sender, recipient, kind, body) VALUES ('2026-10-31T10:00:00Z','peer','peek-orphan','doorbell','x');")
+            .unwrap();
+        let delivered = |c: &Connection| -> Option<String> {
+            c.query_row("SELECT delivered_at FROM messages WHERE id = 1", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(inbox_read(&c, "peek-orphan", false, true).unwrap().len(), 1);
+        assert_eq!(last_seen_s("peek-orphan"), None, "a peek is not a sighting");
+        assert_eq!(delivered(&c), None, "a peek is not a delivery");
+        assert_eq!(inbox_read(&c, "peek-orphan", false, false).unwrap().len(), 1);
+        assert!(last_seen_s("peek-orphan").is_some());
+        assert!(delivered(&c).is_some());
+    }
+
+    #[test]
+    fn parse_after_id_defaults_and_rejects_non_integers() {
+        assert_eq!(parse_after_id(&json!({})).unwrap(), 0);
+        assert_eq!(parse_after_id(&json!({"after_id": null})).unwrap(), 0);
+        assert_eq!(parse_after_id(&json!({"after_id": 41})).unwrap(), 41);
+        assert_eq!(parse_after_id(&json!({"after_id": -3})).unwrap(), 0);
+        assert!(parse_after_id(&json!({"after_id": "41"})).is_err());
+        assert!(parse_after_id(&json!({"after_id": 4.5})).is_err());
     }
 
     #[test]

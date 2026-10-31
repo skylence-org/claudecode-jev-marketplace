@@ -27,6 +27,9 @@ mod guide;
 mod nudge;
 mod queue;
 mod server;
+// Pure helper shared with build.rs (include!); compiled here for its tests.
+#[cfg(test)]
+mod remote;
 
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -65,9 +68,6 @@ fn build_router() -> axum::Router {
         )
     }
 
-    // Plain-HTTP mirror of the relay_status tool for CLI and hook consumers
-    // (relay-ctl status, org-stop-gate): no MCP handshake, no session, no
-    // guide gate — the same never-gated diagnostics the tool exposes.
     // Plain-HTTP mirror of the relay_status tool for CLI and hook consumers
     // (relay-ctl status, org-stop-gate): no MCP handshake, no session, no
     // guide gate — the same never-gated diagnostics the tool exposes,

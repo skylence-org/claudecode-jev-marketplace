@@ -80,6 +80,10 @@ as a timer (each timeout replays a whole turn):
 
   <job>; relay-ctl send --to <orchestrator> --kind job --body "job <id> rc=$?"
 
+`relay-ctl` is on PATH once `relay-ctl install-daemon` has linked it into
+~/.local/bin; otherwise use the absolute path `relay-ctl status` prints on
+its `cli` line.
+
 `relay-ctl send` enqueues exactly as relay_send does (same validation, same
 in-process wake of a live await) over the daemon's plain POST /send.
 
@@ -133,7 +137,10 @@ queue, never instead of it:
   peer | operator | question | answer | job | other. Returns {id, queued_for, live_await}: a sender
   that stays awake pings ONCE when live_await is false or absent; a sender
   whose turn ends with the send pings once regardless.
-- relay_inbox(agent, include_consumed?) — list queued messages.
+- relay_inbox(agent, include_consumed?, peek?) — list queued messages. Your
+  own read counts as being seen and as delivery; to triage SOMEONE ELSE's
+  queue (an orphan), pass peek=true so relay_status and relay_stats stay
+  true.
 - relay_consume(agent, ids) — mark handled AFTER acting.
 - relay_await(agent, timeout_s?, after_id?) — task-backed coverage; see the
   wake model. after_id defers known messages (rule 5).
