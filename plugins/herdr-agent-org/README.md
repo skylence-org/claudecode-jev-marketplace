@@ -41,6 +41,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
 - **Scripts**:
   - `board` is the filesystem board (todos, comments, pads, blockers); `set-status` best-effort publishes the lane's status into the herdr sidebar pane (`pane report-metadata`), `ready` lists unblocked pending todos, `create --tags`/`list --tags` tag and filter todos, `query <text>` case-insensitively searches todo files, `list`/`ready`/`get` support `--json`, and every mutating command snapshots a best-effort silent git commit when git is available
   - `dispatch-worker` splits a pane (auto layout: first worker below the orchestrator, later workers rightward in rows of at most 2, a fresh row per 2; explicit `--direction` overrides), starts a named agent, sends the pointer prompt, and reports the post-send state; optional `--beat-note TEXT` is forwarded to waker registration so settle/block/death rings carry the orchestrator's beat script
+    - 0.1.6: a hard brief below the top tier stops the dispatch until `--upgrade-reason` or `--keep-tier "<why>"` (`[TIER-KEPT: ...]`); `--relaunch <name> --model <m>` reaps and relaunches a just-started lane at another model (`[RELAUNCH: ...]`); `--accept-trust` answers Claude Code's startup folder-trust dialog with content-free keys (`state=trust-prompt` without it); the default pointer carries the exact board command (`env HERDR_ORG_ROOT=<root> <abs>/board`); the lane is appended to the session's stop-gate marker even when dispatch-worker runs from a script
   - `build-slot` is the machine-wide compile serializer
   - `tier-gauge` measures a brief's worker tier, risk, and template completeness (L17; one Jev request, called by `dispatch-worker`)
   - `review-gate-check` measures the L10 review gate at accept (lines in code, surfaces by one Jev request)
@@ -123,6 +124,8 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 ```
 
 `dispatch-worker` fills in the doctrinal default itself (`--model sonnet` for a Claude worker, `--effort medium` for a grok one) when you pass none, so silence at dispatch cannot resolve to whatever the box is installed at. Going above that default requires `--upgrade-reason "<why>"`, which the script refuses to skip and files on the lane todo as `[MODEL: ...]` or `[EFFORT: ...]`. A bare `herdr agent start` has no such protection, so pass the setting yourself there. Both rules come from [issue #32](https://github.com/skylence-org/multi-llm-marketplace/issues/32).
+
+A brief `tier-gauge` reads as HARD below the top tier (`upgrade=advised`) stops the dispatch before any pane exists: pass `-- --model opus --upgrade-reason "<why>"` or `--keep-tier "<why>"`, filed as `[TIER-KEPT: <tier>, <why>]`. To change a just-started worker's model, `dispatch-worker --relaunch <name> --model <m>` (with `--upgrade-reason` or `--keep-tier`) closes its pane and starts the same name in the same lane tree with the same todo, filing `[RELAUNCH: <old pane> -> <new pane>, <why>]`.
 
 ## The Herdr substrate at a glance
 
