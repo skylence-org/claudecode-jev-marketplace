@@ -194,6 +194,18 @@ fn tool_defs() -> Value {
          "outputSchema": {"type": "object", "properties": {
              "audit": {"type": "object"}, "access": {"type": "object"},
              "max_log_bytes": {"type": "integer"}}}},
+        {"name": "relay_stats",
+         "description": "Session numbers for retrospectives, read-only and never guide-gated: for messages TO agent (all recipients when omitted) stamped at or after since (an ISO stamp or Ns|Nm|Nh|Nd; omitted = everything the db still holds), the total, counts by kind (sent / delivered / consumed / unconsumed), and send-to-deliver and send-to-consume latency in seconds (n, median, max). delivered = handed over by relay_inbox or a waking relay_await, stamped from 1.5.0 on; consumed rows older than ORG_RELAY_RETAIN_DAYS (default 7) are pruned.",
+         "inputSchema": {"type": "object", "properties": {
+             "agent": s("optional recipient to scope to"),
+             "since": s("optional ISO stamp (2026-10-31T06:00:00Z) or relative Ns|Nm|Nh|Nd")}},
+         "outputSchema": {"type": "object", "properties": {
+             "agent": {"type": ["string", "null"]}, "since": {"type": ["string", "null"]},
+             "total": {"type": "integer"}, "delivered": {"type": "integer"},
+             "consumed": {"type": "integer"}, "unconsumed": {"type": "integer"},
+             "by_kind": {"type": "object"},
+             "send_to_deliver_s": {"type": "object"}, "send_to_consume_s": {"type": "object"},
+             "note": {"type": "string"}}}},
         {"name": "relay_status",
          "description": "Per recipient queue: unconsumed count, oldest message stamp and age (oldest_age_s), whether that recipient holds live await coverage right now (awaiting), whether the herdr live-agent snapshot lists it (agent_live; null = no fresh evidence), and seconds since this daemon last heard from it (last_seen_s; in-memory, null since a restart). Plus the db path, the awaiting list (in-call and task-backed holds both count), the nudge watchdog state, and the daemon's own build (version, git sha, dirty flag, origin remote, source dir) so an installed binary can be matched to the repo that built it. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for; an old queue with awaiting false, agent_live false and no recent last_seen_s is an orphan (relay-ctl purge, operator-only). Never guide-gated.",
          "inputSchema": {"type": "object", "properties": {}},
@@ -458,12 +470,14 @@ mod tests {
         "relay_audit_tail",
         "relay_observability_set",
         "relay_observability_status",
+        "relay_stats",
     ];
 
     #[test]
     fn tool_defs_deserialize_into_rmcp_tools() {
         let tools = build_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
+        assert!(tools.iter().any(|t| t.name == "relay_stats"));
         assert!(tools.iter().any(|t| t.name == "relay_guide"));
     }
 

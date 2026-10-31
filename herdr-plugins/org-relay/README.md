@@ -88,15 +88,43 @@ Client-side env worth exporting in org pane shells (Board bootstrap):
 idle-aborted before the harness backgrounds it.
 
 Tools: `relay_guide / relay_send / relay_inbox / relay_consume / relay_await /
-relay_status`, plus `relay_audit_tail / relay_observability_set /
+relay_status / relay_stats`, plus `relay_audit_tail / relay_observability_set /
 relay_observability_status` over the audit / access / nudge JSONL streams.
 
-Layout: `src/queue.rs` (data plane + awaiter registry + ack ledger),
+**1.5.0 additions:**
+
+- `relay-ctl send --to <agent> --kind <kind> --body <text> [--sender <name>]
+  [--lane <slug>]`: the same enqueue as `relay_send`, over POST /send, so a
+  long job ends with `...; relay-ctl send --to <orch> --kind job --body "job
+  <id> rc=$?"` and wakes its orchestrator. Never a short-timeout await as a
+  timer.
+- `relay_await(after_id=N)`: wake only for ids above N, so queued messages
+  you cannot act on yet stay unconsumed (consume-after-acting holds) without
+  the await returning at once. Chosen over a `relay_defer(ids, reason)` tool:
+  stateless, no deadlines to expire, nothing for the nudge net to reconcile.
+- `relay_status` per queue: `oldest_ts`, `oldest_age_s`, `awaiting`,
+  `agent_live`, `last_seen_s` (in-memory, resets on restart), plus the
+  daemon's `build`. Orphans are removed by the operator only:
+  `relay-ctl purge --recipient <name> --older-than <N>s|m|h|d` lists, and
+  deletes only with `--delete` (exactly the listed ids; audited).
+- `relay_stats(agent?, since?)`: counts by kind, delivered vs consumed,
+  send-to-deliver / send-to-consume seconds (n, median, max). Delivery is a
+  new nullable `delivered_at` column (added on open when missing; a 1.4
+  daemon on the same db is unaffected), stamped when relay_inbox or a waking
+  relay_await first hands a row over.
+
+Layout: `src/queue.rs` (data plane + awaiter and last-seen registries + stats),
 `src/server.rs` (rmcp handler + guide gate + SEP-2663 tasks), `src/guide.rs`
 (guide text + pinned refusal), `src/nudge.rs` (watchdog), `src/main.rs`
-(axum serve + /health + /status).
+(axum serve + /health + /status + /send), `relay-ctl` (daemon control,
+`send`, `purge`), `test/` (concurrency smoke, nudge classify, relay-ctl
+send and purge suites).
 
-Status: 1.0.0 — compiled, `cargo test` green (gate transitions, pinned
+Status: 1.5.0 is written but NOT yet compiled: the change set was authored
+under the org's compile monopoly, so its first `cargo test` is the
+orchestrator's integration gate. The shell suites and every new SQL
+statement were run; the Rust unit tests were written, not run. History,
+1.0.0 — compiled, `cargo test` green (gate transitions, pinned
 refusal text, nudge predicate incl. task-backed suppression, guide hash,
 tool-def deserialization), wire-smoked end to end (gate refusal → unlock →
 send → task handle → tasks/get result → gate re-arms for a fresh session →

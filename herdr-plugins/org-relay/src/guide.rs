@@ -143,6 +143,9 @@ queue, never instead of it:
   now; an old queue nobody awaits, herdr does not list and the daemon has
   not seen is an orphan: the OPERATOR purges it with `relay-ctl purge`
   (lists first, deletes only with --delete), never a role, never on a timer.
+- relay_stats(agent?, since?) — retrospective numbers, never gated: counts
+  by kind, delivered vs consumed, send-to-deliver and send-to-consume
+  seconds (median, max) for messages to agent since an ISO stamp or Nd|Nh|Nm.
 - relay_guide() — this text; reading it (or the relay://guide resource)
   unlocks the messaging tools for this session.
 - relay_audit_tail(stream?, limit?) — audit = message lifecycle with wake
@@ -204,6 +207,8 @@ mod tests {
             "DEFER WITHOUT CONSUMING",
             "after_id",
             "relay-ctl send",
+            "relay_stats",
+            "relay-ctl purge",
         ] {
             assert!(GUIDE_RESOURCE.contains(phrase), "guide must contain {phrase:?}");
         }

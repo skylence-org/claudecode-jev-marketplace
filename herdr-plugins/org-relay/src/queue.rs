@@ -307,6 +307,15 @@ pub fn open_db() -> rusqlite::Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))?;
     // WAL: concurrent readers during a writer (async handlers + watchdog).
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+/// The table, its inbox index, and (1.5.0) a nullable `delivered_at` stamp,
+/// added only when missing. A 1.4 daemon sharing the db keeps working: every
+/// statement it runs names its columns, so an appended nullable column is
+/// invisible to it. Split from open_db so tests can use an in-memory db.
+pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -320,7 +329,128 @@ pub fn open_db() -> rusqlite::Result<Connection> {
         );
         CREATE INDEX IF NOT EXISTS idx_inbox ON messages(recipient, consumed_at);",
     )?;
-    Ok(conn)
+    let has_delivered = conn
+        .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'delivered_at'")?
+        .exists([])?;
+    if !has_delivered {
+        // Two openers can race here; the loser's "duplicate column" is benign.
+        let _ = conn.execute_batch("ALTER TABLE messages ADD COLUMN delivered_at TEXT");
+    }
+    Ok(())
+}
+
+/// Stamp the first hand-over of each row to its recipient (relay_inbox, or a
+/// relay_await that wakes with it), for relay_stats' delivered count and
+/// send-to-deliver latency. Only rows actually returned are stamped, once.
+pub fn mark_delivered(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
+    let now = now_iso();
+    let mut n = 0;
+    for id in ids {
+        n += conn.execute(
+            "UPDATE messages SET delivered_at = ?1 WHERE id = ?2 AND delivered_at IS NULL",
+            rusqlite::params![now, id],
+        )?;
+    }
+    Ok(n)
+}
+
+/// `since` for relay_stats: "" (everything the db retains), an ISO stamp in
+/// the db's own shape, or a relative Ns|Nm|Nh|Nd back from now.
+pub fn parse_since(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    let bad = || format!("since must be an ISO stamp (2026-10-31T06:00:00Z) or Ns|Nm|Nh|Nd, got {s:?}");
+    if !s.is_ascii() {
+        return Err(bad());
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let mult: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => 0,
+    };
+    if mult > 0 {
+        if let Ok(n) = num.parse::<u64>() {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
+            return Ok(fmt_iso(now.saturating_sub(n.saturating_mul(mult))));
+        }
+    }
+    if age_ms_since(s).is_some() {
+        return Ok(s.to_string());
+    }
+    Err(bad())
+}
+
+/// Median and max of an ascending list of second counts; nulls when empty.
+pub fn latency_summary(sorted: &[i64]) -> Value {
+    let n = sorted.len();
+    if n == 0 {
+        return json!({"n": 0, "median": null, "max": null});
+    }
+    let median = if n % 2 == 1 {
+        sorted[n / 2] as f64
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
+    };
+    json!({"n": n, "median": median, "max": sorted[n - 1]})
+}
+
+/// relay_stats: for messages TO `agent` (every recipient when None) stamped
+/// at or after `since` ("" = all retained): counts by kind, delivered vs
+/// consumed, and send-to-deliver / send-to-consume latency in seconds. The
+/// arithmetic is SQL over the stored stamps, so it is exact, not sampled.
+pub fn stats(conn: &Connection, agent: Option<&str>, since: &str) -> rusqlite::Result<Value> {
+    let mut by_kind = serde_json::Map::new();
+    let (mut total, mut delivered, mut consumed) = (0i64, 0i64, 0i64);
+    {
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*), SUM(delivered_at IS NOT NULL), SUM(consumed_at IS NOT NULL)
+             FROM messages WHERE (?1 IS NULL OR recipient = ?1) AND ts >= ?2
+             GROUP BY kind ORDER BY kind",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![agent, since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            ))
+        })?;
+        for row in rows {
+            let (kind, n, d, c) = row?;
+            total += n;
+            delivered += d;
+            consumed += c;
+            by_kind.insert(kind, json!({"sent": n, "delivered": d, "consumed": c, "unconsumed": n - c}));
+        }
+    }
+    let latency = |col: &str| -> rusqlite::Result<Value> {
+        let sql = format!(
+            "SELECT CAST(strftime('%s', {col}) AS INTEGER) - CAST(strftime('%s', ts) AS INTEGER)
+             FROM messages WHERE (?1 IS NULL OR recipient = ?1) AND ts >= ?2 AND {col} IS NOT NULL
+             ORDER BY 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let secs: Vec<i64> = stmt
+            .query_map(rusqlite::params![agent, since], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(latency_summary(&secs))
+    };
+    let to_deliver = latency("delivered_at")?;
+    let to_consume = latency("consumed_at")?;
+    Ok(json!({
+        "agent": agent,
+        "since": if since.is_empty() { Value::Null } else { json!(since) },
+        "total": total, "delivered": delivered, "consumed": consumed,
+        "unconsumed": total - consumed,
+        "by_kind": by_kind,
+        "send_to_deliver_s": to_deliver,
+        "send_to_consume_s": to_consume,
+        "note": "delivered = handed over by relay_inbox or a waking relay_await (stamped from 1.5.0 on); consumed rows older than ORG_RELAY_RETAIN_DAYS (default 7) are pruned, so the window is what the db still holds"
+    }))
 }
 
 fn row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
@@ -532,6 +662,12 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
             mark_seen(&agent);
             let all = args.get("include_consumed").and_then(|v| v.as_bool()).unwrap_or(false);
             let msgs = inbox(&conn, &agent, all).map_err(|e| e.to_string())?;
+            let fresh: Vec<i64> = msgs
+                .iter()
+                .filter(|m| m.get("consumed_at").is_some_and(|v| v.is_null()))
+                .filter_map(|m| m.get("id").and_then(|v| v.as_i64()))
+                .collect();
+            let _ = mark_delivered(&conn, &fresh);
             Ok(json!({"agent": agent, "count": msgs.len(), "messages": msgs}))
         }
         "relay_consume" => {
@@ -592,6 +728,16 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
                       "build": crate::build_info(),
                       "nudge": {"enabled": crate::nudge::nudge_enabled(),
                                 "helper": crate::nudge::nudge_helper().map(|p| p.to_string_lossy().into_owned())}}))
+        }
+        "relay_stats" => {
+            let agent = args
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let since = parse_since(args.get("since").and_then(|v| v.as_str()).map(str::trim).unwrap_or(""))?;
+            stats(&conn, agent.as_deref(), &since).map_err(|e| e.to_string())
         }
         "relay_audit_tail" => {
             let stream = args.get("stream").and_then(|v| v.as_str()).unwrap_or("audit").to_string();
@@ -668,13 +814,17 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
         // and the select cannot be missed (notified() buffers one permit).
         let notified = notify.notified();
         let a = agent.clone();
-        let msgs = tokio::task::spawn_blocking(move || -> Result<Vec<Value>, String> {
+        let polled = tokio::task::spawn_blocking(move || -> Result<(Vec<Value>, usize), String> {
             let c = open_db().map_err(|e| format!("db open failed: {e}"))?;
-            inbox(&c, &a, false).map_err(|e| e.to_string())
+            let all = inbox(&c, &a, false).map_err(|e| e.to_string())?;
+            let (kept, deferred) = filter_after(all, after_id);
+            let ids: Vec<i64> = kept.iter().filter_map(|m| m.get("id").and_then(|v| v.as_i64())).collect();
+            let _ = mark_delivered(&c, &ids);
+            Ok((kept, deferred))
         })
         .await
         .map_err(|e| format!("await poll task failed: {e}"))??;
-        let (msgs, deferred) = filter_after(msgs, after_id);
+        let (msgs, deferred) = polled;
         if !msgs.is_empty() {
             // Wake LATENCY: how long this agent was covered, and how old the
             // oldest delivered message was.
@@ -782,6 +932,73 @@ mod tests {
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
         set_live_agents(None);
+    }
+
+    #[test]
+    fn init_schema_adds_delivered_at_once_and_is_idempotent() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        init_schema(&c).unwrap();
+        let cols: i64 = c
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'delivered_at'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cols, 1);
+    }
+
+    #[test]
+    fn mark_delivered_stamps_each_row_once() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        c.execute_batch("INSERT INTO messages (ts, sender, recipient, kind, body) VALUES ('2026-10-31T10:00:00Z','w','orch','doorbell','a');")
+            .unwrap();
+        assert_eq!(mark_delivered(&c, &[1]).unwrap(), 1);
+        assert_eq!(mark_delivered(&c, &[1]).unwrap(), 0, "the first hand-over is the stamp");
+    }
+
+    #[test]
+    fn stats_counts_kinds_delivery_and_latency() {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO messages (ts, sender, recipient, kind, body, delivered_at, consumed_at) VALUES
+             ('2026-10-31T10:00:00Z','w','orch','doorbell','a','2026-10-31T10:00:10Z','2026-10-31T10:01:00Z'),
+             ('2026-10-31T10:00:00Z','w','orch','doorbell','b','2026-10-31T10:00:30Z',NULL),
+             ('2026-10-31T10:00:00Z','j','orch','job','c',NULL,NULL),
+             ('2026-10-31T10:00:00Z','w','other','doorbell','d','2026-10-31T10:00:05Z','2026-10-31T10:00:20Z');",
+        )
+        .unwrap();
+        let s = stats(&c, Some("orch"), "").unwrap();
+        assert_eq!(s["total"], 3);
+        assert_eq!(s["delivered"], 2);
+        assert_eq!(s["consumed"], 1);
+        assert_eq!(s["unconsumed"], 2);
+        assert_eq!(s["by_kind"]["doorbell"]["sent"], 2);
+        assert_eq!(s["by_kind"]["job"]["unconsumed"], 1);
+        assert_eq!(s["send_to_deliver_s"]["n"], 2);
+        assert_eq!(s["send_to_deliver_s"]["median"], 20.0);
+        assert_eq!(s["send_to_deliver_s"]["max"], 30);
+        assert_eq!(s["send_to_consume_s"]["max"], 60);
+        assert_eq!(stats(&c, None, "").unwrap()["total"], 4);
+        assert_eq!(stats(&c, None, "2026-11-01T00:00:00Z").unwrap()["total"], 0);
+        assert_eq!(stats(&c, Some("nobody"), "").unwrap()["send_to_consume_s"]["median"], Value::Null);
+    }
+
+    #[test]
+    fn latency_summary_median_odd_even_empty() {
+        assert_eq!(latency_summary(&[1, 5, 9])["median"], 5.0);
+        assert_eq!(latency_summary(&[1, 3])["median"], 2.0);
+        assert_eq!(latency_summary(&[])["n"], 0);
+    }
+
+    #[test]
+    fn parse_since_accepts_iso_and_relative_and_rejects_the_rest() {
+        assert_eq!(parse_since("").unwrap(), "");
+        assert_eq!(parse_since("2026-10-31T06:00:00Z").unwrap(), "2026-10-31T06:00:00Z");
+        let rel = parse_since("2h").unwrap();
+        assert_eq!(rel.len(), 20, "an ISO stamp in the db's shape: {rel}");
+        assert!(parse_since("bogus").is_err());
+        assert!(parse_since("5\u{e9}").is_err(), "non-ascii never panics on split_at");
+        assert!(parse_since("2026-10-31").is_err());
     }
 
     #[test]
