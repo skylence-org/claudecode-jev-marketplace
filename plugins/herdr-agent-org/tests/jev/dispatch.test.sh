@@ -156,6 +156,44 @@ sh "$PLUGIN/scripts/board" set-status lane-a verified >/dev/null 2>&1
 dw --relaunch lane-a --model opus --upgrade-reason x --no-gauge
 [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'is verified' && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch on a verified todo: refused, nothing closed" || bad "relaunch verified" "rc=$RC err=$ERR"
 unset HERDR_STUB_CWD HERDR_STUB_PANES
+
+echo "--- --replacer [--bounce N] (marketplace#11) ---------------------------"
+bd() { sh "$PLUGIN/scripts/board" "$@" >/dev/null 2>&1; }
+RLANE="$TMP/rlane"; git init -q -b main "$RLANE"
+git -C "$RLANE" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "wip: predecessor's work"
+RTIP=$(git -C "$RLANE" rev-parse --short HEAD)
+BCMD="env HERDR_ORG_ROOT=$HERDR_ORG_ROOT $PLUGIN/scripts/board"
+bd create lane-r --title "lane r" --body-file "$TMP/brief.md"
+printf '**[BOUNCE 1/3]**\nDIGEST\n- tip: aaa1111\n\nRULING: fix F1.\n' | bd comment lane-r --stdin
+printf '**[BOUNCE 2/3]**\nDIGEST\n- tip: bbb2222\n\nRULING: fix F2 "as listed".\n' | bd comment lane-r --stdin
+bd comment lane-r "**[BOUNCE 2/3 FIXES]** F2 fixed, 9 passed"
+bd create lane-q --title "lane q" --body-file "$TMP/brief.md"
+startline() { grep '^agent start' "$HERDR_STUB_LOG"; }
+dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+if [ $RC -eq 0 ] && printf '%s' "$S" | grep -q 'herdr-replacer' && printf '%s' "$S" | grep -qF "REPLACER for todo lane-r, bounce 2/3" && printf '%s' "$S" | grep -qF "$BCMD get lane-r" && printf '%s' "$S" | grep -qF "tip $RTIP" && printf '%s' "$S" | grep -q 'ONLY its FIXES' && ! printf '%s' "$S" | grep -q 'you own todo'; then ok "--replacer: pointer names herdr-replacer, the exact board command, the tip SHA and the round"; else bad "replacer pointer" "rc=$RC err=$ERR start=$S"; fi
+printf '%s' "$OUT" | jq -e --arg t "$RTIP" '.replacer == true and .tip == $t and .bounce == 2' >/dev/null && ok "--replacer: JSON reports replacer, tip, bounce (auto-detected 2 from [BOUNCE 2/3], the FIXES milestone ignored)" || bad "replacer json" "out=$OUT"
+dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --bounce 3 --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+[ $RC -eq 0 ] && printf '%s' "$S" | grep -qF 'bounce 3/3' && printf '%s' "$OUT" | jq -e '.bounce == 3' >/dev/null && ok "--bounce N overrides the detected round" || bad "replacer --bounce" "rc=$RC out=$OUT start=$S"
+dw --name lane-q --todo lane-q --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+if [ $RC -eq 0 ] && printf '%s' "$S" | grep -q 'REPLACER for todo lane-q:' && ! printf '%s' "$S" | grep -qi 'bounce' && printf '%s' "$OUT" | jq -e '.replacer == true and .bounce == null' >/dev/null; then ok "--replacer, no [BOUNCE r/3] on the todo: the bounce clause is omitted, bounce=null"; else bad "replacer no bounce" "rc=$RC out=$OUT start=$S"; fi
+dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --prompt "do it" --no-gauge
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--prompt' && [ ! -s "$HERDR_STUB_LOG" ] && ok "--replacer with --prompt: refused (exit 2) before any herdr call" || bad "replacer+prompt" "rc=$RC err=$ERR"
+dw --name lane-r --cwd "$RLANE" --replacer --no-gauge
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--todo' && [ ! -s "$HERDR_STUB_LOG" ] && ok "--replacer without --todo: refused (exit 2) before any herdr call" || bad "replacer no todo" "rc=$RC err=$ERR"
+dw --name lane-r --todo lane-r --replacer --no-gauge
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--cwd' && [ ! -s "$HERDR_STUB_LOG" ] && ok "--replacer without --cwd: refused (exit 2)" || bad "replacer no cwd" "rc=$RC err=$ERR"
+dw --name lane-r --todo lane-r --cwd "$TMP/nowhere" --replacer --no-gauge
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'git' && [ ! -s "$HERDR_STUB_LOG" ] && ok "--replacer on a --cwd that is no git tree: refused (exit 2), no tip to name" || bad "replacer no git" "rc=$RC err=$ERR"
+JEV_STUB_ANSWERS="$(stub "$ANS_HARD")" dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --keep-tier "precise fix list" -- --permission-mode bypassPermissions
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.replacer == true and (.gauge | test("source=bounce"))' >/dev/null && sh "$PLUGIN/scripts/board" get lane-r | grep -q 'TIER-KEPT: model=sonnet brief_tier=hard, precise fix list'; then ok "--replacer + gauge + --keep-tier: gauged on the bounce, [TIER-KEPT] filed"; else bad "replacer keep-tier" "rc=$RC out=$OUT err=$ERR"; fi
+HERDR_STUB_TRUST=1 dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --no-gauge --accept-trust --model opus --upgrade-reason "approach was wrong twice" -- --permission-mode bypassPermissions
+S=$(startline)
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.replacer == true and .model == "opus" and .trust == "accepted"' >/dev/null && printf '%s' "$S" | grep -q -- '--model opus' && printf '%s' "$S" | grep -q 'herdr-replacer' && sh "$PLUGIN/scripts/board" get lane-r | grep -q 'MODEL: opus, approach was wrong twice'; then ok "--replacer + --model + --upgrade-reason + --accept-trust: all still apply"; else bad "replacer flags" "rc=$RC out=$OUT err=$ERR"; fi
+dw --name lane-a --todo lane-q --no-gauge -- --permission-mode bypassPermissions
+printf '%s' "$OUT" | jq -e '.replacer == false and .tip == "" and .bounce == null' >/dev/null && ok "fresh dispatch: replacer=false, tip empty, bounce=null" || bad "fresh json" "out=$OUT"
 echo
 echo "dispatch-worker: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1

@@ -6,7 +6,7 @@
 #   dispatch-worker --name NAME [--kind KIND] [--cwd PATH] [--direction right|down] \
 #                   [--todo SLUG] [--prompt TEXT] [--timeout MS] [--model M] \
 #                   [--wake-target ORCH] [--beat-note TEXT] [--upgrade-reason TEXT] [--no-gauge] \
-#                   [--keep-tier TEXT] [--accept-trust] [-- agent-args...]
+#                   [--keep-tier TEXT] [--accept-trust] [--replacer [--bounce N]] [-- agent-args...]
 #   dispatch-worker --relaunch NAME [--model M] (--upgrade-reason TEXT | --keep-tier TEXT) \
 #                   [--todo SLUG] [--cwd PATH] [--accept-trust] [-- agent-args...]
 #   --relaunch carries only what is passed again: the old lane's other agent
@@ -78,6 +78,16 @@
 # The default pointer carries the exact board command for the lane
 # (env HERDR_ORG_ROOT=<root> <abs>/board), so a worker's skyline-routed
 # shell, which has neither scripts/ on PATH nor HERDR_ORG_ROOT, can paste it.
+# REPLACER (marketplace#11): --replacer swaps the default pointer for the
+# replacer/bounce pointer: the lane tree's tip (git -C <cwd> rev-parse --short
+# HEAD), the exact board command, the herdr-replacer skill, and, on a bounce,
+# the round, with the order to implement ONLY the latest [BOUNCE r/3]'s
+# FIXES. It needs --todo and a --cwd that is a git tree, and refuses --prompt
+# (exit 2). --bounce N names the round; without it the round is the highest
+# r of any [BOUNCE r/n] in the todo's comments (a worker's [BOUNCE 2/3
+# FIXES] milestone does not match), and no match omits the bounce clause.
+# Every other flag applies unchanged; the JSON summary adds replacer, tip,
+# bounce.
 # The lane is also appended to this session's org-stop-gate marker, so a
 # dispatch run from inside a script is not invisible to the gate.
 # With --wake-target (or HERDR_ORG_WAKER_TARGET set) and the org-waker herdr
@@ -103,8 +113,11 @@ NO_GAUGE=0
 ACCEPT_TRUST=0
 KEEP_TIER=""
 RELAUNCH=""
+REPLACER=0
+BOUNCE_N=""
+TIP=""
 TOP_MODEL=""
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 BOARD=""
 if command -v board >/dev/null 2>&1; then
   BOARD="board"
@@ -141,6 +154,8 @@ while [ "$#" -gt 0 ]; do
     --beat-note) BEAT_NOTE=$2; shift 2 ;;
     --no-gauge) NO_GAUGE=1; shift ;;
     --accept-trust) ACCEPT_TRUST=1; shift ;;
+    --replacer) REPLACER=1; shift ;;
+    --bounce) BOUNCE_N=$2; shift 2 ;;
     --) shift; EXTRA_ARGS=$*; break ;;
     -h|--help) usage ;;
     *) echo "dispatch-worker: unknown arg $1" >&2; usage ;;
@@ -164,6 +179,15 @@ fi
   echo "dispatch-worker: --kind $KIND is not dispatchable: the pointer rides the launch arguments and only the claude CLI takes one; nothing is ever typed into a composer (L11)." >&2
   exit 2
 }
+if [ "$REPLACER" -eq 1 ]; then
+  [ -z "$PROMPT" ] || { echo "dispatch-worker: --replacer builds its own pointer; drop --prompt." >&2; exit 2; }
+  [ -n "$TODO" ] || { echo "dispatch-worker: --replacer needs --todo <slug> (the lane the replacer inherits)." >&2; exit 2; }
+  [ -n "$CWD" ] || [ -n "$RELAUNCH" ] || { echo "dispatch-worker: --replacer needs --cwd <lane tree> (its tip is named in the pointer)." >&2; exit 2; }
+fi
+if [ -n "$BOUNCE_N" ]; then
+  [ "$REPLACER" -eq 1 ] || { echo "dispatch-worker: --bounce only applies with --replacer." >&2; exit 2; }
+  case "$BOUNCE_N" in ''|*[!0-9]*) echo "dispatch-worker: --bounce takes a round number, got '$BOUNCE_N'." >&2; exit 2 ;; esac
+fi
 
 if [ -n "$TOP_MODEL" ]; then
   [ -z "$(arg_value --model "$EXTRA_ARGS")" ] || { echo "dispatch-worker: --model given both as a flag and in the agent args" >&2; exit 2; }
@@ -202,6 +226,19 @@ if [ -n "$RELAUNCH" ]; then
     "") echo "dispatch-worker: --relaunch $NAME: todo $TODO not found on the board (HERDR_ORG_ROOT=${HERDR_ORG_ROOT:-unset})." >&2; exit 2 ;;
   esac
   case " $EXTRA_ARGS " in *" --permission-mode "*) ;; *) EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }--permission-mode bypassPermissions" ;; esac
+fi
+if [ "$REPLACER" -eq 1 ]; then
+  TIP=$(git -C "$CWD" rev-parse --short HEAD 2>/dev/null) || TIP=""
+  [ -n "$TIP" ] || { echo "dispatch-worker: --replacer: --cwd '$CWD' is not a git tree with a commit; the pointer must name the lane tree's tip." >&2; exit 2; }
+  if [ -z "$BOUNCE_N" ]; then
+    if [ -n "$BOARD" ]; then
+      BOUNCE_N=$("$BOARD" get "$TODO" 2>/dev/null | sed -n '/^## Comments$/,$p' | grep -oE '\[BOUNCE [0-9]+/[0-9]+\]' | sed 's/^\[BOUNCE \([0-9]*\)\/.*/\1/' | sort -n | tail -1) || BOUNCE_N=""
+    else
+      echo "dispatch-worker: --replacer: no board CLI to read the bounce round from; the pointer omits it (pass --bounce N)." >&2
+    fi
+  fi
+  # A bare JSON number: "02" would break the summary.
+  [ -z "$BOUNCE_N" ] || BOUNCE_N=$(printf '%s' "$BOUNCE_N" | sed 's/^0*\([0-9]\)/\1/')
 fi
 
 MODEL=$(arg_value --model "$EXTRA_ARGS")
@@ -289,7 +326,14 @@ esac
 # eaten by Claude's command palette and the task text is silently dropped.
 # BOARD_CMD works as typed in any shell and split on spaces as an argv array.
 BOARD_CMD="env HERDR_ORG_ROOT=$HERDR_ORG_ROOT $HERE/board"
-if [ -z "$PROMPT" ] && [ -n "$TODO" ]; then
+if [ -z "$PROMPT" ] && [ -n "$TODO" ] && [ "$REPLACER" -eq 1 ]; then
+  if [ -n "$BOUNCE_N" ]; then
+    READ_ORDER="starting from the latest [BOUNCE ${BOUNCE_N}/3] comment and its DIGEST, and implement ONLY its FIXES"
+  else
+    READ_ORDER="and its comment trail, and continue the lane from its last milestone"
+  fi
+  PROMPT="you are the REPLACER for todo ${TODO}${BOUNCE_N:+, bounce ${BOUNCE_N}/3}: the previous worker is gone, the lane tree (your cwd) holds its committed work at tip ${TIP}. Your board command, exact for every shell including skyline-routed ones (paste it whole): ${BOARD_CMD}. Invoke the herdr-agent-org replacer skill (herdr-replacer), then read the board brief (${BOARD_CMD} get ${TODO}) ${READ_ORDER}. Report milestones with ${BOARD_CMD} comment ${TODO} \"...\" and close out with [DONE] plus the relay doorbell to the orchestrator."
+elif [ -z "$PROMPT" ] && [ -n "$TODO" ]; then
   PROMPT="you own todo ${TODO}. Your board command, exact for every shell including skyline-routed ones (paste it whole): ${BOARD_CMD}. Read the board brief (${BOARD_CMD} get ${TODO}), then invoke the herdr-worker skill and implement it. Report milestones with ${BOARD_CMD} comment ${TODO} \"...\"."
 fi
 [ -n "$PROMPT" ] || {
@@ -303,7 +347,9 @@ WHY="${UPGRADE_REASON:-$KEEP_TIER}"
 # After the reap, a failed split or start would leave the lane dead with no
 # record: file it, and hand back the exact re-dispatch.
 relaunch_failed() {
-  redo="dispatch-worker --name $NAME --todo $TODO --cwd $CWD${UPGRADE_REASON:+ --upgrade-reason \"$UPGRADE_REASON\"}${KEEP_TIER:+ --keep-tier \"$KEEP_TIER\"} -- $EXTRA_ARGS"
+  repl=""
+  [ "$REPLACER" -eq 1 ] && repl=" --replacer${BOUNCE_N:+ --bounce $BOUNCE_N}"
+  redo="dispatch-worker --name $NAME --todo $TODO --cwd $CWD${UPGRADE_REASON:+ --upgrade-reason \"$UPGRADE_REASON\"}${KEEP_TIER:+ --keep-tier \"$KEEP_TIER\"}$repl -- $EXTRA_ARGS"
   echo "dispatch-worker: --relaunch $NAME: $1 AFTER pane $OLD_PANE was reaped; the lane has no live agent. Re-dispatch: $redo" >&2
   [ -n "$BOARD" ] && { "$BOARD" comment "$TODO" "**[RELAUNCH-FAILED: $OLD_PANE reaped, $1]** re-dispatch: $redo" >/dev/null 2>&1 || true; }
   exit 1
@@ -493,7 +539,7 @@ if [ -n "$TODO" ] && [ -n "$BOARD" ]; then
   [ -n "$GAUGE" ] && { "$BOARD" comment "$TODO" "**[$GAUGE]** at dispatch of $NAME" >/dev/null || true; }
 fi
 
-printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s,"trust":%s,"relaunched_from":%s}\n' \
+printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s,"trust":%s,"relaunched_from":%s,"replacer":%s,"tip":%s,"bounce":%s}\n' \
   "$(printf '%s' "$NAME" | jq -Rs .)" \
   "$(printf '%s' "$pane_id" | jq -Rs .)" \
   "$(printf '%s' "$KIND" | jq -Rs .)" \
@@ -508,4 +554,7 @@ printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effo
   "$(printf '%s' "$WAKER" | jq -Rs .)" \
   "$(printf '%s' "$SUBMIT" | jq -Rs .)" \
   "$(printf '%s' "$TRUST" | jq -Rs .)" \
-  "$(printf '%s' "$OLD_PANE" | jq -Rs .)"
+  "$(printf '%s' "$OLD_PANE" | jq -Rs .)" \
+  "$([ "$REPLACER" -eq 1 ] && echo true || echo false)" \
+  "$(printf '%s' "$TIP" | jq -Rs .)" \
+  "${BOUNCE_N:-null}"
