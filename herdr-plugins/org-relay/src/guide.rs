@@ -65,6 +65,17 @@ Rules that keep the org deaf-proof:
    or your ping (when live_await is false, or always for a sender whose turn
    ends with the send)) is what turns it into a mind reading it.
 
+## Job wakes (1.5.0)
+
+A long local job (a gate run, a CI watch) wakes its orchestrator by
+ENDING with a send, never by the orchestrator spending short-timeout awaits
+as a timer (each timeout replays a whole turn):
+
+  <job>; relay-ctl send --to <orchestrator> --kind job --body "job <id> rc=$?"
+
+`relay-ctl send` enqueues exactly as relay_send does (same validation, same
+in-process wake of a live await) over the daemon's plain POST /send.
+
 ## The nudge net (last resort, not the primary)
 
 The daemon polls its own queue (~20s). A recipient with unconsumed messages
@@ -112,7 +123,7 @@ queue, never instead of it:
 
 - relay_send(sender, to, kind, body, lane?) — durable enqueue + in-process
   wake of any live awaiter. kind: doorbell | ring | blocker | incident |
-  peer | operator | other. Returns {id, queued_for, live_await}: a sender
+  peer | operator | question | answer | job | other. Returns {id, queued_for, live_await}: a sender
   that stays awake pings ONCE when live_await is false or absent; a sender
   whose turn ends with the send pings once regardless.
 - relay_inbox(agent, include_consumed?) — list queued messages.

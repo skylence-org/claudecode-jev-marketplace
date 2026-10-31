@@ -147,7 +147,7 @@ fn tool_defs() -> Value {
              "sender": s("your agent name"),
              "to": s("recipient agent name (e.g. orch-<feature>)"),
              "lane": s("optional lane/todo slug for context"),
-             "kind": s("doorbell | ring | blocker | incident | peer | operator | other"),
+             "kind": s("doorbell | ring | blocker | incident | peer | operator | question | answer | job | other"),
              "body": s("the message; stored verbatim, no shell interpolation hazards")}},
          "outputSchema": {"type": "object", "properties": {
              "id": {"type": "integer"}, "queued_for": {"type": "string"},

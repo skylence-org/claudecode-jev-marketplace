@@ -1,5 +1,5 @@
 #!/bin/sh
-# relay-ctl: start/stop/status/run/install-daemon/rollback for the org-relay
+# relay-ctl: start/stop/status/run/install-daemon/rollback/send for the org-relay
 # MCP server. install-daemon is the production path: it refuses a dirty tree,
 # copies the release binary to a VERSIONED slot outside the repo, repoints the
 # `current` symlink, restarts launchd, and verifies the served sha matches the
@@ -177,6 +177,51 @@ case "${1:-status}" in
       [ -n "${PID:-}" ] && kill "$PID" && echo "org-relay: stopped (pid $PID)" || echo "org-relay: not running"
     fi
     ;;
+  send)
+    # JOB WAKES (1.5.0): enqueue one message exactly as relay_send does, from a
+    # shell, so a long local job (a gate run, a CI watch) can end with
+    #   ...; relay-ctl send --to <orchestrator> --kind job --body "job <id> rc=$?"
+    # and wake the orchestrator through its one armed relay_await (or the nudge
+    # net) instead of the orchestrator spending short-timeout awaits as a timer.
+    # Rides POST /send, the same op as the tool: same validation, durable
+    # enqueue, audit event, in-process wake. /send carries no MCP session, so
+    # the guide gate does not apply, exactly as for any stateless caller; the
+    # loopback bind is the trust boundary.
+    shift
+    S_TO=""; S_KIND=""; S_BODY=""; S_SENDER="relay-ctl"; S_LANE=""
+    while [ "$#" -gt 0 ]; do
+      [ "$#" -ge 2 ] || { echo "relay-ctl send: $1 needs a value" >&2; exit 2; }
+      case "$1" in
+        --to) S_TO=$2 ;;
+        --kind) S_KIND=$2 ;;
+        --body) S_BODY=$2 ;;
+        --sender) S_SENDER=$2 ;;
+        --lane) S_LANE=$2 ;;
+        *) echo "relay-ctl send: unknown argument $1" >&2; exit 2 ;;
+      esac
+      shift 2
+    done
+    for v in "to:$S_TO" "kind:$S_KIND" "body:$S_BODY" "sender:$S_SENDER"; do
+      [ -n "$(printf '%s' "${v#*:}" | tr -d '[:space:]')" ] || { echo "relay-ctl send: --${v%%:*} is required (usage: relay-ctl send --to <agent> --kind <kind> --body <text> [--sender <name>] [--lane <slug>])" >&2; exit 2; }
+    done
+    command -v jq >/dev/null 2>&1 || { echo "relay-ctl send: jq required" >&2; exit 2; }
+    payload=$(jq -nc --arg s "$S_SENDER" --arg t "$S_TO" --arg k "$S_KIND" --arg b "$S_BODY" --arg l "$S_LANE" \
+      '{sender: $s, to: $t, kind: $k, body: $b} + (if $l == "" then {} else {lane: $l} end)')
+    out=$(mktemp "${TMPDIR:-/tmp}/relay-ctl-send.XXXXXX")
+    code=$(curl -s -m 10 -o "$out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+      --data-binary "$payload" "http://127.0.0.1:$PORT/send" 2>/dev/null)
+    rc=$?
+    reply=$(cat "$out" 2>/dev/null); rm -f "$out"
+    if [ "$rc" -ne 0 ]; then
+      echo "relay-ctl send: no org-relay answering on :$PORT (curl rc=$rc); nothing was queued" >&2
+      exit 1
+    fi
+    case "$code" in
+      200) printf '%s\n' "$reply" ;;
+      404) echo "relay-ctl send: the daemon on :$PORT has no POST /send (a build older than this repo's); install org-relay from herdr-plugins/org-relay (README). Nothing was queued." >&2; exit 1 ;;
+      *) echo "relay-ctl send: refused (HTTP $code): $reply" >&2; exit 1 ;;
+    esac
+    ;;
   status)
     if alive; then
       echo "org-relay: serving on :$PORT"
@@ -193,5 +238,5 @@ case "${1:-status}" in
       echo "org-relay: not running on :$PORT"; exit 1
     fi
     ;;
-  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback" >&2; exit 2 ;;
+  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback|send" >&2; exit 2 ;;
 esac

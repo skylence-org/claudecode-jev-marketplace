@@ -85,6 +85,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: cargo test
         run: cargo test --manifest-path herdr-plugins/org-relay/Cargo.toml
+      - name: relay-ctl send suite (stub curl, no daemon)
+        run: sh herdr-plugins/org-relay/test/relay_ctl_send.sh
       - name: nudge-deliver classify suite
         run: sh herdr-plugins/org-relay/test/nudge_deliver_classify.sh
       - name: concurrency smoke (parallel awaits, fan-out, burst, consume race)
