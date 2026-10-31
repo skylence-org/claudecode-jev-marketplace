@@ -551,6 +551,7 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
                 .collect();
             Ok(json!({"db": db_path(), "queues": rows, "awaiting": awaiting_names(),
                       "awaiting_detail": awaiting_detail(),
+                      "build": crate::build_info(),
                       "nudge": {"enabled": crate::nudge::nudge_enabled(),
                                 "helper": crate::nudge::nudge_helper().map(|p| p.to_string_lossy().into_owned())}}))
         }

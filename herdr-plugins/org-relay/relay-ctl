@@ -181,10 +181,14 @@ case "${1:-status}" in
     if alive; then
       echo "org-relay: serving on :$PORT"
       # rmcp streamable HTTP needs an MCP handshake per session, so the CLI
-      # reads the plain GET /status mirror (never guide-gated); it now carries
-      # the daemon's own build attestation.
-      curl -s -m 5 "http://127.0.0.1:$PORT/status" 2>/dev/null
-      echo
+      # reads the plain GET /status mirror (never guide-gated); it carries the
+      # daemon's own build attestation, summarized first so a drifted install
+      # (same version, other repo or sha) is visible at a glance.
+      st=$(curl -s -m 5 "http://127.0.0.1:$PORT/status" 2>/dev/null)
+      if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$st" | jq -r '.build // {} | "org-relay: build \(.version // "?") sha \(.sha // "?")\(if .dirty then "-dirty" else "" end) built \(.built_at // "?") from \(.remote // "unknown remote (pre-1.5.0 build)") \(.source_dir // "")"' 2>/dev/null
+      fi
+      printf '%s\n' "$st"
     else
       echo "org-relay: not running on :$PORT"; exit 1
     fi

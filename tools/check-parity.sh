@@ -42,4 +42,28 @@ for f in "$CORE/scripts/jev" "$CORE/hooks/judge-hook.sh" "$CORE/hooks/writing-gu
   [ -x "$f" ] || err "$f is not executable"
 done
 
+# org-relay: one version per build. Two repos once shipped different builds
+# as 1.4.1 (multi-llm-marketplace 965ec72 and this repo's df40d17), so the
+# three version fields must agree, and a src/ or build.rs change against main
+# without a Cargo.toml version bump fails. The base is $PARITY_BASE, else
+# origin/main, else a depth-1 fetch of main (CI checks out shallow, with no
+# origin/main); with no base at all the bump check is skipped, never failed.
+RELAY=herdr-plugins/org-relay
+cver() { sed -n 's/^version = "\(.*\)"/\1/p' | head -1; }
+cv=$(cver < "$RELAY/Cargo.toml")
+pv=$(cver < "$RELAY/herdr-plugin.toml")
+lv=$(awk '/^name = "org-relay"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$RELAY/Cargo.lock")
+[ "$cv" = "$pv" ] || err "$RELAY: Cargo.toml says $cv but herdr-plugin.toml says $pv"
+[ "$cv" = "$lv" ] || err "$RELAY: Cargo.toml says $cv but Cargo.lock says $lv"
+base="${PARITY_BASE:-origin/main}"
+if ! git rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1; then
+  if git fetch -q --depth=1 origin main 2>/dev/null; then base=FETCH_HEAD; else base=""; fi
+fi
+if [ -z "$base" ]; then
+  echo "parity: org-relay version-bump check skipped (no base ref)"
+elif ! git diff --quiet "$base" HEAD -- "$RELAY/src" "$RELAY/build.rs" 2>/dev/null; then
+  bv=$(git show "$base:$RELAY/Cargo.toml" 2>/dev/null | cver)
+  [ "$bv" != "$cv" ] || err "$RELAY/src changed against $base but Cargo.toml still says $cv: bump the crate version (one version per build)"
+fi
+
 if [ "$fail" = 0 ]; then echo "parity: OK"; else echo "parity: FAILED"; exit 1; fi

@@ -7,6 +7,24 @@ orchestrator's turn (operator prompts queued behind a listener that re-armed
 every 50s) and still died with every turn end. The wake plane is TASK-DRIVEN
 as of 1.0.
 
+**Source of truth (1.5.0):** this directory, `herdr-plugins/org-relay` in
+skylence-org/claudecode-jev-marketplace. The multi-llm-marketplace copy
+stopped at 1.4.1 (commit 965ec72, 2026-09-19); this repo then changed the
+crate (df40d17, `relay_send` live_await) under the same 1.4.1, so two
+different builds carried one version. From 1.5.0 on, every change to `src/`
+or `build.rs` bumps the crate version, and `tools/check-parity.sh` fails a
+change that does not; it also keeps `Cargo.toml`, `Cargo.lock` and
+`herdr-plugin.toml` on the same version.
+
+**Install from this repo:** `cd herdr-plugins/org-relay && cargo build
+--release && sh relay-ctl install-daemon`. install-daemon refuses a dirty
+build, copies the binary to a versioned slot under
+`~/.local/libexec/org-relay/`, repoints `current`, restarts launchd, and
+verifies the served sha. Then `sh relay-ctl status`: its first line names
+the build (`org-relay: build 1.5.0 sha <sha> built <ts> from <origin remote>
+<source dir>`); the same `build` object is in `relay_status` and `GET
+/status`. A daemon whose build has no `remote` predates 1.5.0.
+
 **Design (settled):** data plane = SQLite queue — ONE box-wide db for every
 org (`~/.config/herdr/org-relay/relay.db`, set as ORG_RELAY_DB by the launchd
 plist; the `$HERDR_ORG_ROOT/relay.db` fallback only applies to ad-hoc runs

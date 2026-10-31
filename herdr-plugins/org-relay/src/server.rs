@@ -193,13 +193,17 @@ fn tool_defs() -> Value {
              "audit": {"type": "object"}, "access": {"type": "object"},
              "max_log_bytes": {"type": "integer"}}}},
         {"name": "relay_status",
-         "description": "Unconsumed message counts per recipient, the db path, which recipients currently hold live await coverage in this daemon (awaiting; in-call and task-backed holds both count), and the nudge watchdog state. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for. Never guide-gated.",
+         "description": "Unconsumed message counts per recipient, the db path, which recipients currently hold live await coverage in this daemon (awaiting; in-call and task-backed holds both count), the nudge watchdog state, and the daemon's own build (version, git sha, dirty flag, origin remote, source dir) so an installed binary can be matched to the repo that built it. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for. Never guide-gated.",
          "inputSchema": {"type": "object", "properties": {}},
          "outputSchema": {"type": "object", "properties": {
              "db": {"type": "string"},
              "queues": {"type": "array", "items": {"type": "object", "properties": {
                  "recipient": {"type": "string"}, "unconsumed": {"type": "integer"}}}},
              "awaiting": {"type": "array", "items": {"type": "string"}},
+             "build": {"type": "object", "properties": {
+                 "version": {"type": "string"}, "sha": {"type": "string"},
+                 "dirty": {"type": "boolean"}, "built_at": {"type": "string"},
+                 "remote": {"type": "string"}, "source_dir": {"type": "string"}}},
              "nudge": {"type": "object", "properties": {
                  "enabled": {"type": "boolean"}, "helper": {"type": ["string", "null"]}}}}}}
     ])

@@ -1,6 +1,6 @@
 [package]
 name = "org-relay"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 description = "Durable MCP message bus for the herdr agent-org: SQLite queue + task-backed awaiting (SEP-2663) over rmcp streamable HTTP, guide-gated tools, plus a nudge watchdog that rings recipients whose backlog has no listener."
 

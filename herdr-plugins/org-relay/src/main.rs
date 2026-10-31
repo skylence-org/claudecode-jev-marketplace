@@ -39,11 +39,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("ORG_RELAY_GIT_SHA");
 pub const GIT_DIRTY: &str = env!("ORG_RELAY_GIT_DIRTY");
 pub const BUILT_AT: &str = env!("ORG_RELAY_BUILT_AT");
+/// The `origin` remote of the checkout that built this binary, and the
+/// crate directory it was built from: which repo, not just which sha (1.5.0,
+/// after two repos shipped different builds as 1.4.1).
+pub const GIT_REMOTE: &str = env!("ORG_RELAY_GIT_REMOTE");
+pub const SOURCE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-fn build_info() -> serde_json::Value {
+/// Served by /health, /status, and the relay_status tool.
+pub(crate) fn build_info() -> serde_json::Value {
     serde_json::json!({
         "version": VERSION, "sha": GIT_SHA, "dirty": GIT_DIRTY == "dirty",
-        "built_at": BUILT_AT,
+        "built_at": BUILT_AT, "remote": GIT_REMOTE, "source_dir": SOURCE_DIR,
     })
 }
 
@@ -62,14 +68,15 @@ fn build_router() -> axum::Router {
     // Plain-HTTP mirror of the relay_status tool for CLI and hook consumers
     // (relay-ctl status, org-stop-gate): no MCP handshake, no session, no
     // guide gate — the same never-gated diagnostics the tool exposes.
+    // Plain-HTTP mirror of the relay_status tool for CLI and hook consumers
+    // (relay-ctl status, org-stop-gate): no MCP handshake, no session, no
+    // guide gate — the same never-gated diagnostics the tool exposes,
+    // build attestation included (op_sync adds it).
     async fn status() -> impl axum::response::IntoResponse {
         let body = tokio::task::spawn_blocking(|| {
-            let mut v = queue::op_sync("relay_status", &serde_json::json!({}))
-                .unwrap_or_else(|e| serde_json::json!({"error": e}));
-            if let Some(o) = v.as_object_mut() {
-                o.insert("build".into(), build_info());
-            }
-            v.to_string()
+            queue::op_sync("relay_status", &serde_json::json!({}))
+                .unwrap_or_else(|e| serde_json::json!({"error": e, "build": build_info()}))
+                .to_string()
         })
         .await
         .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
@@ -169,7 +176,7 @@ async fn shutdown_signal() {
 async fn main() {
     // Self-attestation for installers and humans: `org-relay --version`.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("org-relay {VERSION} {GIT_SHA} {GIT_DIRTY} {BUILT_AT}");
+        println!("org-relay {VERSION} {GIT_SHA} {GIT_DIRTY} {BUILT_AT} {GIT_REMOTE}");
         return;
     }
     let port = std::env::var("ORG_RELAY_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(7431);
