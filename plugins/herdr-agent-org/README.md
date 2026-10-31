@@ -64,6 +64,8 @@ The tier criteria `tier-gauge` asks Jev about ship in `scripts/jev-questions.jso
 - **Compare runs.** Gauge every labelled slug twice, shipped criteria versus overlay, and count agreements per tier. The request checksum covers the questions, so a changed criterion is never answered from cache:
 
   ```bash
+  export HERDR_ORG_ROOT=~/.herdr-org/<org>   # board (and so --todo) refuses to guess an org
+  # tier=null in the output means ungauged: no key, no root, or no such todo
   while read -r slug label; do
     shipped=$(JEV_QUESTIONS_OVERLAY=/nonexistent tier-gauge --todo "$slug" --json | jq -r .tier)
     overlay=$(tier-gauge --todo "$slug" --json | jq -r .tier)
