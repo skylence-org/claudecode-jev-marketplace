@@ -38,11 +38,19 @@
 #    counts as failed unless it printed at least one failure line and every
 #    one of them is known, and its rc is below 126: a signal or a command that
 #    could not run is never downgraded (`known-only rc=N`). Crash markers
-#    (CRASH_RE below: make's own `*** [...] Segmentation fault` / `Killed` /
-#    `Error 126-255` report, a shell's `Segmentation fault: 11`, `(core
-#    dumped)`, a runtime's `[signal SIGSEGV` or `signal: 11, SIGSEGV`) in a
-#    failing command's log print as `crash:` lines, and no --known-fail covers
-#    them: make exits 2 for a crashed recipe, so the rc alone cannot tell.
+#    (CRASH_RE below) in a failing command's log print as `crash:` lines,
+#    and no --known-fail covers them: make exits 2 for a crashed recipe, so
+#    the rc alone cannot tell. Covered: make's `*** [target]` report of any
+#    signal or of Error 126-255 (measured on GNU make 3.81; the make 4
+#    `[Makefile:N: target]` forms are tested as strings only); a shell's job
+#    report of a crashed child, `sh: line 1: <pid> Segmentation fault: 11
+#    ./x` (bash, macOS sh), `sh: 1: <pid> Killed` (Linux spellings such as
+#    `Aborted` and `Trace/breakpoint trap` as strings only), and dash's bare
+#    `Segmentation fault: 11` line; `(core dumped)`; a runtime's
+#    `[signal SIGSEGV` or `signal: 11, SIGSEGV`. Not covered: a crash that
+#    leaves none of these in the log (a runner that swallows its child's
+#    report and prints only a FAIL line). A test name that merely mentions
+#    a signal (`ok 4 - prints Abort trap`) is not a crash line.
 #    failed= counts commands, known= counts lines.
 # 5. The gate owns the tree for its run: never gate a tree a live worker
 #    writes to. Gate commands run on a detached HEAD, so in them
@@ -297,20 +305,24 @@ if [ -z "$CMDS" ]; then
   fi
 fi
 
-# CRASH_RE (review round 2, I-A), the one place crash markers live. A
-# failing command's log line matching it (leading whitespace stripped) prints
-# as `crash:` and no --known-fail covers it. Alternatives, in order:
-#   make's report of a recipe that a signal killed or that exited 126-255
-#     (make itself then exits 2): `make[: N]: *** [...] Segmentation fault: 11`,
-#     `Killed: 9`, `Abort trap: 6`, `Bus error: 10`, `Error 139`;
-#   a shell naming a fatal signal at the end of a line: `Segmentation fault`,
-#     `Bus error`, `Illegal instruction`, `Abort trap`, optionally `: N`
-#     and/or ` (core dumped)`;
+# CRASH_RE (review rounds 2 and 3, I-A and I-1), the one place crash markers
+# live. A failing command's log line matching it (leading whitespace
+# stripped) prints as `crash:` and no --known-fail covers it. Alternatives,
+# in order:
+#   make's `*** [target] <tail>` report whose tail is anything but
+#     `Error N` with N below 126: every strsignal make prints (Segmentation
+#     fault, Trace/BPT trap, Floating point exception, Terminated, Hangup,
+#     ...) and Error 126-255. An `(ignored)` error carries no `***`, and an
+#     `Error N (ignored)` tail is never a crash;
+#   a shell's job report of a crashed child, anchored on the pid:
+#     `[<prog>: ][line N: ]<pid> <signal>[: N]`, the command after it;
+#   dash's bare report, the whole line: `<signal>[: N][ (core dumped)]`;
 #   `(core dumped)` anywhere;
 #   a runtime's signal tag: Go `[signal SIGSEGV`, Rust `signal: 11, SIGSEGV`.
-# A log line that merely mentions a signal name ("installing SIGSEGV
-# handler") matches none of them.
-CRASH_RE='^make(\[[0-9]+\])?: \*\*\* .*(Error (12[6-9]|1[3-9][0-9]|2[0-5][0-9])|Segmentation fault|Killed|Abort|Bus error|Illegal instruction|core dumped)|(Segmentation fault|Bus error|Illegal instruction|Abort trap)(: [0-9]+)?( \(core dumped\))?$|\(core dumped\)|\[signal SIG[A-Z]+|signal: [0-9]+, SIG[A-Z]+'
+# <signal> is the macOS and the Linux strsignal text of SEGV, BUS, ILL, ABRT,
+# FPE, TRAP, KILL and TERM. A line that merely mentions a signal name
+# ("installing SIGSEGV handler", "ok 4 - prints Abort trap") matches none.
+CRASH_RE='^[^ ]*make(\[[0-9]+\])?: \*\*\* \[[^]]*\] ([^E]|E[^r]|Er[^r]|Err[^o]|Erro[^r]|Error[^ ]|Error [^0-9]|Error (12[6-9]|1[3-9][0-9]|[2-9][0-9][0-9]|[0-9][0-9][0-9][0-9]+)$)|^(.*: )?(line [0-9]+: )?[0-9]+ (Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?|^(Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?( \(core dumped\))?$|\(core dumped\)|\[signal SIG[A-Z]+|signal: [0-9]+, SIG[A-Z]+'
 
 is_known() {
   [ -n "$KNOWN" ] || return 1

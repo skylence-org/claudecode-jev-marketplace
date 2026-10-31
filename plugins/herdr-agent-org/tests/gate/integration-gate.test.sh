@@ -238,6 +238,69 @@ commit_in "$TMP/r12" Makefile 'check:\n\ttrue\ntest:\n\t@echo "--- FAIL: TestFla
 ig --slug "$SLUG" --cwd "$TMP/r12" --known-fail 'TestFlaky \('
 if [ $RC -eq 0 ] && printf '%s\n' "$OUT" | grep -q 'failed=0 known=1$' && ! printf '%s\n' "$OUT" | grep -q '^  crash:'; then ok "make test with only a known failure (and a log line that merely names SIGSEGV): still downgraded, exit 0"; else bad "make known" "rc=$RC out=$OUT err=$ERR"; fi
 
+echo "--- round 3: every signal report is a crash, a test name is not (I-1) ---"
+# Each case pairs a crash with a KNOWN flaky line, so only the crash rule can
+# keep the gate red.
+for s in TRAP FPE TERM; do
+  mkrepos "r20$s"
+  commit_in "$TMP/r20$s" Makefile 'check:\n\ttrue\ntest:\n\tsh -c '"'"'echo "--- FAIL: TestFlaky (1.0s)"; kill -'"$s"' $$$$'"'"'\n'
+  ig --slug "$SLUG" --cwd "$TMP/r20$s" --known-fail 'TestFlaky \('
+  if [ $RC -eq 1 ] && printf '%s\n' "$OUT" | grep -q '^  crash: make' && printf '%s\n' "$OUT" | grep -q 'failed=1 known=1$'; then ok "make recipe killed by SIG$s after a known flaky line: crash: make line, counted failed, exit 1 ($IG_SH)"; else bad "make $s crash" "rc=$RC out=$OUT err=$ERR"; fi
+done
+mkrepos r21
+printf '#!/bin/sh\nkill -SEGV $$\n' >"$TMP/r21/crasher"; chmod +x "$TMP/r21/crasher"
+git -C "$TMP/r21" add crasher; git -C "$TMP/r21" commit -q -m crasher
+commit_in "$TMP/r21" Makefile 'check:\n\ttrue\ntest:\n\t@./crasher; echo "--- FAIL: TestFlaky (1.0s)"; exit 1\n'
+ig --slug "$SLUG" --cwd "$TMP/r21" --known-fail 'TestFlaky \('
+if [ $RC -eq 1 ] && printf '%s\n' "$OUT" | grep -q '^  crash: .*[0-9] Segmentation fault' && printf '%s\n' "$OUT" | grep -q 'failed=1 known=1$'; then ok "make runner whose child segfaults, then prints the known flaky and exits 1: the shell's job report is a crash: line, exit 1 ($IG_SH)"; else bad "make child crash" "rc=$RC out=$OUT err=$ERR"; fi
+for inner in sh bash dash; do
+  command -v "$inner" >/dev/null 2>&1 || { echo "skip child crash under $inner: not installed"; continue; }
+  ig --slug "$SLUG" --cwd "$TMP/r21" --cmd "$inner -c './crasher; echo \"--- FAIL: TestFlaky (1.0s)\"'; exit 1" --known-fail 'TestFlaky \('
+  if [ $RC -eq 1 ] && printf '%s\n' "$OUT" | grep -q '^  crash: .*Segmentation fault' && printf '%s\n' "$OUT" | grep -q 'failed=1 known=1$'; then ok "a runner under $inner whose child segfaults (rc 1, known flaky): crash: line, exit 1 ($IG_SH)"; else bad "child crash $inner" "rc=$RC out=$OUT err=$ERR log=$(cat "/tmp/gate_${SLUG}_1.log")"; fi
+done
+ig --slug "$SLUG" --cwd "$TMP/r21" --cmd 'echo "--- FAIL: TestFlaky (1.0s)"; echo "ok 4 - prints Abort trap"; echo "not ok 3 - recovers from Segmentation fault"; echo "--- FAIL: TestBus (0.0s) expected Bus error"; echo "t.go:12: child said: Killed"; exit 1' \
+  --known-fail 'TestFlaky \(' --known-fail 'recovers from Segmentation' --known-fail 'TestBus \('
+if [ $RC -eq 0 ] && ! printf '%s\n' "$OUT" | grep -q '^  crash:' && printf '%s\n' "$OUT" | grep -q 'failed=0 known=3$'; then ok "test names that mention a signal (TAP ok/not ok, a FAIL reason, a quoted child line) are not crash: lines; all known, exit 0"; else bad "signal in a test name" "rc=$RC out=$OUT err=$ERR"; fi
+# The regex itself over fixed lines: GNU make 4 and Linux spellings cannot be
+# produced on every box (make 3.81 on macOS), so they are tested as strings.
+CRE=$(sed -n "s/^CRASH_RE='\(.*\)'\$/\1/p" "$IG")
+miss=""
+while IFS='|' read -r want line; do
+  [ -n "$line" ] || continue
+  got=no; printf '%s\n' "$line" | grep -qE -- "$CRE" && got=yes
+  [ "$got" = "$want" ] || miss="$miss [$want] $line;"
+done <<'EOF'
+yes|make: *** [Makefile:3: test] Segmentation fault (core dumped)
+yes|make[1]: *** [Makefile:3: test] Error 139
+yes|make: *** [Makefile:2: test] Terminated
+yes|make: *** [Makefile:2: test] Floating point exception
+yes|gmake: *** [Makefile:2: test] Segmentation fault: 11
+yes|/usr/bin/make: *** [t] Trace/BPT trap: 5
+yes|make: *** [t] Hangup: 1
+yes|make: *** [t] User defined signal 1: 30
+yes|make: *** [t] Error 130
+yes|/bin/sh: line 1: 35112 Segmentation fault: 11  ./crasher
+yes|bash: line 1: 4242 Aborted                 (core dumped) ./crasher
+yes|run.sh: line 7: 4242 Trace/breakpoint trap   ./crasher
+yes|sh: 1: 4242 Killed
+yes|Floating point exception: 8
+yes|Terminated
+yes|[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x10a4b2c]
+yes|process didn't exit successfully: `x` (signal: 11, SIGSEGV: invalid memory reference)
+no|make: *** [test] Error 2
+no|make: *** [Makefile:3: test] Error 1
+no|make: *** [t] Error 125
+no|make: [u] Error 3 (ignored)
+no|make: *** [t] Error 139 (ignored)
+no|make: *** No rule to make target 'x'.  Stop.
+no|ok 4 - prints Abort trap
+no|not ok 3 - recovers from Segmentation fault
+no|--- FAIL: TestHandlesBusError (0.00s) expected Bus error
+no|t.go:12: child said: Killed
+no|installing SIGSEGV handler
+EOF
+[ -n "$CRE" ] && [ -z "$miss" ] && ok "CRASH_RE over fixed lines: GNU make 4 and Linux report forms are crashes, make's ordinary Error N<126, (ignored) and test names are not" || bad "crash regex table" "CRE=${CRE:-<not found>} miss:$miss"
+
 echo "--- round 2: restore puts back the SHA and keeps what it found (I-B I-C) --"
 for shape in inplace merged; do
   mkrepos "r13$shape"; R="$TMP/r13$shape"
