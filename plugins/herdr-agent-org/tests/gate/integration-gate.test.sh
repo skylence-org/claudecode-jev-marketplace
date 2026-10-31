@@ -213,6 +213,85 @@ ig --slug "$SLUG" --cwd "$TMP/r8"
 [ $RC -eq 0 ] && printf '%s' "$ERR" | grep -q '\.herdr-gate.*differs' && ok ".herdr-gate that differs from the base's: warned" || bad "gate file differs" "rc=$RC err=$ERR"
 grep -qi 'trust' "$IG" && grep -q 'sh -c' "$IG" && grep -qi 'privileges' "$IG" && ok "the script header states the gate-file trust boundary" || bad "header trust" "no trust boundary text"
 
+echo "--- round 2: crash markers under make (I-A) -------------------------------"
+REALGIT=$(command -v git)
+# gitwrap DIR CASE-PATTERN ACTION: a git first on PATH that runs ACTION
+# (a sleep, or exit 1) when its argv matches CASE-PATTERN, else the real git.
+gitwrap() { mkdir -p "$1"; printf '#!/bin/sh\ncase "$*" in %s) %s ;; esac\nexec "%s" "$@"\n' "$2" "$3" "$REALGIT" >"$1/git"; chmod +x "$1/git"; }
+# ig_pre_bg PREFIX DELAY SIG ARGS...: the gate with PREFIX first on PATH, in
+# the background; SIG is sent once after DELAY seconds.
+ig_pre_bg() {
+  local pre=$1 d=$2 sig=$3 pid
+  shift 3
+  PATH="$pre:$STUBBIN:$BASEPATH" $IG_SH "$IG" "$@" >"$TMP/bg.out" 2>"$TMP/bg.err" &
+  pid=$!
+  sleep "$d"; kill -"$sig" "$pid"
+  wait "$pid"; RC=$?
+  OUT=$(cat "$TMP/bg.out"); ERR=$(cat "$TMP/bg.err")
+}
+mkrepos r11
+commit_in "$TMP/r11" Makefile 'check:\n\ttrue\ntest:\n\tsh -c '"'"'echo "--- FAIL: TestFlaky (1.0s)"; kill -SEGV $$$$'"'"'\n'
+ig --slug "$SLUG" --cwd "$TMP/r11" --known-fail 'TestFlaky \('
+if [ $RC -eq 1 ] && printf '%s\n' "$OUT" | grep -q '^  crash: make' && printf '%s\n' "$OUT" | grep -q '^  known: --- FAIL: TestFlaky' && printf '%s\n' "$OUT" | grep -q 'failed=1 known=1$'; then ok "make test crashes after a known flaky line: crash: line printed, counted failed, exit 1 ($IG_SH)"; else bad "make crash" "rc=$RC out=$OUT err=$ERR"; fi
+mkrepos r12
+commit_in "$TMP/r12" Makefile 'check:\n\ttrue\ntest:\n\t@echo "--- FAIL: TestFlaky (1.0s)"; echo "installing SIGSEGV handler"; exit 1\n'
+ig --slug "$SLUG" --cwd "$TMP/r12" --known-fail 'TestFlaky \('
+if [ $RC -eq 0 ] && printf '%s\n' "$OUT" | grep -q 'failed=0 known=1$' && ! printf '%s\n' "$OUT" | grep -q '^  crash:'; then ok "make test with only a known failure (and a log line that merely names SIGSEGV): still downgraded, exit 0"; else bad "make known" "rc=$RC out=$OUT err=$ERR"; fi
+
+echo "--- round 2: restore puts back the SHA and keeps what it found (I-B I-C) --"
+for shape in inplace merged; do
+  mkrepos "r13$shape"; R="$TMP/r13$shape"
+  [ "$shape" = merged ] && move_main "r13$shape" m.txt "from main"
+  before=$(snap "$R"); FEAT=$(git -C "$R" rev-parse feat)
+  ig --slug "$SLUG" --cwd "$R" --cmd 'git checkout -q feat && git commit -q --allow-empty -m gate-made-on-feat'
+  MV=$(git -C "$R" rev-parse -q --verify "refs/integration-gate/$SLUG/moved")
+  if [ $RC -eq 0 ] && [ "$(snap "$R")" = "$before" ] && [ "$(git -C "$R" rev-parse feat)" = "$FEAT" ] && [ -n "$MV" ] && [ "$(git -C "$R" log -1 --format=%s "$MV")" = gate-made-on-feat ] \
+     && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*feat moved to $MV.*put back to feat at $FEAT.*kept: .*refs/integration-gate/$SLUG/moved" && ! printf '%s' "$OUT" | grep -q 'featrefs'; then
+    ok "$shape: a command that commits on the lane branch: feat put back to its SHA, the commit kept under refs/integration-gate/<slug>/moved, RESTORED: says so"
+  else bad "lane branch moved ($shape)" "rc=$RC feat=$(git -C "$R" rev-parse feat) want=$FEAT MV=$MV snap=$(snap "$R") before=$before out=$OUT err=$ERR"; fi
+done
+mkrepos r15; before=$(snap "$TMP/r15"); FEAT=$(git -C "$TMP/r15" rev-parse feat)
+log1="/tmp/gate_${SLUG}_1.log"; [ -e "$log1" ] && ls -la "$log1" >/dev/null && rm -f "$log1"
+PATH="$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r15" --cmd 'sleep 2' >"$TMP/bg.out" 2>"$TMP/bg.err" &
+gp=$!; i=0
+while [ ! -e "$log1" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+sleep 0.2
+printf 'worker edit\n' >>"$TMP/r15/a.txt"; git -C "$TMP/r15" commit -q -am 'worker commit during gate'; WC=$(git -C "$TMP/r15" rev-parse HEAD)
+printf 'uncommitted worker edit\n' >>"$TMP/r15/b.txt"
+wait $gp; RC=$?; OUT=$(cat "$TMP/bg.out"); ERR=$(cat "$TMP/bg.err")
+if [ $RC -eq 0 ] && [ "$(snap "$TMP/r15")" = "$before" ] && [ "$(git -C "$TMP/r15" rev-parse feat)" = "$FEAT" ] \
+   && git -C "$TMP/r15" merge-base --is-ancestor "$WC" "refs/integration-gate/$SLUG/head" \
+   && git -C "$TMP/r15" show 'stash@{0}:b.txt' 2>/dev/null | grep -q 'uncommitted worker edit' \
+   && git -C "$TMP/r15" stash list | grep -q "integration-gate $SLUG: found at restore" \
+   && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*kept: .*refs/integration-gate/$SLUG/head" && printf '%s\n' "$OUT" | grep -q '^RESTORED: .*kept: .*stash'; then
+  ok "a writer commits and edits during an in-place run: nothing lost (commit under refs/integration-gate/<slug>/head, edit in a stash), both named"
+else bad "preserve before discard" "rc=$RC WC=$WC head=$(git -C "$TMP/r15" rev-parse -q --verify "refs/integration-gate/$SLUG/head") stash=$(git -C "$TMP/r15" stash list) snap=$(snap "$TMP/r15") before=$before out=$OUT err=$ERR"; fi
+
+echo "--- round 2: ignored lane files survive the test merge (I-D) -------------"
+mkrepos r16
+commit_in "$TMP/r16" .gitignore 'local.cfg\n'
+printf 'MY LOCAL SECRET CONFIG\n' >"$TMP/r16/local.cfg"
+move_main r16 local.cfg "main default"
+ig --slug "$SLUG" --cwd "$TMP/r16" --cmd true
+if [ $RC -eq 2 ] && printf '%s' "$OUT" | grep -q 'MERGE-FAILED' && [ "$(cat "$TMP/r16/local.cfg" 2>&1)" = 'MY LOCAL SECRET CONFIG' ] && ! printf '%s' "$OUT" | grep -q '^true rc='; then ok "main starts tracking an ignored lane file: MERGE-FAILED, exit 2, the lane's file intact"; else bad "ignored file" "rc=$RC out=$OUT err=$ERR local.cfg=$(cat "$TMP/r16/local.cfg" 2>&1)"; fi
+
+echo "--- round 2: signal races and the verifier (m-c, ruling A) ----------------"
+mkrepos r17; move_main r17 m.txt "from main"; before=$(snap "$TMP/r17")
+gitwrap "$TMP/slow-detach" '"checkout -q --detach"' 'sleep 1.5'
+ig_pre_bg "$TMP/slow-detach" 0.7 TERM --slug "$SLUG" --cwd "$TMP/r17" --cmd true
+[ $RC -eq 143 ] && [ "$(snap "$TMP/r17")" = "$before" ] && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG " && ok "TERM during the detach: tree restored, GATE-DONE printed, exit 143" || bad "term detach" "rc=$RC snap=$(snap "$TMP/r17") before=$before out=$OUT err=$ERR"
+mkrepos r18
+commit_in "$TMP/r18" m.txt 'lane\n'
+move_main r18 m.txt "main"
+before=$(snap "$TMP/r18")
+gitwrap "$TMP/slow-abort" '"merge --abort"' 'sleep 1.5'
+ig_pre_bg "$TMP/slow-abort" 0.8 TERM --slug "$SLUG" --cwd "$TMP/r18" --cmd true
+[ $RC -eq 3 ] && [ "$(snap "$TMP/r18")" = "$before" ] && [ ! -e "$TMP/r18/.git/MERGE_HEAD" ] && printf '%s' "$OUT" | grep -q '^MERGE-CONFLICT' && printf '%s\n' "$OUT" | tail -1 | grep -q 'merged=conflict' && ok "TERM during the conflict path's merge --abort: tree restored, MERGE-CONFLICT printed, merged=conflict, exit 3 (a signal during finish is ignored)" || bad "term abort" "rc=$RC snap=$(snap "$TMP/r18") before=$before out=$OUT err=$ERR"
+mkrepos r19
+gitwrap "$TMP/fail-co" '"checkout -q -f feat"*' 'exit 1'
+OUT=$(PATH="$TMP/fail-co:$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r19" --cmd true 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err")
+[ $RC -eq 1 ] && [ "$(printf '%s\n' "$OUT" | grep -c '^RESTORE MISMATCH:')" = 1 ] && printf '%s\n' "$OUT" | grep -q '^RESTORE MISMATCH: .*detached' && ! printf '%s' "$OUT" | grep -q '^RESTORED:' && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG " && ok "a restore the verifier cannot confirm: one RESTORE MISMATCH: line naming what differs, exit 1, never a RESTORED: line" || bad "restore mismatch" "rc=$RC out=$OUT err=$ERR"
+
 echo
 echo "integration-gate: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1
