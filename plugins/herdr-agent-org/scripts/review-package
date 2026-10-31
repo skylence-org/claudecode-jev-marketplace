@@ -1,0 +1,81 @@
+#!/bin/sh
+# review-package: write the L10 review package to one file, so the diff never
+# transits the orchestrator's context (marketplace#13).
+#
+# Usage:
+#   review-package --slug S --cwd TREE --base B --head H [--out PATH]   (whole PR)
+#   review-package --slug S --cwd TREE --from F --to T [--out PATH]     (delta)
+#
+# Whole PR (round 1, templates/reviewer-brief.md): `git log --oneline B..H`,
+# `git diff --stat B...H`, `git diff -U10 B...H` into /tmp/<slug>_review.diff.
+# THREE dots on both diffs, from the merge base, so a main that moved on never
+# pulls another merged PR's files into the review; two dots on the log.
+# Delta (round 2+, templates/reviewer-delta-brief.md): the same three parts
+# with TWO dots throughout (F..T: the previous round's tip to the fix tip, not
+# the merge base) into /tmp/<slug>_review2.diff.
+# --out PATH overrides the file. Each part is headed by a `# <command>` line.
+# Refuses (exit 3, nothing written) when the tree's HEAD is not --head / --to:
+# a package of a ref the tree has moved off reviews code nobody will merge.
+# Prints `<path> <n> lines`. Exit 2 on usage errors and unresolvable refs.
+set -u
+
+SLUG=""; CWD=""; BASE=""; HEAD_REF=""; FROM=""; TO=""; OUTP=""
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
+  exit 2
+}
+die2() { echo "review-package: $*" >&2; exit 2; }
+need() { [ "$1" -ge 2 ] || die2 "$2 needs a value"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --slug) need "$#" "$1"; SLUG=$2; shift 2 ;;
+    --cwd) need "$#" "$1"; CWD=$2; shift 2 ;;
+    --base) need "$#" "$1"; BASE=$2; shift 2 ;;
+    --head) need "$#" "$1"; HEAD_REF=$2; shift 2 ;;
+    --from) need "$#" "$1"; FROM=$2; shift 2 ;;
+    --to) need "$#" "$1"; TO=$2; shift 2 ;;
+    --out) need "$#" "$1"; OUTP=$2; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "review-package: unknown arg $1" >&2; usage ;;
+  esac
+done
+
+[ -n "$SLUG" ] || die2 "--slug required"
+printf '%s' "$SLUG" | LC_ALL=C grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die2 "--slug '$SLUG' must match [A-Za-z0-9][A-Za-z0-9._-]* (it names /tmp/<slug>_review.diff)"
+[ -n "$CWD" ] || die2 "--cwd required"
+[ "$(git -C "$CWD" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || die2 "--cwd '$CWD' is not a git working tree"
+
+if [ -n "$BASE$HEAD_REF" ] && [ -n "$FROM$TO" ]; then
+  die2 "pass one range: --base/--head (whole PR) or --from/--to (delta), not both"
+elif [ -n "$BASE" ] && [ -n "$HEAD_REF" ]; then
+  A=$BASE; B=$HEAD_REF; DIFFDOTS="..."; DEFAULT="/tmp/${SLUG}_review.diff"; KIND="whole PR"; TIPFLAG="--head"
+elif [ -n "$FROM" ] && [ -n "$TO" ]; then
+  A=$FROM; B=$TO; DIFFDOTS=".."; DEFAULT="/tmp/${SLUG}_review2.diff"; KIND="delta"; TIPFLAG="--to"
+else
+  die2 "pass --base B --head H (whole PR) or --from F --to T (delta)"
+fi
+OUTP=${OUTP:-$DEFAULT}
+
+A_SHA=$(git -C "$CWD" rev-parse -q --verify "$A^{commit}" 2>/dev/null) || die2 "cannot resolve $A"
+B_SHA=$(git -C "$CWD" rev-parse -q --verify "$B^{commit}" 2>/dev/null) || die2 "cannot resolve $B"
+HERE_SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null) || die2 "$CWD has no commit"
+if [ "$HERE_SHA" != "$B_SHA" ]; then
+  echo "review-package: HEAD of $CWD is $HERE_SHA, not $TIPFLAG $B ($B_SHA); the tree moved off the reviewed tip. Nothing written." >&2
+  exit 3
+fi
+
+TMPF="$OUTP.tmp.$$"
+trap 'rm -f "$TMPF"' EXIT
+(
+  printf '# review package %s (%s): %s %s%s%s, tip %s\n' "$SLUG" "$KIND" "$A_SHA" "$A" "$DIFFDOTS" "$B" "$B_SHA"
+  printf '# git log --oneline %s..%s\n' "$A" "$B"
+  git -C "$CWD" log --oneline "$A_SHA..$B_SHA" || exit 1
+  printf '\n# git diff --stat %s%s%s\n' "$A" "$DIFFDOTS" "$B"
+  git -C "$CWD" diff --stat "$A_SHA$DIFFDOTS$B_SHA" || exit 1
+  printf '\n# git diff -U10 %s%s%s\n' "$A" "$DIFFDOTS" "$B"
+  git -C "$CWD" diff -U10 "$A_SHA$DIFFDOTS$B_SHA" || exit 1
+) >"$TMPF" 2>/dev/null || { echo "review-package: git failed building the package (no merge base for a three-dot diff?); nothing written." >&2; exit 1; }
+mv -f "$TMPF" "$OUTP" || { echo "review-package: cannot write $OUTP" >&2; exit 1; }
+printf '%s %s lines\n' "$OUTP" "$(wc -l <"$OUTP" | tr -d ' ')"
