@@ -17,12 +17,17 @@
 #     messages rotted for 3h23m.
 #   AWAIT COVERAGE (org-relay 1.0; LANES IN FLIGHT ONLY since marketplace#2):
 #     with a lane in flight — a marker line `dispatch <todo> <name>` the relay
-#     holds no `doorbell` ([DONE]) for since, from either key, or a dispatch
-#     line with no key at all — a stop while this agent holds no live
-#     relay_await (GET /status .awaiting, no MCP handshake needed) re-blocks
-#     once with the arm-coverage instruction, the mechanical form of L6. With
-#     every dispatched lane done, coverage is neither asked for nor part of
-#     the fingerprint: an idle orchestrator arms nothing (marketplace#1).
+#     holds no `doorbell` ([DONE]) for since, from either key — a stop while
+#     this agent holds no live relay_await (GET /status .awaiting, no MCP
+#     handshake needed) re-blocks once with the arm-coverage instruction, the
+#     mechanical form of L6. With every dispatched lane done, coverage is
+#     neither asked for nor part of the fingerprint: an idle orchestrator arms
+#     nothing (marketplace#1).
+#   KEYLESS LINES (0.1.6): a dispatch line with no key can never be matched
+#     to a doorbell, so it counts as in flight only while `herdr agent list`
+#     shows a live agent on some other pane; with no worker alive it is done,
+#     never in flight forever (12/12 complete, no worker alive, gate still
+#     demanding an await: skyway #550 session).
 #     Fail-open: an unreachable daemon never blocks a stop; an unreadable
 #     relay DB counts every dispatch as in flight.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -33,10 +38,11 @@ sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 marker="/tmp/claude-herdr-org-lanes-$sid"
 { [ -n "$sid" ] && [ -f "$marker" ]; } || exit 0
 
-backlog=""; me=""; covered=""
+backlog=""; me=""; covered=""; agents_json=""
 relay_db="$HOME/.config/herdr/org-relay/relay.db"
+[ -n "${HERDR_PANE_ID:-}" ] && agents_json=$("${HERDR_BIN_PATH:-herdr}" agent list 2>/dev/null)
 if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$relay_db" ] && command -v sqlite3 >/dev/null 2>&1; then
-  me=$("${HERDR_BIN_PATH:-herdr}" agent list 2>/dev/null | jq -r --arg p "$HERDR_PANE_ID" '.result.agents[]? | select(.pane_id==$p) | .name // empty' 2>/dev/null | head -1)
+  me=$(printf '%s' "$agents_json" | jq -r --arg p "$HERDR_PANE_ID" '.result.agents[]? | select(.pane_id==$p) | .name // empty' 2>/dev/null | head -1)
   if [ -n "$me" ]; then
     me_sql=$(printf '%s' "$me" | sed "s/'/''/g")
     backlog=$(sqlite3 -readonly "$relay_db" "SELECT COUNT(*) FROM messages WHERE recipient='$me_sql' AND consumed_at IS NULL;" 2>/dev/null)
@@ -46,12 +52,17 @@ if [ -n "${HERDR_PANE_ID:-}" ] && [ -f "$relay_db" ] && command -v sqlite3 >/dev
     fi
   fi
 fi
+# Live agents on other panes of this workspace (workers split into the
+# orchestrator's own); empty when herdr was not readable.
+others=""
+[ -n "$agents_json" ] && others=$(printf '%s' "$agents_json" | jq -r --arg p "${HERDR_PANE_ID:-}" --arg w "${HERDR_WORKSPACE_ID:-}" '[.result.agents[]? | select(.pane_id != $p and ($w == "" or .workspace_id == $w))] | length' 2>/dev/null)
 # Each marker line `<ts> dispatch <todo> <name>` is in flight until the relay
 # holds a `doorbell` whose sender is that lane's todo slug or its agent name
 # (`-` = unknown; older lines carry one field or none) stamped at or after the
 # line's own stamp (both ISO-8601 UTC, so string order is time order; a blocker
-# does not end the flight; a re-dispatch is a new line). A line with no key, a
-# failed query, or no readable relay DB: in flight.
+# does not end the flight; a re-dispatch is a new line). A failed query or no
+# readable relay DB: in flight. A line with no key: in flight while another
+# agent is alive (or herdr is unreadable), done once none is.
 in_flight=0
 if grep -Eq ' dispatch( |$)' "$marker" 2>/dev/null; then
   if ! { [ -f "$relay_db" ] && command -v sqlite3 >/dev/null 2>&1; }; then
@@ -66,7 +77,10 @@ if grep -Eq ' dispatch( |$)' "$marker" 2>/dev/null; then
           *) keys="${keys:+$keys,}'$(printf '%s' "$k" | sed "s/'/''/g")'" ;;
         esac
       done
-      [ -n "$keys" ] || { in_flight=1; break; }
+      if [ -z "$keys" ]; then
+        [ "${others:-1}" = "0" ] || { in_flight=1; break; }
+        continue
+      fi
       done_n=$(sqlite3 -readonly "$relay_db" "SELECT COUNT(*) FROM messages WHERE sender IN ($keys) AND kind='doorbell' AND ts >= '$since';" 2>/dev/null </dev/null)
       [ "${done_n:-0}" -gt 0 ] 2>/dev/null || { in_flight=1; break; }
     done < "$marker"

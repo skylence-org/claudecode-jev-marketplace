@@ -5,7 +5,8 @@
 # Usage:
 #   dispatch-worker --name NAME [--kind KIND] [--cwd PATH] [--direction right|down] \
 #                   [--todo SLUG] [--prompt TEXT] [--timeout MS] \
-#                   [--wake-target ORCH] [--beat-note TEXT] [--upgrade-reason TEXT] [--no-gauge] [-- agent-args...]
+#                   [--wake-target ORCH] [--beat-note TEXT] [--upgrade-reason TEXT] [--no-gauge] \
+#                   [--accept-trust] [-- agent-args...]
 #
 # With no --direction, placement is automatic: the first worker splits the
 # orchestrator pane DOWN, later workers split the last live worker pane
@@ -46,6 +47,18 @@
 # After the launch, dispatch-worker waits up to 15s for the agent to reach
 # working and reports submit=launch-arg|launch-arg-unconfirmed in the JSON
 # summary; unconfirmed means read the pane, then reap and re-dispatch (L11).
+# FOLDER TRUST: a lane tree Claude Code has never seen opens on its "Quick
+# safety check ... one you trust?" dialog (trust is per directory; a parent's
+# entry does not inherit). The summary then reports state=trust-prompt and
+# trust=prompt. --accept-trust answers it with content-free keys only, the
+# one L11 exception besides esc: `down` when "No, exit" is selected, then
+# `enter` ONLY once the frame shows "❯ ... Yes, I trust this folder", and
+# reports trust=accepted (trust=unconfirmed: nothing was confirmed).
+# The default pointer carries the exact board command for the lane
+# (env HERDR_ORG_ROOT=<root> <abs>/board), so a worker's skyline-routed
+# shell, which has neither scripts/ on PATH nor HERDR_ORG_ROOT, can paste it.
+# The lane is also appended to this session's org-stop-gate marker, so a
+# dispatch run from inside a script is not invisible to the gate.
 # With --wake-target (or HERDR_ORG_WAKER_TARGET set) and the org-waker herdr
 # plugin installed, the lane is registered so its settle, block, or death
 # rings the conductor (L6); optional --beat-note TEXT is stored with the
@@ -66,6 +79,8 @@ WAKE_TARGET="${HERDR_ORG_WAKER_TARGET:-}"
 BEAT_NOTE=""
 EXTRA_ARGS=""
 NO_GAUGE=0
+ACCEPT_TRUST=0
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 usage() {
   awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"
@@ -90,6 +105,7 @@ while [ "$#" -gt 0 ]; do
     --wake-target) WAKE_TARGET=$2; shift 2 ;;
     --beat-note) BEAT_NOTE=$2; shift 2 ;;
     --no-gauge) NO_GAUGE=1; shift ;;
+    --accept-trust) ACCEPT_TRUST=1; shift ;;
     --) shift; EXTRA_ARGS=$*; break ;;
     -h|--help) usage ;;
     *) echo "dispatch-worker: unknown arg $1" >&2; usage ;;
@@ -170,10 +186,22 @@ if [ -n "$TODO" ] && [ "$NO_GAUGE" -eq 0 ] && [ -x "$TG" ]; then
   fi
 fi
 
+# The worker's board writes silently fall back to ~/.herdr-org/default when
+# this is missing, which reads downstream as "board unavailable" and loses
+# milestones (marketplace#125): fail at spawn time instead. Skyline-routed
+# shells drop the pane env; measure yours once (ps eww -p <claude-pid> |
+# grep '^HERDR_') and pass it via the tool call's env parameter.
+[ -n "${HERDR_ORG_ROOT:-}" ] || {
+  echo "dispatch-worker: HERDR_ORG_ROOT is not set in this process; refusing to spawn a worker whose board writes would land in ~/.herdr-org/default (marketplace#125)." >&2
+  exit 1
+}
+
 # Plain text, never a leading slash: a send that STARTS with a slash command is
 # eaten by Claude's command palette and the task text is silently dropped.
+# BOARD_CMD works as typed in any shell and split on spaces as an argv array.
+BOARD_CMD="env HERDR_ORG_ROOT=$HERDR_ORG_ROOT $HERE/board"
 if [ -z "$PROMPT" ] && [ -n "$TODO" ]; then
-  PROMPT="you own todo ${TODO}. Read the board brief (board get ${TODO}), then invoke the herdr-worker skill and implement it. Report milestones with board comment."
+  PROMPT="you own todo ${TODO}. Your board command, exact for every shell including skyline-routed ones (paste it whole): ${BOARD_CMD}. Read the board brief (${BOARD_CMD} get ${TODO}), then invoke the herdr-worker skill and implement it. Report milestones with ${BOARD_CMD} comment ${TODO} \"...\"."
 fi
 [ -n "$PROMPT" ] || {
   echo "dispatch-worker: --prompt or --todo required" >&2
@@ -223,17 +251,7 @@ if [ -n "$CWD" ]; then
 elif [ -n "${PWD:-}" ]; then
   set -- "$@" --cwd "$PWD"
 fi
-# The worker's board writes silently fall back to ~/.herdr-org/default when
-# this is missing, which reads downstream as "board unavailable" and loses
-# milestones (marketplace#125): fail at spawn time instead. Skyline-routed
-# shells drop the pane env; measure yours once (ps eww -p <claude-pid> |
-# grep '^HERDR_') and pass it via the tool call's env parameter.
-if [ -n "${HERDR_ORG_ROOT:-}" ]; then
-  set -- "$@" --env "HERDR_ORG_ROOT=$HERDR_ORG_ROOT"
-else
-  echo "dispatch-worker: HERDR_ORG_ROOT is not set in this process; refusing to spawn a worker whose board writes would land in ~/.herdr-org/default (marketplace#125)." >&2
-  exit 1
-fi
+set -- "$@" --env "HERDR_ORG_ROOT=$HERDR_ORG_ROOT"
 set -- "$@" --env "PATH=$PATH"
 split_json=$($HERDR "$@")
 pane_id=$(printf '%s\n' "$split_json" | jq -r '.result.pane.pane_id // empty')
@@ -275,6 +293,20 @@ while :; do
   sleep 1
 done
 
+# Lane marker (org-stop-gate.sh): org-lane-mark.sh sees only a dispatch typed
+# into the tool call, never one run from inside a script, so record the lane
+# here too, after the start succeeded. The session is $CLAUDE_CODE_SESSION_ID
+# (the hook's session_id) or, in a shell that dropped it, the pane map the hook
+# keeps; neither found means nothing is recorded. A duplicate of the hook's own
+# line is harmless: one doorbell closes both.
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+if [ -z "$SID" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+  SID=$(cat "/tmp/claude-herdr-org-pane-$(printf '%s' "$HERDR_PANE_ID" | tr -c 'A-Za-z0-9_-' '_')" 2>/dev/null) || SID=""
+fi
+if [ -n "$SID" ]; then
+  printf '%s dispatch %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TODO:--}" "$NAME" >> "/tmp/claude-herdr-org-lanes-$SID" 2>/dev/null || true
+fi
+
 # L18: label the pane too. The agent name carries sidebar identity while the
 # agent lives; the pane label outlives it, so a reaped lane stays legible.
 $HERDR pane rename "$pane_id" "${NAME}${TODO:+: $TODO}" >/dev/null 2>&1 || true
@@ -291,19 +323,56 @@ if [ -n "$WAKE_TARGET" ] && [ -x "$WCTL" ] && "$WCTL" present 2>/dev/null; then
 fi
 
 # The pointer rode the launch args; there is nothing to type and nothing to
-# recover (L11). Confirm the session actually started processing it.
+# recover (L11). Confirm the session actually started processing it. A
+# session that never reached working may be parked on the folder-trust dialog.
 SUBMIT="launch-arg"
-$HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1 || SUBMIT="launch-arg-unconfirmed"
+TRUST="none"
+read_frame() { $HERDR agent read "$NAME" --source visible --lines 40 --format text 2>/dev/null || true; }
+trust_yes() { printf '%s\n' "$1" | grep -q '❯.*Yes, I trust this folder'; }
+if ! $HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1; then
+  SUBMIT="launch-arg-unconfirmed"
+  frame=$(read_frame)
+  case "$frame" in
+    *"trust this folder"*|*"one you trust"*)
+      TRUST="prompt"
+      if [ "$ACCEPT_TRUST" -eq 1 ]; then
+        if ! trust_yes "$frame"; then
+          $HERDR agent send-keys "$NAME" down >/dev/null 2>&1 || true
+          frame=$(read_frame)
+        fi
+        if trust_yes "$frame"; then
+          $HERDR agent send-keys "$NAME" enter >/dev/null 2>&1 || true
+          TRUST="accepted"
+          $HERDR agent wait "$NAME" --until working --timeout 15000 >/dev/null 2>&1 && SUBMIT="launch-arg"
+        else
+          TRUST="unconfirmed"
+        fi
+      fi
+      ;;
+  esac
+fi
 
 # Report the state the caller should sanity-check instead of assuming the
 # send landed.
 state=$($HERDR agent get "$NAME" 2>/dev/null | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null || echo unknown)
+case "$TRUST" in
+  prompt)
+    state="trust-prompt"
+    echo "dispatch-worker: $NAME is parked on Claude Code's folder-trust dialog for ${CWD:-$PWD} (trust is per directory; a parent's entry does not inherit). Reap and re-dispatch with --accept-trust, or trust the folder once by hand." >&2
+    ;;
+  unconfirmed)
+    state="trust-prompt"
+    echo "dispatch-worker: --accept-trust sent down but the frame never showed the selected \"Yes, I trust this folder\" line, so enter was NOT sent; read the pane (herdr agent read $NAME --source visible)." >&2
+    ;;
+esac
 
 BOARD=""
 if command -v board >/dev/null 2>&1; then
   BOARD="board"
 elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -x "$CLAUDE_PLUGIN_ROOT/scripts/board" ]; then
   BOARD="$CLAUDE_PLUGIN_ROOT/scripts/board"
+elif [ -x "$HERE/board" ]; then
+  BOARD="$HERE/board"
 fi
 if [ -n "$TODO" ] && [ -n "$BOARD" ]; then
   # Silenced: stdout is the JSON summary contract, board chatter must not join it.
@@ -314,7 +383,7 @@ if [ -n "$TODO" ] && [ -n "$BOARD" ]; then
   [ -n "$GAUGE" ] && { "$BOARD" comment "$TODO" "**[$GAUGE]** at dispatch of $NAME" >/dev/null || true; }
 fi
 
-printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s}\n' \
+printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effort":%s,"advisor":%s,"defaulted":%s,"upgrade":%s,"gauge":%s,"waker":%s,"submit":%s,"trust":%s}\n' \
   "$(printf '%s' "$NAME" | jq -Rs .)" \
   "$(printf '%s' "$pane_id" | jq -Rs .)" \
   "$(printf '%s' "$KIND" | jq -Rs .)" \
@@ -327,4 +396,5 @@ printf '{"agent":%s,"pane_id":%s,"kind":%s,"todo":%s,"state":%s,"model":%s,"effo
   "$(printf '%s' "$MARKERS" | jq -Rs .)" \
   "$(printf '%s' "$GAUGE" | jq -Rs .)" \
   "$(printf '%s' "$WAKER" | jq -Rs .)" \
-  "$(printf '%s' "$SUBMIT" | jq -Rs .)"
+  "$(printf '%s' "$SUBMIT" | jq -Rs .)" \
+  "$(printf '%s' "$TRUST" | jq -Rs .)"

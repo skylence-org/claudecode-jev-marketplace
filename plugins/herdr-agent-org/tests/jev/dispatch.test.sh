@@ -2,9 +2,11 @@
 # dispatch.test.sh: dispatch-worker's decision paths against a stubbed herdr
 # and a real filesystem board. No live herdr, no key, no tokens.
 #
-# The stub answers the five herdr calls dispatch-worker makes with canned
-# JSON and records every invocation, so the suite can assert both the exit
-# code and that no composer send (`agent prompt`, `pane run`) ever happens.
+# The stub answers the herdr calls dispatch-worker makes with canned JSON and
+# records every invocation, so the suite can assert both the exit code and
+# that no composer send (`agent prompt`, `pane run`) ever happens. With
+# HERDR_STUB_TRUST=1 the fresh session sits on Claude Code's folder-trust
+# dialog ("No, exit" selected) until an `enter` follows a `down`.
 #
 # Run: bash plugins/herdr-agent-org/tests/jev/dispatch.test.sh
 set -uo pipefail
@@ -19,7 +21,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"; mkdir -p "$HOME/.claude"
 export TMPDIR="$TMP"
-unset TYPESAFE_API_KEY JEV_DISABLE 2>/dev/null || true
+unset TYPESAFE_API_KEY JEV_DISABLE CLAUDE_CODE_SESSION_ID HERDR_ORG_WAKER_TARGET 2>/dev/null || true
 export JEV_AUDIT_FILE="$TMP/audit.jsonl"
 
 PASS=0; FAIL=0
@@ -36,7 +38,10 @@ case "$1 $2" in
   "pane list")   echo '{"result":{"panes":[]}}' ;;
   "pane split")  echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
   "agent start") echo '{"result":{"ok":true}}' ;;
-  "agent wait")  exit 0 ;;
+  "agent wait")  [ -n "${HERDR_STUB_TRUST:-}" ] && ! grep -q 'send-keys .* enter$' "$HERDR_STUB_LOG" && exit 1; exit 0 ;;
+  "agent read")
+    echo 'Quick safety check: Is this a project you created or one you trust?'
+    if [ "${HERDR_STUB_TRUST:-}" != stuck ] && grep -q 'send-keys .* down$' "$HERDR_STUB_LOG"; then printf '❯ Yes, I trust this folder\n  No, exit\n'; else printf '  Yes, I trust this folder\n❯ No, exit\n'; fi ;;
   "agent get")   echo '{"result":{"agent":{"agent_status":"working"}}}' ;;
   "pane rename") exit 0 ;;
   *)             exit 0 ;;
@@ -66,6 +71,8 @@ if [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'refused by tier-gauge' && [ ! 
 JEV_STUB_ANSWERS="$(stub "$ANS_ORD")" dw --name lane-a --todo lane-a -- --permission-mode bypassPermissions
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.model == "sonnet" and .submit == "launch-arg" and (.gauge | test("tier=ordinary"))' >/dev/null; then ok "sonnet default: dispatched, gauge verdict in the JSON summary"; else bad "dispatch" "rc=$RC out=$OUT err=$ERR"; fi
 grep -q 'agent start lane-a --kind claude --pane w1:p9' "$HERDR_STUB_LOG" && grep -q 'you own todo lane-a' "$HERDR_STUB_LOG" && ok "pointer rode the launch arguments" || bad "launch arg" "$(cat "$HERDR_STUB_LOG")"
+grep -qF "env HERDR_ORG_ROOT=$HERDR_ORG_ROOT $PLUGIN/scripts/board get lane-a" "$HERDR_STUB_LOG" && ok "pointer carries the exact board command (absolute script, HERDR_ORG_ROOT)" || bad "board command" "$(grep 'agent start' "$HERDR_STUB_LOG")"
+printf '%s' "$OUT" | jq -e '.trust == "none"' >/dev/null && ok "no trust dialog: trust=none" || bad "trust none" "out=$OUT"
 if ! grep -qE 'agent prompt|pane run|send-keys' "$HERDR_STUB_LOG"; then ok "no composer send of any kind (L11)"; else bad "composer" "$(cat "$HERDR_STUB_LOG")"; fi
 sh "$PLUGIN/scripts/board" get lane-a | grep -q 'TIER-GAUGE: jev-1.13.0 tier=ordinary' && ok "gauge verdict filed on the todo" || bad "filing" "$(sh "$PLUGIN/scripts/board" get lane-a | tail -5)"
 sh "$PLUGIN/scripts/board" get lane-a --json | jq -e '.status == "in_progress" and .owner == "lane-a"' >/dev/null && ok "todo owned and in_progress" || bad "board state" "$(sh "$PLUGIN/scripts/board" get lane-a --json)"
@@ -85,6 +92,17 @@ JEV_STUB_ANSWERS="$(stub "$ANS_ORD")" dw --name lane-a --todo lane-a --no-gauge 
 dw --name 'Bad Name' --todo lane-a
 [ $RC -eq 2 ] && ok "invalid agent name: usage error" || bad "name" "rc=$RC"
 
+HERDR_STUB_TRUST=1 dw --name lane-a --todo lane-a --no-gauge -- --permission-mode bypassPermissions
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.state == "trust-prompt" and .trust == "prompt" and .submit == "launch-arg-unconfirmed"' >/dev/null && printf '%s' "$ERR" | grep -q -- '--accept-trust' && ! grep -q 'send-keys' "$HERDR_STUB_LOG"; then ok "trust dialog without --accept-trust: state=trust-prompt, hint, no key sent"; else bad "trust prompt" "rc=$RC out=$OUT err=$ERR log=$(cat "$HERDR_STUB_LOG")"; fi
+
+HERDR_STUB_TRUST=1 dw --name lane-a --todo lane-a --no-gauge --accept-trust -- --permission-mode bypassPermissions
+keys=$(grep 'send-keys' "$HERDR_STUB_LOG" | awk '{print $NF}' | tr '\n' ' ')
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.trust == "accepted" and .submit == "launch-arg" and .state == "working"' >/dev/null && [ "$keys" = "down enter " ]; then ok "--accept-trust: down, verified ❯ Yes, enter; trust=accepted, submit confirmed"; else bad "accept trust" "rc=$RC out=$OUT keys=$keys"; fi
+if ! grep -qE 'agent prompt|pane run' "$HERDR_STUB_LOG" && ! grep 'send-keys' "$HERDR_STUB_LOG" | grep -qvE ' (down|enter)$'; then ok "trust path sends content-free keys only (L11 exception)"; else bad "trust keys" "$(cat "$HERDR_STUB_LOG")"; fi
+
+HERDR_STUB_TRUST=stuck dw --name lane-a --todo lane-a --no-gauge --accept-trust -- --permission-mode bypassPermissions
+keys=$(grep 'send-keys' "$HERDR_STUB_LOG" | awk '{print $NF}' | tr '\n' ' ')
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.trust == "unconfirmed" and .state == "trust-prompt"' >/dev/null && [ "$keys" = "down " ]; then ok "--accept-trust, Yes never selected: enter NOT sent, trust=unconfirmed"; else bad "trust stuck" "rc=$RC out=$OUT keys=$keys"; fi
 echo
 echo "dispatch-worker: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1
