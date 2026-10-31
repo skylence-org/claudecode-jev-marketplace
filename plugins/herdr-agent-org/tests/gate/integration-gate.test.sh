@@ -84,7 +84,7 @@ echo "--- integration-gate ---------------------------------------------------"
 mkrepos r1
 TIP=$(git -C "$TMP/r1" rev-parse HEAD); before=$(snap "$TMP/r1")
 ig --slug "$SLUG" --cwd "$TMP/r1" --cmd true --cmd "test -f b.txt"
-if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q '^true rc=0$' && printf '%s' "$OUT" | grep -q '^test -f b.txt rc=0$' && printf '%s' "$OUT" | grep -q "^GATE-DONE $SLUG tip=$TIP merged=none failed=0 known=0$" && [ "$(snap "$TMP/r1")" = "$before" ]; then ok "clean pass: rc lines, GATE-DONE merged=none, exit 0, tree untouched"; else bad "clean pass" "rc=$RC out=$OUT err=$ERR"; fi
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q '^true rc=0$' && printf '%s' "$OUT" | grep -q '^test -f b.txt rc=0$' && printf '%s' "$OUT" | grep -q "^GATE-DONE $SLUG tip=$TIP merged=none restore=ok failed=0 known=0$" && [ "$(snap "$TMP/r1")" = "$before" ]; then ok "clean pass: rc lines, GATE-DONE merged=none restore=ok, exit 0, tree untouched"; else bad "clean pass" "rc=$RC out=$OUT err=$ERR"; fi
 [ -e "/tmp/gate_${SLUG}_1.log" ] && [ -e "/tmp/gate_${SLUG}_2.log" ] && ok "each command logged to /tmp/gate_<slug>_<n>.log" || bad "logs" "$(ls /tmp/gate_"${SLUG}"_* 2>&1)"
 
 : >"$TMP/r1/.skyrift-workspace"
@@ -139,11 +139,11 @@ echo "--- notify / comment / usage --------------------------------------------"
 : >"$TMP/relay.log"
 ig --slug "$SLUG" --cwd "$TMP/r1" --cmd 'exit 1' --notify orch-x
 R=$(cat "$TMP/relay.log")
-if [ $RC -eq 1 ] && printf '%s' "$R" | grep -q '^send ' && printf '%s' "$R" | grep -q -- '--to orch-x' && printf '%s' "$R" | grep -q -- '--kind job' && printf '%s' "$R" | grep -q "$SLUG" && printf '%s' "$R" | grep -q 'rc=1'; then ok "--notify: relay-ctl send --to <agent> --kind job, body names slug and rc"; else bad "notify" "rc=$RC relay=$R err=$ERR"; fi
+if [ $RC -eq 1 ] && printf '%s' "$R" | grep -q '^send ' && printf '%s' "$R" | grep -q -- '--to orch-x' && printf '%s' "$R" | grep -q -- '--kind job' && printf '%s' "$R" | grep -q "$SLUG" && printf '%s' "$R" | grep -q 'rc=1' && printf '%s' "$R" | grep -q ' restore=ok '; then ok "--notify: relay-ctl send --to <agent> --kind job, body names slug, rc and restore=ok"; else bad "notify" "rc=$RC relay=$R err=$ERR"; fi
 ig_norelay --slug "$SLUG" --cwd "$TMP/r1" --cmd true --notify orch-x
 [ $RC -eq 0 ] && printf '%s' "$ERR" | grep -q 'relay-ctl' && printf '%s' "$OUT" | grep -q '^GATE-DONE' && ok "--notify with no relay-ctl on PATH: warns only, exit unchanged" || bad "no relay-ctl" "rc=$RC out=$OUT err=$ERR"
 ig --slug "$SLUG" --cwd "$TMP/r1" --cmd true --comment
-sh "$PLUGIN/scripts/board" get "$SLUG" | grep -q "\[GATE $SLUG rc=0\]" && ok "--comment: one-line [GATE <slug> rc=N] filed on the todo" || bad "comment" "$(sh "$PLUGIN/scripts/board" get "$SLUG" | tail -3)"
+sh "$PLUGIN/scripts/board" get "$SLUG" | grep -q "\[GATE $SLUG rc=0\]\*\* .* restore=ok " && ok "--comment: one-line [GATE <slug> rc=N] filed on the todo, restore=ok in it" || bad "comment" "$(sh "$PLUGIN/scripts/board" get "$SLUG" | tail -3)"
 
 ig --cwd "$TMP/r1" --cmd true
 [ $RC -eq 2 ] && ok "no --slug: usage error (exit 2)" || bad "no slug" "rc=$RC"
@@ -280,6 +280,8 @@ yes|make: *** [t] Hangup: 1
 yes|make: *** [t] User defined signal 1: 30
 yes|make: *** [t] Error 130
 yes|/bin/sh: line 1: 35112 Segmentation fault: 11  ./crasher
+yes|sh: line 1:  8319 Segmentation fault: 11  ./crasher
+yes|bash: line 1:   812 Killed: 9  ./crasher
 yes|bash: line 1: 4242 Aborted                 (core dumped) ./crasher
 yes|run.sh: line 7: 4242 Trace/breakpoint trap   ./crasher
 yes|sh: 1: 4242 Killed
@@ -433,6 +435,55 @@ mkrepos r19
 gitwrap "$TMP/fail-co" '"checkout -q -f feat"*' 'exit 1'
 OUT=$(PATH="$TMP/fail-co:$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r19" --cmd true 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err")
 [ $RC -eq 1 ] && [ "$(printf '%s\n' "$OUT" | grep -c '^RESTORE MISMATCH:')" = 1 ] && printf '%s\n' "$OUT" | grep -q '^RESTORE MISMATCH: .*detached' && ! printf '%s' "$OUT" | grep -q '^RESTORED:' && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG " && ok "a restore the verifier cannot confirm: one RESTORE MISMATCH: line naming what differs, exit 1, never a RESTORED: line" || bad "restore mismatch" "rc=$RC out=$OUT err=$ERR"
+
+echo "--- round 3: the safety net, D2, the verifier's merge check, the hints (I-4 m-1 m-3 m-6) --"
+# ig_pre_wait PREFIX SIG ARGS...: the gate with PREFIX first on PATH, in the
+# background; SIG is sent once its first command is running.
+ig_pre_wait() {
+  local pre=$1 sig=$2 log1="/tmp/gate_${SLUG}_1.log" pid i=0
+  shift 2
+  [ -e "$log1" ] && ls -la "$log1" >/dev/null && rm -f "$log1"
+  PATH="$pre:$STUBBIN:$BASEPATH" $IG_SH "$IG" "$@" >"$TMP/bg.out" 2>"$TMP/bg.err" &
+  pid=$!
+  while [ ! -e "$log1" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  sleep 0.3
+  kill -"$sig" "$pid"
+  wait "$pid"; RC=$?
+  OUT=$(cat "$TMP/bg.out"); ERR=$(cat "$TMP/bg.err")
+}
+mkrepos r33
+gitwrap "$TMP/fail-stashref" '*"/stash "*' 'exit 1'
+OUT=$(PATH="$TMP/fail-stashref:$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r33" --cmd 'echo gate-edit >> a.txt' 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err")
+if [ $RC -eq 1 ] && grep -q gate-edit "$TMP/r33/a.txt" && ! git -C "$TMP/r33" symbolic-ref -q HEAD >/dev/null && [ "$(printf '%s\n' "$OUT" | grep -c '^RESTORE MISMATCH:')" = 1 ] \
+   && printf '%s\n' "$OUT" | grep -q '^RESTORE MISMATCH: .*nothing was put back because the tracked changes could not be stashed' && ! printf '%s' "$OUT" | grep -q '^RESTORED:'; then
+  ok "R2: the stash ref cannot be written: nothing is put back (the tracked edit is still in the tree, HEAD still detached), one RESTORE MISMATCH:, exit 1"
+else bad "R2 failed preserve puts nothing back" "rc=$RC a.txt=$(tr '\n' '|' <"$TMP/r33/a.txt") head=$(git -C "$TMP/r33" symbolic-ref -q HEAD) out=$OUT err=$ERR"; fi
+git -C "$TMP/r33" checkout -q -f feat
+mkrepos r34
+gitwrap "$TMP/fail-co-say" '"checkout -q -f feat"*' 'echo "checkout refused: simulated" >&2; exit 1'
+: >"$TMP/relay.log"
+ig_pre_wait "$TMP/fail-co-say" TERM --slug "$SLUG" --cwd "$TMP/r34" --cmd 'sleep 3' --notify orch-x --comment
+if [ $RC -eq 143 ] && [ "$(printf '%s\n' "$OUT" | grep -c '^RESTORE MISMATCH:')" = 1 ] && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG .* restore=mismatch " \
+   && grep -q 'rc=143 .* restore=mismatch ' "$TMP/relay.log" && sh "$PLUGIN/scripts/board" get "$SLUG" | grep -q "\[GATE $SLUG rc=143\]\*\* .* restore=mismatch " \
+   && printf '%s' "$ERR" | grep -q 'checkout refused: simulated'; then
+  ok "R1 m-1 m-6: TERM mid-command, then the put-back checkout fails: exit 143 kept, one RESTORE MISMATCH:, restore=mismatch on GATE-DONE, --notify and --comment, git's reason on stderr"
+else bad "R1 signal plus mismatch" "rc=$RC out=$OUT err=$ERR relay=$(cat "$TMP/relay.log")"; fi
+git -C "$TMP/r34" checkout -q -f feat
+prep_other r35
+gitwrap "$TMP/noop-abort-co" '*"merge --abort"*|*"checkout -q -f feat"*' 'exit 0'
+OUT=$(PATH="$TMP/noop-abort-co:$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r35" --cmd 'git merge -q --no-ff --no-commit other >/dev/null 2>&1; true' 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err")
+if [ $RC -eq 1 ] && [ "$(printf '%s\n' "$OUT" | grep -c '^RESTORE MISMATCH:')" = 1 ] && printf '%s\n' "$OUT" | grep -q '^RESTORE MISMATCH: .*a merge is in progress' \
+   && git -C "$TMP/r35" show "refs/integration-gate/$SLUG/stash:o.txt" >/dev/null 2>&1; then
+  ok "R3: the abort and the checkout both do nothing: the verifier reports a merge in progress (one RESTORE MISMATCH:, exit 1), the merge's work kept under the stash ref"
+else bad "R3 verifier merge check" "rc=$RC out=$OUT err=$ERR"; fi
+git -C "$TMP/r35" merge --abort 2>/dev/null; git -C "$TMP/r35" checkout -q -f feat
+mkrepos r36; move_main r36 m.txt "from main"; FEAT=$(git -C "$TMP/r36" rev-parse feat)
+gitwrap "$TMP/fail-keep" '*"update-ref --create-reflog"*' 'exit 1'
+OUT=$(PATH="$TMP/fail-keep:$STUBBIN:$BASEPATH" $IG_SH "$IG" --slug "$SLUG" --cwd "$TMP/r36" --cmd 'git checkout -q feat && git commit -q --allow-empty -m gate-on-feat' 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err")
+HINT=$(printf '%s\n' "$OUT" | sed -n 's/^RESTORE MISMATCH: .*; put .* back with: //p')
+if [ $RC -eq 1 ] && [ "$HINT" = "git update-ref refs/heads/feat $FEAT && git checkout -f feat" ] && (cd "$TMP/r36" && sh -c "$HINT" >/dev/null 2>&1) && [ "$(git -C "$TMP/r36" rev-parse feat)" = "$FEAT" ] && [ "$(git -C "$TMP/r36" symbolic-ref -q HEAD)" = refs/heads/feat ]; then
+  ok "m-3: the lane branch moved and could not be kept: the hint resets the branch to its SHA before checking it out, and following it restores feat"
+else bad "m-3 moved-branch hint" "rc=$RC hint=$HINT feat=$(git -C "$TMP/r36" rev-parse feat) want=$FEAT out=$OUT err=$ERR"; fi
 
 echo
 echo "integration-gate: $PASS passed, $FAIL failed"

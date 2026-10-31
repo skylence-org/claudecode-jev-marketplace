@@ -73,13 +73,16 @@
 #    stash calls run with the lane's hooks off.
 #    `RESTORED: <found>; put back to <branch> at <sha>; kept: <...>`
 #    prints only when the verifier confirms it; otherwise
-#    `RESTORE MISMATCH: <what differs>` prints and the gate fails.
+#    `RESTORE MISMATCH: <what differs>; put <tree> back with: <command>`
+#    prints and the gate fails; the command resets a moved lane branch to
+#    its SHA before checking it out. GATE-DONE, --notify and --comment then
+#    carry restore=mismatch (restore=ok otherwise).
 # 6. --comment files `**[GATE <slug> rc=N]** ...` on todo <slug> (board CLI);
 #    --notify AGENT ends with `relay-ctl send --to AGENT --kind job` so a
 #    background gate wakes the orchestrator instead of being polled (L12). A
 #    missing board or relay-ctl only warns.
 # Last stdout line: GATE-DONE <slug> tip=<sha> merged=<sha|none|conflict|failed>
-# failed=<n> known=<n>.
+# restore=<ok|mismatch> failed=<n> known=<n>.
 # Exit: 0 no unknown failure, 1 failures or a RESTORE MISMATCH, 2 usage or a
 # merge that failed without a conflict, 3 merge conflict, 129/130/143 on
 # HUP/INT/TERM.
@@ -197,7 +200,7 @@ restore() {
       elif [ "$ref_sha" != "$ORIG_SHA" ]; then
         gid update-ref -m "integration-gate $SLUG: put back" "$ORIG_REF" "$ORIG_SHA" "$ref_sha" 2>/dev/null
       fi
-      git checkout -q -f "$ORIG_NAME" -- 2>/dev/null || git checkout -q -f "$ORIG_NAME" 2>/dev/null
+      git checkout -q -f "$ORIG_NAME" -- 2>/dev/null || git checkout -q -f "$ORIG_NAME"
     else
       git checkout -q -f --detach "$ORIG_SHA" 2>/dev/null
     fi
@@ -207,6 +210,7 @@ restore() {
   have_sha=$(git rev-parse -q --verify HEAD 2>/dev/null) || have_sha=""
   [ "$have_ref" = "$ORIG_REF" ] || bad="HEAD is ${have_ref:-detached}, want ${ORIG_REF:-detached}"
   [ "$have_sha" = "$ORIG_SHA" ] || bad="${bad:+$bad; }HEAD at ${have_sha:-nothing}, want $ORIG_SHA"
+  have_ref_sha=""
   if [ -n "$ORIG_REF" ]; then
     have_ref_sha=$(git rev-parse -q --verify "$ORIG_REF" 2>/dev/null) || have_ref_sha=""
     [ "$have_ref_sha" = "$ORIG_SHA" ] || bad="${bad:+$bad; }$ORIG_NAME at ${have_ref_sha:-nothing}, want $ORIG_SHA"
@@ -220,15 +224,18 @@ restore() {
     [ -z "$found" ] || printf 'RESTORED: %s; put back to %s at %s%s\n' "$found" "$ORIG_NAME" "$ORIG_SHA" "${kept:+; kept: $kept}"
   else
     [ "$RC" -ne 0 ] || RC=1
-    hint=$ORIG_SHA; [ -z "$ORIG_REF" ] || hint=$ORIG_NAME
-    printf 'RESTORE MISMATCH: %s%s%s; put %s back with: git checkout %s\n' "$bad" "${found:+ (found: $found)}" "${kept:+; kept: $kept}" "$CWD" "$hint"
+    RESTORE_STATE=mismatch
+    if [ -z "$ORIG_REF" ]; then hint="git checkout $ORIG_SHA"
+    elif [ "$have_ref_sha" != "$ORIG_SHA" ]; then hint="git update-ref $ORIG_REF $ORIG_SHA && git checkout -f $ORIG_NAME"
+    else hint="git checkout $ORIG_NAME"; fi
+    printf 'RESTORE MISMATCH: %s%s%s; put %s back with: %s\n' "$bad" "${found:+ (found: $found)}" "${kept:+; kept: $kept}" "$CWD" "$hint"
     REPORTED=1
   fi
 }
 # A mismatch is reported once; the EXIT trap after finish does not retry it.
 trap '[ "$REPORTED" -eq 1 ] || restore' EXIT
 
-FAILED_N=0; KNOWN_N=0; MERGED=none; FINISHING=0
+FAILED_N=0; KNOWN_N=0; MERGED=none; FINISHING=0; RESTORE_STATE=ok
 
 finish() {
   FINISHING=1
@@ -237,7 +244,7 @@ finish() {
     B=""
     if command -v board >/dev/null 2>&1; then B=board; elif [ -x "$HERE/board" ]; then B="$HERE/board"; fi
     if [ -n "$B" ]; then
-      "$B" comment "$SLUG" "**[GATE $SLUG rc=$RC]** tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N base=$BASE" >/dev/null 2>&1 \
+      "$B" comment "$SLUG" "**[GATE $SLUG rc=$RC]** tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N base=$BASE" >/dev/null 2>&1 \
         || warn "--comment: board comment $SLUG failed (HERDR_ORG_ROOT=${HERDR_ORG_ROOT:-unset})"
     else
       warn "--comment: no board CLI found; nothing filed"
@@ -246,13 +253,13 @@ finish() {
   if [ -n "$NOTIFY" ]; then
     if command -v relay-ctl >/dev/null 2>&1; then
       relay-ctl send --to "$NOTIFY" --kind job --sender integration-gate --lane "$SLUG" \
-        --body "gate $SLUG rc=$RC tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N" >/dev/null 2>&1 \
+        --body "gate $SLUG rc=$RC tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N" >/dev/null 2>&1 \
         || warn "--notify: relay-ctl send to $NOTIFY failed; nothing was queued"
     else
       warn "--notify: relay-ctl not on PATH; $NOTIFY was not woken"
     fi
   fi
-  echo "GATE-DONE $SLUG tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N"
+  echo "GATE-DONE $SLUG tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N"
   exit "$RC"
 }
 # A signal runs the whole finish, so a killed background gate still restores
@@ -316,7 +323,6 @@ if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
     finish
   fi
 fi
-RUN_SHA=${RUN_SHA:-$(git rev-parse HEAD)}
 RUN_SHA=$(git rev-parse HEAD)
 
 if [ -z "$CMDS" ]; then
@@ -345,14 +351,15 @@ fi
 #     ...) and Error 126-255. An `(ignored)` error carries no `***`, and an
 #     `Error N (ignored)` tail is never a crash;
 #   a shell's job report of a crashed child, anchored on the pid:
-#     `[<prog>: ][line N: ]<pid> <signal>[: N]`, the command after it;
+#     `[<prog>: ][line N: ]<pid> <signal>[: N]`, the command after it; bash
+#     pads the pid to five columns (`line 1:  8319 Segmentation fault`);
 #   dash's bare report, the whole line: `<signal>[: N][ (core dumped)]`;
 #   `(core dumped)` anywhere;
 #   a runtime's signal tag: Go `[signal SIGSEGV`, Rust `signal: 11, SIGSEGV`.
 # <signal> is the macOS and the Linux strsignal text of SEGV, BUS, ILL, ABRT,
 # FPE, TRAP, KILL and TERM. A line that merely mentions a signal name
 # ("installing SIGSEGV handler", "ok 4 - prints Abort trap") matches none.
-CRASH_RE='^[^ ]*make(\[[0-9]+\])?: \*\*\* \[[^]]*\] ([^E]|E[^r]|Er[^r]|Err[^o]|Erro[^r]|Error[^ ]|Error [^0-9]|Error (12[6-9]|1[3-9][0-9]|[2-9][0-9][0-9]|[0-9][0-9][0-9][0-9]+)$)|^(.*: )?(line [0-9]+: )?[0-9]+ (Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?|^(Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?( \(core dumped\))?$|\(core dumped\)|\[signal SIG[A-Z]+|signal: [0-9]+, SIG[A-Z]+'
+CRASH_RE='^[^ ]*make(\[[0-9]+\])?: \*\*\* \[[^]]*\] ([^E]|E[^r]|Er[^r]|Err[^o]|Erro[^r]|Error[^ ]|Error [^0-9]|Error (12[6-9]|1[3-9][0-9]|[2-9][0-9][0-9]|[0-9][0-9][0-9][0-9]+)$)|^(.*: )?(line [0-9]+: )? *[0-9]+ (Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?|^(Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?( \(core dumped\))?$|\(core dumped\)|\[signal SIG[A-Z]+|signal: [0-9]+, SIG[A-Z]+'
 
 is_known() {
   [ -n "$KNOWN" ] || return 1
