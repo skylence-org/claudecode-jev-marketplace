@@ -137,8 +137,12 @@ queue, never instead of it:
 - relay_consume(agent, ids) — mark handled AFTER acting.
 - relay_await(agent, timeout_s?, after_id?) — task-backed coverage; see the
   wake model. after_id defers known messages (rule 5).
-- relay_status() — queues per recipient + `awaiting` (live coverage) +
-  nudge state. Non-empty queues with empty awaiting = deaf org, right now.
+- relay_status() — queues per recipient (count, oldest_age_s, awaiting,
+  agent_live, last_seen_s) + `awaiting` (live coverage) + nudge state +
+  the daemon's build. Non-empty queues with empty awaiting = deaf org, right
+  now; an old queue nobody awaits, herdr does not list and the daemon has
+  not seen is an orphan: the OPERATOR purges it with `relay-ctl purge`
+  (lists first, deletes only with --delete), never a role, never on a timer.
 - relay_guide() — this text; reading it (or the relay://guide resource)
   unlocks the messaging tools for this session.
 - relay_audit_tail(stream?, limit?) — audit = message lifecycle with wake

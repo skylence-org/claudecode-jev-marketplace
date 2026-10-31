@@ -195,12 +195,15 @@ fn tool_defs() -> Value {
              "audit": {"type": "object"}, "access": {"type": "object"},
              "max_log_bytes": {"type": "integer"}}}},
         {"name": "relay_status",
-         "description": "Unconsumed message counts per recipient, the db path, which recipients currently hold live await coverage in this daemon (awaiting; in-call and task-backed holds both count), the nudge watchdog state, and the daemon's own build (version, git sha, dirty flag, origin remote, source dir) so an installed binary can be matched to the repo that built it. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for. Never guide-gated.",
+         "description": "Per recipient queue: unconsumed count, oldest message stamp and age (oldest_age_s), whether that recipient holds live await coverage right now (awaiting), whether the herdr live-agent snapshot lists it (agent_live; null = no fresh evidence), and seconds since this daemon last heard from it (last_seen_s; in-memory, null since a restart). Plus the db path, the awaiting list (in-call and task-backed holds both count), the nudge watchdog state, and the daemon's own build (version, git sha, dirty flag, origin remote, source dir) so an installed binary can be matched to the repo that built it. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for; an old queue with awaiting false, agent_live false and no recent last_seen_s is an orphan (relay-ctl purge, operator-only). Never guide-gated.",
          "inputSchema": {"type": "object", "properties": {}},
          "outputSchema": {"type": "object", "properties": {
              "db": {"type": "string"},
              "queues": {"type": "array", "items": {"type": "object", "properties": {
-                 "recipient": {"type": "string"}, "unconsumed": {"type": "integer"}}}},
+                 "recipient": {"type": "string"}, "unconsumed": {"type": "integer"},
+                 "oldest_ts": {"type": "string"}, "oldest_age_s": {"type": ["integer", "null"]},
+                 "awaiting": {"type": "boolean"}, "agent_live": {"type": ["boolean", "null"]},
+                 "last_seen_s": {"type": ["integer", "null"]}}}},
              "awaiting": {"type": "array", "items": {"type": "string"}},
              "build": {"type": "object", "properties": {
                  "version": {"type": "string"}, "sha": {"type": "string"},

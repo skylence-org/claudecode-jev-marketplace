@@ -1,5 +1,5 @@
 #!/bin/sh
-# relay-ctl: start/stop/status/run/install-daemon/rollback/send for the org-relay
+# relay-ctl: start/stop/status/run/install-daemon/rollback/send/purge for the org-relay
 # MCP server. install-daemon is the production path: it refuses a dirty tree,
 # copies the release binary to a VERSIONED slot outside the repo, repoints the
 # `current` symlink, restarts launchd, and verifies the served sha matches the
@@ -177,6 +177,63 @@ case "${1:-status}" in
       [ -n "${PID:-}" ] && kill "$PID" && echo "org-relay: stopped (pid $PID)" || echo "org-relay: not running"
     fi
     ;;
+  purge)
+    # ORPHANED QUEUES (1.5.0), operator-only: a message for an agent nobody
+    # will ever be again (a peer org's agent, a reaped lane) sits unconsumed
+    # forever. relay_status shows the shape (old oldest_age_s, awaiting false,
+    # agent_live false, no last_seen_s); this removes it by hand. LISTING is
+    # the default (--dry-run says so explicitly); only --delete removes, and
+    # it removes exactly the ids it listed. Never run automatically. Writes
+    # the db directly (sqlite3, WAL-safe with a busy timeout) and appends a
+    # purge event to the audit stream beside it.
+    shift
+    P_RCPT=""; P_AGE=""; P_DELETE=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --dry-run) shift; continue ;;
+        --delete) P_DELETE=1; shift; continue ;;
+      esac
+      [ "$#" -ge 2 ] || { echo "relay-ctl purge: $1 needs a value" >&2; exit 2; }
+      case "$1" in
+        --recipient) P_RCPT=$2 ;;
+        --older-than) P_AGE=$2 ;;
+        *) echo "relay-ctl purge: unknown argument $1" >&2; exit 2 ;;
+      esac
+      shift 2
+    done
+    usage_p="usage: relay-ctl purge --recipient <name> --older-than <N>s|m|h|d [--dry-run | --delete]"
+    [ -n "$P_RCPT" ] || { echo "relay-ctl purge: --recipient is required; $usage_p" >&2; exit 2; }
+    case "$P_AGE" in
+      *[!0-9smhd]*|"") echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;;
+    esac
+    n=${P_AGE%?}; unit=${P_AGE#"$n"}
+    case "$n" in ""|*[!0-9]*) echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;; esac
+    case "$unit" in s) secs=$n ;; m) secs=$((n * 60)) ;; h) secs=$((n * 3600)) ;; d) secs=$((n * 86400)) ;; *) echo "relay-ctl purge: --older-than must be <N>s|m|h|d; $usage_p" >&2; exit 2 ;; esac
+    command -v sqlite3 >/dev/null 2>&1 || { echo "relay-ctl purge: sqlite3 required" >&2; exit 2; }
+    DB="${ORG_RELAY_DB:-$BOX_DB}"
+    [ -f "$DB" ] || { echo "relay-ctl purge: no relay db at $DB" >&2; exit 1; }
+    rq=$(printf '%s' "$P_RCPT" | sed "s/'/''/g")
+    where="consumed_at IS NULL AND recipient = '$rq' AND ts < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-$secs seconds')"
+    sq() { sqlite3 -cmd '.timeout 5000' "$DB" "$@"; }
+    ids=$(sq "SELECT group_concat(id) FROM messages WHERE $where;")
+    if [ -z "$ids" ]; then
+      echo "relay-ctl purge: no unconsumed message for '$P_RCPT' older than $P_AGE in $DB"
+      exit 0
+    fi
+    sq -header -separator ' | ' "SELECT id, ts, sender, kind, substr(replace(body, char(10), ' '), 1, 80) AS body FROM messages WHERE id IN ($ids) ORDER BY id;"
+    count=$(printf '%s' "$ids" | tr ',' '\n' | grep -c .)
+    if [ "$P_DELETE" -ne 1 ]; then
+      echo "relay-ctl purge: $count unconsumed message(s) for '$P_RCPT' older than $P_AGE listed; nothing deleted (re-run with --delete to remove exactly these)"
+      exit 0
+    fi
+    deleted=$(sq "DELETE FROM messages WHERE id IN ($ids) AND consumed_at IS NULL; SELECT changes();")
+    if command -v jq >/dev/null 2>&1; then
+      jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg r "$P_RCPT" --arg age "$P_AGE" --arg ids "$ids" --argjson n "${deleted:-0}" \
+        '{ts: $ts, event: "purge", recipient: $r, older_than: $age, deleted: $n, ids: ($ids | split(",") | map(tonumber)), by: "relay-ctl"}' \
+        >> "$(dirname "$DB")/audit.jsonl" 2>/dev/null || true
+    fi
+    echo "relay-ctl purge: deleted ${deleted:-0} unconsumed message(s) for '$P_RCPT' (ids $ids)"
+    ;;
   send)
     # JOB WAKES (1.5.0): enqueue one message exactly as relay_send does, from a
     # shell, so a long local job (a gate run, a CI watch) can end with
@@ -238,5 +295,5 @@ case "${1:-status}" in
       echo "org-relay: not running on :$PORT"; exit 1
     fi
     ;;
-  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback|send" >&2; exit 2 ;;
+  *) echo "usage: relay-ctl start|stop|status|run|install-daemon|rollback|send|purge" >&2; exit 2 ;;
 esac

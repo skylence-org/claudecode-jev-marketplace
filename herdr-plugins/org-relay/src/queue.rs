@@ -77,6 +77,25 @@ impl Drop for AwaitGuard {
     }
 }
 
+// ── Last-seen registry (1.5.0) ──────────────────────────────────────────────
+// When this daemon last heard from an agent: relay_inbox / relay_consume /
+// relay_await by `agent`, relay_send by `sender`. relay_status puts it next
+// to each queue so an orphaned queue (a recipient nobody has been since) is
+// visible. In-memory on purpose: it resets when the daemon restarts.
+fn seen() -> &'static Mutex<HashMap<String, Instant>> {
+    static S: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn mark_seen(agent: &str) {
+    seen().lock().unwrap().insert(agent.to_string(), Instant::now());
+}
+
+/// Seconds since this daemon last heard from `agent`; None = not since start.
+pub fn last_seen_s(agent: &str) -> Option<u64> {
+    seen().lock().unwrap().get(agent).map(|t| t.elapsed().as_secs())
+}
+
 // ── Task-backed coverage (SEP-2663 holds) ───────────────────────────────────
 // A task-backed hold runs SERVER-side: the client session that spawned it can
 // die while the task keeps waiting, and a dead session must not suppress the
@@ -501,6 +520,7 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
             )
             .map_err(|e| e.to_string())?;
             let id = conn.last_insert_rowid();
+            mark_seen(&sender);
             log_event("audit", json!({"event":"send","id":id,"sender":sender,"recipient":to,
                 "lane":lane,"kind":kind,"body_bytes":body.len()}));
             let live = awaiter_active(&to);
@@ -509,12 +529,14 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
         }
         "relay_inbox" => {
             let agent = req_str(args, "agent")?;
+            mark_seen(&agent);
             let all = args.get("include_consumed").and_then(|v| v.as_bool()).unwrap_or(false);
             let msgs = inbox(&conn, &agent, all).map_err(|e| e.to_string())?;
             Ok(json!({"agent": agent, "count": msgs.len(), "messages": msgs}))
         }
         "relay_consume" => {
             let agent = req_str(args, "agent")?;
+            mark_seen(&agent);
             let ids: Vec<i64> = args
                 .get("ids")
                 .and_then(|v| v.as_array())
@@ -537,14 +559,30 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
             Ok(json!({"consumed": n, "of": ids.len()}))
         }
         "relay_status" => {
+            // Per queue: how old its oldest unconsumed message is, whether the
+            // recipient is covered right now, whether herdr lists it, and when
+            // this daemon last heard from it. An old queue with no coverage, no
+            // live agent and no recent sighting is the orphan shape (a peer
+            // org's agent, a reaped lane): purge it with relay-ctl purge, never
+            // automatically.
             let mut stmt = conn
                 .prepare(
-                    "SELECT recipient, COUNT(*) FROM messages WHERE consumed_at IS NULL GROUP BY recipient",
+                    "SELECT recipient, COUNT(*), MIN(ts) FROM messages WHERE consumed_at IS NULL GROUP BY recipient",
                 )
                 .map_err(|e| e.to_string())?;
             let rows: Vec<Value> = stmt
                 .query_map([], |r| {
-                    Ok(json!({"recipient": r.get::<_, String>(0)?, "unconsumed": r.get::<_, i64>(1)?}))
+                    let recipient: String = r.get(0)?;
+                    let unconsumed: i64 = r.get(1)?;
+                    let oldest: String = r.get(2)?;
+                    let oldest_age_s = age_ms_since(&oldest).map(|ms| ms / 1000);
+                    let awaiting = awaiter_active(&recipient);
+                    let agent_live = agent_is_live(&recipient);
+                    let seen_s = last_seen_s(&recipient);
+                    Ok(json!({"recipient": recipient, "unconsumed": unconsumed,
+                        "oldest_ts": oldest, "oldest_age_s": oldest_age_s,
+                        "awaiting": awaiting, "agent_live": agent_live,
+                        "last_seen_s": seen_s}))
                 })
                 .map_err(|e| e.to_string())?
                 .filter_map(Result::ok)
@@ -619,6 +657,7 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
         .clamp(1, AWAIT_MAX_S);
     let after_id = args.get("after_id").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
     let _guard = direct_cover.then(|| AwaitGuard::new(&agent));
+    mark_seen(&agent);
     log_event("audit", json!({"event":"await_start","agent":agent,"timeout_s":timeout_s,
         "after_id":after_id, "mode": if direct_cover { "hold" } else { "task" }}));
     let notify = notifier_for(&agent);
@@ -743,6 +782,13 @@ mod tests {
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
         set_live_agents(None);
+    }
+
+    #[test]
+    fn last_seen_records_and_unknown_is_none() {
+        assert_eq!(last_seen_s("seen-never-probe"), None, "not seen since start");
+        mark_seen("seen-probe");
+        assert!(last_seen_s("seen-probe").is_some_and(|s| s <= 1));
     }
 
     #[test]
