@@ -4,6 +4,7 @@
 # key, no network.
 #
 # Run: bash plugins/herdr-agent-org/tests/review/review-package.test.sh
+# RP_SH=dash (or bash) runs review-package under that shell instead of sh.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +19,7 @@ TMP=$(mktemp -d)
 SLUG="rptest-$$"
 cleanup() {
   rm -rf "$TMP"
-  for f in "/tmp/${SLUG}_review.diff" "/tmp/${SLUG}_review2.diff"; do [ -e "$f" ] && ls -la "$f" >/dev/null && rm -f "$f"; done
+  for f in "/tmp/${SLUG}_review.diff" "/tmp/${SLUG}_review2.diff" "/tmp/${SLUG}_review3.diff"; do [ -e "$f" ] && ls -la "$f" >/dev/null && rm -f "$f"; done
 }
 trap cleanup EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -27,7 +28,8 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n     %s\n' "$1" "$2"; }
-rp() { OUT=$(sh "$RP" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
+RP_SH=${RP_SH:-sh}
+rp() { OUT=$($RP_SH "$RP" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
 
 # main: base; feat branches off it (f1 b.txt, later f2 c.txt); main then moves
 # on (m1 main-only.txt), so a two-dot PR diff would drag main-only.txt in.
@@ -55,8 +57,8 @@ rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat
 P2="/tmp/${SLUG}_review2.diff"
 if [ $RC -eq 0 ] && [ -s "$P2" ] && printf '%s' "$OUT" | grep -qF "$P2" && grep -qF "git diff -U10 $F1..feat" "$P2" && grep -qF "git diff --stat $F1..feat" "$P2" && grep -qF "git log --oneline $F1..feat" "$P2"; then ok "delta: /tmp/<slug>_review2.diff, two dots on the log and both diffs"; else bad "delta package" "rc=$RC out=$OUT err=$ERR head=$(grep '^#' "$P2" 2>/dev/null)"; fi
 if grep -q 'c.txt' "$P2" && ! grep -q '^diff --git a/b.txt' "$P2" && grep -q 'feat f2 subject' "$P2" && ! grep -q 'feat f1 subject' "$P2"; then ok "delta: only the commits and files after --from"; else bad "delta content" "$(cat "$P2")"; fi
-rp --slug "$SLUG" --cwd "$R" --from "$M1" --to feat
-grep -q 'main-only.txt' "$P2" && ok "delta is a straight two-dot range (a --from off the branch shows its files; three dots would hide them)" || bad "delta two-dot" "$(cat "$P2")"
+rp --slug "$SLUG" --cwd "$R" --from "$M1" --to feat --out "$TMP/offbranch.diff"
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'ancestor' && [ ! -e "$TMP/offbranch.diff" ] && ok "delta: a --from off the branch (not an ancestor of --to) is refused, nothing written" || bad "delta off-branch" "rc=$RC err=$ERR"
 
 rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --out "$TMP/custom.diff"
 [ $RC -eq 0 ] && [ -s "$TMP/custom.diff" ] && printf '%s' "$OUT" | grep -qF "$TMP/custom.diff" && ok "--out overrides the package path" || bad "out" "rc=$RC out=$OUT err=$ERR"
@@ -77,6 +79,40 @@ rp --slug "$SLUG" --cwd "$R" --base main --head no-such-ref
 [ $RC -eq 2 ] && ok "unresolvable ref: usage error (exit 2)" || bad "bad ref" "rc=$RC"
 rp --cwd "$R" --base main --head feat
 [ $RC -eq 2 ] && ok "no --slug: usage error (exit 2)" || bad "no slug" "rc=$RC"
+
+echo "--- bounce 1/3 fixes (review I5 m5 m5b) ----------------------------------"
+# R1: the fix tip was rebased onto a main that merged two other PRs.
+R2="$TMP/repo2"; git init -q -b main "$R2"
+c2() { printf '%s\n' "$2" >"$R2/$1"; git -C "$R2" add "$1"; git -C "$R2" commit -q -m "$3"; }
+c2 a.txt base "base commit"
+git -C "$R2" checkout -q -b feat
+c2 b.txt one "feat round-1 work"
+OLDTIP=$(git -C "$R2" rev-parse HEAD)
+c2 fix.txt fixed "bounce fix"
+git -C "$R2" checkout -q main
+c2 other-pr.txt x "other PR merged"
+c2 other-pr2.txt y "second other PR merged"
+git -C "$R2" checkout -q feat
+git -C "$R2" rebase -q main >/dev/null 2>&1
+rp --slug "$SLUG" --cwd "$R2" --from "$OLDTIP" --to feat --out "$TMP/r1.diff"
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'range-diff' && printf '%s' "$ERR" | grep -q 'ancestor' && [ ! -e "$TMP/r1.diff" ] && ok "R1: --from not an ancestor of --to after a rebase: exit 2, names git range-diff, nothing written" || bad "R1 rebased" "rc=$RC err=$ERR"
+rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --out "$TMP/no-such-dir/x.diff"
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'directory' && ! printf '%s' "$ERR" | grep -q 'merge base' && ok "m5: a missing --out directory is named as such, before any git work" || bad "out dir" "rc=$RC err=$ERR"
+P3="/tmp/${SLUG}_review3.diff"
+rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --round 3
+[ $RC -eq 0 ] && [ -s "$P3" ] && printf '%s' "$OUT" | grep -qF "$P3" && ok "m5b: --round 3 writes /tmp/<slug>_review3.diff" || bad "round 3" "rc=$RC out=$OUT err=$ERR"
+printf 'round-3 evidence\n' >>"$P3"
+rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --round 3
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--force' && grep -q 'round-3 evidence' "$P3" && ok "m5b: an existing delta package is refused without --force, left as it was" || bad "no overwrite" "rc=$RC err=$ERR"
+rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --round 3 --force
+[ $RC -eq 0 ] && ! grep -q 'round-3 evidence' "$P3" && ok "m5b: --force replaces it" || bad "force" "rc=$RC err=$ERR"
+[ -e "$P" ] || $RP_SH "$RP" --slug "$SLUG" --cwd "$R" --base main --head feat >/dev/null 2>&1
+rp --slug "$SLUG" --cwd "$R" --base main --head feat
+[ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--force' && ok "m5b: an existing whole-PR package is refused without --force too" || bad "pr no overwrite" "rc=$RC err=$ERR"
+rp --slug "$SLUG" --cwd "$R" --base main --head feat --round 2 --force
+[ $RC -eq 2 ] && ok "--round on a whole-PR package: usage error (exit 2)" || bad "round on pr" "rc=$RC"
+rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --round 1 --force
+[ $RC -eq 2 ] && ok "--round 1: usage error (a delta is round 2 or later)" || bad "round 1" "rc=$RC"
 
 echo "--- templates/reviewer-delta-brief.md ------------------------------------"
 if [ -f "$T" ]; then
@@ -111,7 +147,7 @@ EOF
     [ -n "$line" ] && grep -qxF -- "$line" "$T" && same=$((same + 1))
   done
   [ "$same" = "$total" ] && ok "conduct, verdict, report/close-out and NEVER lines are verbatim from reviewer-brief.md ($same/$total)" || bad "verbatim blocks" "$same/$total"
-  grep -q 'review2.diff' "$T" && grep -q 'CLOSED' "$T" && grep -q 'MINOR-DEFERRED' "$T" && grep -q 'STAGE 1' "$T" && grep -q 'STAGE 2' "$T" && grep -q 'review-package' "$T" && ok "template names the delta package, CLOSED, MINOR-DEFERRED, both stages, review-package" || bad "sections" "$(grep -n '' "$T" | head -5)"
+  grep -q 'review<round>.diff' "$T" && grep -q -- '--round <round>' "$T" && grep -q 'range-diff' "$T" && grep -q 'CLOSED' "$T" && grep -q 'MINOR-DEFERRED' "$T" && grep -q 'STAGE 1' "$T" && grep -q 'STAGE 2' "$T" && grep -q 'review-package' "$T" && ok "template names the per-round delta package, --round, range-diff, CLOSED, MINOR-DEFERRED, both stages, review-package" || bad "sections" "$(grep -n '' "$T" | head -5)"
 else
   bad "delta template" "$T missing"
 fi
