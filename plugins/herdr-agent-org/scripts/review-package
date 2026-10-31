@@ -67,6 +67,7 @@ else
   die2 "pass --base B --head H (whole PR) or --from F --to T (delta)"
 fi
 OUTP=${OUTP:-$DEFAULT}
+[ ! -d "$OUTP" ] || die2 "--out $OUTP is a directory; name the package file (e.g. $OUTP/$(basename -- "$DEFAULT")). Nothing written."
 OUTDIR=$(dirname -- "$OUTP")
 [ -d "$OUTDIR" ] || die2 "the --out directory $OUTDIR does not exist; nothing written"
 

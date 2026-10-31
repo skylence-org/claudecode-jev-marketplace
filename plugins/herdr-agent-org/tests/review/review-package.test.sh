@@ -113,6 +113,13 @@ rp --slug "$SLUG" --cwd "$R" --base main --head feat --round 2 --force
 [ $RC -eq 2 ] && ok "--round on a whole-PR package: usage error (exit 2)" || bad "round on pr" "rc=$RC"
 rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --round 1 --force
 [ $RC -eq 2 ] && ok "--round 1: usage error (a delta is round 2 or later)" || bad "round 1" "rc=$RC"
+# m-i (round 2): --out naming an existing directory is refused with or
+# without --force, and nothing (no tmp file) lands in that directory.
+mkdir -p "$TMP/outdir"
+for f in "" --force; do
+  rp --slug "$SLUG" --cwd "$R" --from "$F1" --to feat --out "$TMP/outdir" $f
+  [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'directory' && [ -z "$(ls -A "$TMP/outdir")" ] && ok "m-i: --out <existing directory>${f:+ $f}: refused (exit 2), nothing written there" || bad "out is dir${f:+ $f}" "rc=$RC out=$OUT err=$ERR ls=$(ls -A "$TMP/outdir")"
+done
 
 echo "--- templates/reviewer-delta-brief.md ------------------------------------"
 if [ -f "$T" ]; then
