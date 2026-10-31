@@ -1,0 +1,199 @@
+#!/bin/sh
+# integration-gate: the L7 merged-state gate for lanes outside build-slot's
+# Rust path (marketplace#12). Gates a lane tree's tip as it would land on the
+# current base, runs the repo's gate commands with one log each, names the
+# failing tests, and always puts the tree back where it was.
+#
+# Usage:
+#   integration-gate --slug S --cwd TREE [--base origin/main] [--cmd "CMD" ...]
+#                    [--known-fail REGEX ...] [--notify AGENT] [--comment]
+#
+# 1. Refuses (exit 2) a tree with tracked modifications or a merge in
+#    progress; untracked files (a .skyrift-workspace marker, build output)
+#    do not block.
+# 2. Fetches the --base remote (a failed fetch warns and gates against the
+#    last fetched ref). When the tip already contains --base, the gate runs on
+#    the tip in place (merged=none). Otherwise it makes a LOCAL merge of --base
+#    on a DETACHED HEAD (never pushed, never on a branch); a conflict aborts,
+#    restores, prints MERGE-CONFLICT and exits 3.
+# 3. Runs each --cmd in order through `sh -c` in TREE (default: the lines of
+#    TREE/.herdr-gate, blank and #-comment lines skipped, read from the gated
+#    tree; else `make check` then `make test`), each logged to
+#    /tmp/gate_<slug>_<n>.log, and prints `<cmd> rc=N`. A failing command
+#    also prints its distinct lines matching --- FAIL / FAIL / panic: / not ok
+#    (leading whitespace allowed, so a nested Go subtest is named too).
+# 4. --known-fail REGEX (repeatable, grep -E) marks matching failure lines as
+#    known: printed with a `known:` prefix and not counted. A failing command
+#    counts as failed unless it printed at least one failure line and every
+#    one of them is known; failed= counts commands, known= counts lines.
+# 5. Always restores the original HEAD, branch or detached (trap on EXIT,
+#    INT, TERM). Changes gate commands made to tracked files of a MERGED tree
+#    are discarded with it; on an in-place run nothing is checked out.
+# 6. --comment files `**[GATE <slug> rc=N]** ...` on todo <slug> (board CLI);
+#    --notify AGENT ends with `relay-ctl send --to AGENT --kind job` so a
+#    background gate wakes the orchestrator instead of being polled (L12). A
+#    missing board or relay-ctl only warns.
+# Last stdout line: GATE-DONE <slug> tip=<sha> merged=<sha|none|conflict>
+# failed=<n> known=<n>.
+# Exit: 0 no unknown failure, 1 failures, 2 usage, 3 merge conflict.
+set -u
+
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+NL='
+'
+SLUG=""; CWD=""; BASE="origin/main"; CMDS=""; KNOWN=""; NOTIFY=""; COMMENT=0
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
+  exit 2
+}
+die2() { echo "integration-gate: $*" >&2; exit 2; }
+warn() { echo "integration-gate: $*" >&2; }
+need() { [ "$1" -ge 2 ] || die2 "$2 needs a value"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --slug) need "$#" "$1"; SLUG=$2; shift 2 ;;
+    --cwd) need "$#" "$1"; CWD=$2; shift 2 ;;
+    --base) need "$#" "$1"; BASE=$2; shift 2 ;;
+    --cmd) need "$#" "$1"; CMDS="$CMDS$2$NL"; shift 2 ;;
+    --known-fail) need "$#" "$1"; KNOWN="$KNOWN$2$NL"; shift 2 ;;
+    --notify) need "$#" "$1"; NOTIFY=$2; shift 2 ;;
+    --comment) COMMENT=1; shift ;;
+    -h|--help) usage ;;
+    *) warn "unknown arg $1"; usage ;;
+  esac
+done
+
+[ -n "$SLUG" ] || die2 "--slug required"
+printf '%s' "$SLUG" | LC_ALL=C grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die2 "--slug '$SLUG' must match [A-Za-z0-9][A-Za-z0-9._-]* (it names /tmp/gate_<slug>_<n>.log)"
+[ -n "$CWD" ] || die2 "--cwd required"
+[ "$(git -C "$CWD" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || die2 "--cwd '$CWD' is not a git working tree"
+cd "$CWD" || die2 "cannot cd to $CWD"
+git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null \
+  || die2 "$CWD has tracked modifications; commit or stash them first (the gate never touches uncommitted work)"
+! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || die2 "$CWD has a merge in progress"
+
+ORIG_REF=$(git symbolic-ref -q HEAD) || ORIG_REF=""
+ORIG_SHA=$(git rev-parse HEAD 2>/dev/null) || die2 "$CWD has no commit"
+
+remote=${BASE%%/*}
+if [ "$remote" != "$BASE" ] && git remote | grep -qxF "$remote"; then
+  git fetch -q "$remote" 2>/dev/null || warn "git fetch $remote failed; gating against the last fetched $BASE"
+fi
+BASE_SHA=$(git rev-parse -q --verify "$BASE^{commit}" 2>/dev/null) || die2 "cannot resolve --base $BASE"
+
+MOVED=0
+restore() {
+  [ "$MOVED" -eq 1 ] || return 0
+  MOVED=0
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git merge --abort >/dev/null 2>&1 || true; fi
+  if [ -n "$ORIG_REF" ]; then
+    git checkout -q -f "${ORIG_REF#refs/heads/}" -- 2>/dev/null || git checkout -q -f "${ORIG_REF#refs/heads/}"
+  else
+    git checkout -q -f --detach "$ORIG_SHA"
+  fi || warn "RESTORE FAILED: put $CWD back with: git checkout ${ORIG_REF:+${ORIG_REF#refs/heads/}}${ORIG_REF:-$ORIG_SHA}"
+}
+trap restore EXIT
+trap 'restore; trap - EXIT; exit 130' INT
+trap 'restore; trap - EXIT; exit 143' TERM
+
+FAILED_N=0; KNOWN_N=0; MERGED=none; RC=0
+
+finish() {
+  restore
+  if [ "$COMMENT" -eq 1 ]; then
+    B=""
+    if command -v board >/dev/null 2>&1; then B=board; elif [ -x "$HERE/board" ]; then B="$HERE/board"; fi
+    if [ -n "$B" ]; then
+      "$B" comment "$SLUG" "**[GATE $SLUG rc=$RC]** tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N base=$BASE" >/dev/null 2>&1 \
+        || warn "--comment: board comment $SLUG failed (HERDR_ORG_ROOT=${HERDR_ORG_ROOT:-unset})"
+    else
+      warn "--comment: no board CLI found; nothing filed"
+    fi
+  fi
+  if [ -n "$NOTIFY" ]; then
+    if command -v relay-ctl >/dev/null 2>&1; then
+      relay-ctl send --to "$NOTIFY" --kind job --sender integration-gate --lane "$SLUG" \
+        --body "gate $SLUG rc=$RC tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N" >/dev/null 2>&1 \
+        || warn "--notify: relay-ctl send to $NOTIFY failed; nothing was queued"
+    else
+      warn "--notify: relay-ctl not on PATH; $NOTIFY was not woken"
+    fi
+  fi
+  echo "GATE-DONE $SLUG tip=$ORIG_SHA merged=$MERGED failed=$FAILED_N known=$KNOWN_N"
+  exit "$RC"
+}
+
+if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
+  MOVED=1
+  git checkout -q --detach 2>/dev/null || { warn "cannot detach HEAD in $CWD"; RC=2; finish; }
+  if git -c user.name=integration-gate -c user.email=integration-gate@localhost -c commit.gpgsign=false \
+       merge -q --no-ff --no-edit --no-verify -m "integration-gate $SLUG: local merge of $BASE" "$BASE_SHA" >/dev/null 2>&1; then
+    MERGED=$(git rev-parse HEAD)
+  else
+    files=$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+    restore
+    printf 'MERGE-CONFLICT %s: %s (%s) does not merge cleanly into tip %s%s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${files:+; conflicted: $files}"
+    MERGED=conflict; RC=3; finish
+  fi
+fi
+
+if [ -z "$CMDS" ]; then
+  if [ -f .herdr-gate ]; then
+    CMDS=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' .herdr-gate | grep -v -e '^#' -e '^$')$NL
+  else
+    CMDS="make check${NL}make test$NL"
+  fi
+fi
+
+is_known() {
+  [ -n "$KNOWN" ] || return 1
+  printf '%s' "$KNOWN" | {
+    while IFS= read -r re; do
+      [ -n "$re" ] || continue
+      printf '%s\n' "$1" | grep -qE -- "$re" && exit 0
+    done
+    exit 1
+  }
+}
+
+if [ -z "$(printf '%s' "$CMDS" | tr -d '[:space:]')" ]; then
+  warn "no gate commands: pass --cmd or list them in $CWD/.herdr-gate"
+  RC=2; finish
+fi
+
+n=0
+while IFS= read -r cmd; do
+  [ -n "$cmd" ] || continue
+  n=$((n + 1))
+  log="/tmp/gate_${SLUG}_${n}.log"
+  sh -c "$cmd" </dev/null >"$log" 2>&1
+  rc=$?
+  # printf, never echo: a POSIX echo may expand the backslashes in a command.
+  printf '%s rc=%s\n' "$cmd" "$rc"
+  [ "$rc" -eq 0 ] && continue
+  printf '  log: %s\n' "$log"
+  lines=$(grep -E '^[[:space:]]*(--- FAIL|FAIL|panic:|not ok)' "$log" | sed 's/^[[:space:]]*//' | awk '!seen[$0]++')
+  if [ -z "$lines" ]; then
+    echo "  (no --- FAIL / FAIL / panic: / not ok line; read the log)"
+    FAILED_N=$((FAILED_N + 1))
+    continue
+  fi
+  unknown=0
+  while IFS= read -r l; do
+    if is_known "$l"; then
+      printf '  known: %s\n' "$l"; KNOWN_N=$((KNOWN_N + 1))
+    else
+      printf '  %s\n' "$l"; unknown=$((unknown + 1))
+    fi
+  done <<EOF
+$lines
+EOF
+  [ "$unknown" -eq 0 ] || FAILED_N=$((FAILED_N + 1))
+done <<EOF
+$CMDS
+EOF
+
+[ "$FAILED_N" -eq 0 ] || RC=1
+finish
