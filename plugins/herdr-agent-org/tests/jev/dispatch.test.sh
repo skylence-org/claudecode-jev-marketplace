@@ -34,7 +34,7 @@ cat >"$STUBBIN/herdr" <<'EOF'
 #!/bin/sh
 echo "$*" >>"$HERDR_STUB_LOG"
 case "$1 $2" in
-  "pane list")   echo "${HERDR_STUB_PANES:-{\"result\":{\"panes\":[]}\}}" ;;
+  "pane list")   if [ -n "${HERDR_STUB_PANES:-}" ]; then echo "$HERDR_STUB_PANES"; else echo '{"result":{"panes":[]}}'; fi ;;
   "pane split")  echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
   "agent start") echo '{"result":{"ok":true}}' ;;
   "agent wait")  [ -n "${HERDR_STUB_TRUST:-}" ] && ! grep -q 'send-keys .* enter$' "$HERDR_STUB_LOG" && exit 1; exit 0 ;;
