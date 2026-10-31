@@ -58,6 +58,25 @@ if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'verdict=warn' && printf '%s' "
 tg opus "$ANS_HARD"
 if [ $RC -eq 0 ] && ! printf '%s' "$ERR" | grep -q 'reads as HARD'; then ok "opus on hard: no tier warning"; else bad "opus hard" "rc=$RC err=$ERR"; fi
 
+tg sonnet "$ANS_HARD"
+if printf '%s' "$OUT" | grep -q 'upgrade=advised'; then ok "hard brief below the top tier: verdict line carries upgrade=advised"; else bad "advised" "out=$OUT"; fi
+tg opus "$ANS_HARD"
+if ! printf '%s' "$OUT" | grep -q 'upgrade=advised'; then ok "hard brief on the top tier: no upgrade=advised"; else bad "advised top" "out=$OUT"; fi
+tg sonnet "$ANS_ORD"
+if ! printf '%s' "$OUT" | grep -q 'upgrade=advised'; then ok "ordinary brief: no upgrade=advised"; else bad "advised ord" "out=$OUT"; fi
+
+ANS_NOMILE='{"tier-gauge":{"tier":{"choice":"ordinary","confidence":0.81},"risky":{"noul":0.05},"names_lane_tree":{"noul":0.9},"orders_milestones":{"noul":0.1},"inlines_board_snippets":{"noul":0.9}}}'
+tg sonnet "$ANS_NOMILE"
+if printf '%s' "$OUT" | grep -q 'lint=milestone-comments'; then ok "worker brief without milestone orders: milestone-comments linted"; else bad "mile control" "out=$OUT"; fi
+printf 'You are the review lane for todo `lane-x`. Read-only: mutate nothing.\n' >"$TMP/review.md"
+OUT=$(JEV_STUB_ANSWERS="$(stub "$ANS_NOMILE")" sh "$TG" --brief-file "$TMP/review.md" --model sonnet 2>"$TMP/err"); RC=$?
+if [ $RC -eq 0 ] && ! printf '%s' "$OUT" | grep -q 'milestone-comments' && ! grep -q 'brief template items' "$TMP/err"; then ok "review-lane brief (template header): milestone-comments lint skipped"; else bad "review header" "rc=$RC out=$OUT err=$(cat "$TMP/err")"; fi
+mkdir -p "$TMP/org"
+HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" init "$TMP/org" >/dev/null 2>&1
+HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" create rev2-i9-lane --title "review" --body-file "$TMP/brief.md" >/dev/null 2>&1
+OUT=$(PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" JEV_STUB_ANSWERS="$(stub "$ANS_NOMILE")" sh "$TG" --todo rev2-i9-lane --model sonnet 2>/dev/null); RC=$?
+if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'tier=ordinary' && ! printf '%s' "$OUT" | grep -q 'milestone-comments'; then ok "review-lane todo name (rev2-): milestone-comments lint skipped"; else bad "review name" "rc=$RC out=$OUT"; fi
+
 OUT=$(sh "$TG" --brief-file "$TMP/brief.md" --model haiku 2>"$TMP/err"); RC=$?
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'verdict=ungauged'; then ok "no key: ungauged, exit 0, never refuses"; else bad "ungauged" "rc=$RC out=$OUT"; fi
 
@@ -107,5 +126,13 @@ rg "$LOW"
 if [ $RC -eq 3 ] && printf '%s' "$OUT" | grep -q '^MANDATORY-REVIEW: lines=201 >= 150' && [ ! -s "$JEV_AUDIT_FILE" ]; then ok "201 lines: MANDATORY by arithmetic, Jev never asked"; else bad "lines" "rc=$RC out=$OUT audit=$(cat "$JEV_AUDIT_FILE")"; fi
 
 echo
+# A diff that cannot be computed is never a pass: unrelated history has no
+# merge base, so the three-dot diff fails (review I1).
+git -C "$REPO" checkout -q --orphan orphan
+git -C "$REPO" rm -rq --cached . >/dev/null 2>&1
+seq 1 901 | sed 's/^/orphan /' >"$REPO/orphan.txt"; git -C "$REPO" add orphan.txt && git -C "$REPO" -c user.email=t@t -c user.name=t commit -q -m "orphan history"
+OUT=$(JEV_STUB_ANSWERS="$(stub "$LOW")" sh "$RG" lane-x --cwd "$REPO" --base main --head orphan 2>/dev/null); RC=$?
+if [ $RC -ne 0 ] && ! printf '%s' "$OUT" | grep -q '^WAIVABLE'; then ok "no merge base (orphan, 901 lines): fails closed, never WAIVABLE"; else bad "no merge base" "rc=$RC out=$OUT"; fi
+
 echo "herdr-agent-org: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1

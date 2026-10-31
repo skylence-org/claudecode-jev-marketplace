@@ -13,10 +13,19 @@
 #             sender is either key to tell an in-flight lane from a done one.
 #   wait      lifecycle wait armed (herdr agent wait)
 # Anything else leaves no mark, so the gate stays inert in ordinary sessions.
+# A --help/-h stage starts nothing and leaves no mark. A dispatch the hook
+# cannot see (dispatch-worker run from inside a script) is recorded by
+# dispatch-worker itself, which finds this session through
+# $CLAUDE_CODE_SESSION_ID or, in a shell that dropped it, through the pane
+# map written below (/tmp/claude-herdr-org-pane-<pane id>).
 command -v jq >/dev/null 2>&1 || exit 0
 input=$(cat)
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
 [ -n "$sid" ] || exit 0
+if [ -n "${HERDR_PANE_ID:-}" ]; then
+  pane_map="/tmp/claude-herdr-org-pane-$(printf '%s' "$HERDR_PANE_ID" | tr -c 'A-Za-z0-9_-' '_')"
+  [ "$(cat "$pane_map" 2>/dev/null)" = "$sid" ] || printf '%s\n' "$sid" > "$pane_map" 2>/dev/null || true
+fi
 
 # One line per command: Bash's .command as typed; each skyline_run .argv array
 # and each run_batch .argv_list array as ONE shell-quoted line (@sh), so a
@@ -42,10 +51,12 @@ events=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk -v q="'" '
       todo = "-"; name = "-"
       for (j = i + 1; j <= n; j++) {
         v = bare(t[j])
+        if (v == "--help" || v == "-h") next
         if (v == "--todo" && j < n) todo = bare(t[j + 1])
         else if (v ~ /^--todo=/) todo = substr(v, 8)
         else if (v == "--name" && j < n) name = bare(t[j + 1])
         else if (v ~ /^--name=/) name = substr(v, 8)
+        else if (v == "--relaunch" && j < n) name = bare(t[j + 1])
       }
       if (todo == "") todo = "-"
       if (name == "") name = "-"
@@ -53,6 +64,7 @@ events=$(printf '%s\n' "$cmd" | tr '|;&' '\n\n\n' | awk -v q="'" '
     }
     if (p ~ /^(\$\{HERDR_BIN_PATH:-herdr\}|\$HERDR|herdr)$/ && bare(t[i + 1]) == "agent") {
       if (bare(t[i + 2]) == "start") {
+        for (j = i + 3; j <= n; j++) { v = bare(t[j]); if (v == "--help" || v == "-h") next }
         name = bare(t[i + 3]); if (name == "") name = "-"
         print "dispatch - " name; next
       }

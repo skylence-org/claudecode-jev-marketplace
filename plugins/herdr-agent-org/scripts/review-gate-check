@@ -12,6 +12,11 @@
 #
 # Defaults: --cwd . ; --base origin/main ; --head HEAD. Both refs must
 # resolve or this exits 2: a failed diff is never a pass.
+# Diffs are three-dot (<base>...<head>, from the merge base), so a base that
+# moved on never pulls another merged PR's files into the count; the commit
+# subjects stay two-dot (<base>..<head>). Three-dot needs a merge base, which
+# unrelated history, a shallow clone, or grafts can lack: no merge base, or any
+# git diff that exits non-zero, is MANDATORY-REVIEW, never zero lines.
 #
 # WHAT LEAVES THE BOX. By default only file paths, commit subjects, and the
 # --stat summary are sent. The diff itself is sent only with --send-diff or
@@ -19,6 +24,8 @@
 # repo may share source with the vendor); then --package or
 # /tmp/<slug>_review.diff is used when it fits thresholds.max_diff_chars,
 # else the paths-only state. JEV_DISABLE=1 makes every Jev call fail open.
+#   MANDATORY-REVIEW: no merge base between <base> and <head> ... (L10)
+#   MANDATORY-REVIEW: git diff <base>...<head> failed ... (L10)
 #
 # stdout, exactly one line:
 #   MANDATORY-REVIEW: lines=<n> >= <gate> (L10)
@@ -62,15 +69,20 @@ T=$($JEV threshold review-gate surface); [ -n "$T" ] || T=0.7
 MODEL_ID="${JEV_MODEL:-jev-1.13.0}"
 
 # Arithmetic in code (vendor jaggedness: Jev is not a calculator).
-LINES=$(git -C "$CWD" diff --numstat "$BASE..$HEAD" 2>/dev/null | awk '{ a += ($1 == "-" ? 0 : $1) + ($2 == "-" ? 0 : $2) } END { print a + 0 }')
+fail_closed() { echo "MANDATORY-REVIEW: $1; a diff that cannot be computed is not a pass (L10)"; exit 3; }
+git -C "$CWD" merge-base "$BASE" "$HEAD" >/dev/null 2>&1 \
+  || fail_closed "no merge base between $BASE and $HEAD (unrelated history, shallow clone, or grafts)"
+NUMSTAT=$(git -C "$CWD" diff --numstat "$BASE...$HEAD" 2>/dev/null) || fail_closed "git diff --numstat $BASE...$HEAD failed"
+LINES=$(printf '%s\n' "$NUMSTAT" | awk 'NF { a += ($1 == "-" ? 0 : $1) + ($2 == "-" ? 0 : $2) } END { print a + 0 }')
 if [ "$LINES" -ge "$GATE" ]; then
   echo "MANDATORY-REVIEW: lines=$LINES >= $GATE (L10)"
   exit 3
 fi
 
-PATHS=$(git -C "$CWD" diff --name-only "$BASE..$HEAD" 2>/dev/null | jq -R . | jq -sc .)
+NAMES=$(git -C "$CWD" diff --name-only "$BASE...$HEAD" 2>/dev/null) || fail_closed "git diff --name-only $BASE...$HEAD failed"
+PATHS=$(printf '%s' "$NAMES" | jq -R . | jq -sc .)
 SUBJ=$(git -C "$CWD" log --format=%s "$BASE..$HEAD" 2>/dev/null | jq -R . | jq -sc .)
-STAT=$(git -C "$CWD" diff --stat "$BASE..$HEAD" 2>/dev/null | tail -n 30)
+STAT=$(git -C "$CWD" diff --stat "$BASE...$HEAD" 2>/dev/null | tail -n 30)
 if [ "$(printf '%s' "$PATHS" | jq 'length')" -eq 0 ]; then
   echo "WAIVABLE: lines=0 (no changed files between $BASE and $HEAD)"
   exit 0
@@ -80,7 +92,7 @@ MODE=paths
 STATE=$(jq -nc --arg s "$SLUG" --arg st "$STAT" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diffstat:$st}')
 if [ "$SEND_DIFF" = 1 ]; then
   [ -n "$PKG" ] || { [ -f "/tmp/${SLUG}_review.diff" ] && PKG="/tmp/${SLUG}_review.diff"; }
-  if [ -n "$PKG" ] && [ -f "$PKG" ]; then DIFF=$(cat "$PKG"); else DIFF=$(git -C "$CWD" diff -U3 "$BASE..$HEAD" 2>/dev/null); fi
+  if [ -n "$PKG" ] && [ -f "$PKG" ]; then DIFF=$(cat "$PKG"); else DIFF=$(git -C "$CWD" diff -U3 "$BASE...$HEAD" 2>/dev/null); fi
   if [ -n "$DIFF" ] && [ "$(printf '%s' "$DIFF" | wc -c | tr -d ' ')" -le "$MAXC" ]; then
     MODE=diff
     STATE=$(jq -nc --arg s "$SLUG" --arg d "$DIFF" --argjson p "$PATHS" --argjson c "$SUBJ" '{slug:$s, paths:$p, commit_subjects:$c, diff:$d}')
