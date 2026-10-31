@@ -62,9 +62,10 @@ fi
 # orchestrator's own): named, not done, not idle past their own [DONE].
 # Empty when herdr was not readable. Names of every listed agent, for the
 # gone-agent rule.
-others=""; listed=""
+others=""; listed=""; agents_ok=0
 first_ts=$(awk 'NR == 1 { print $1 }' "$marker")
 if [ -n "$agents_json" ] && printf '%s' "$agents_json" | jq -e '.result.agents' >/dev/null 2>&1; then
+  agents_ok=1
   listed=$(printf '%s' "$agents_json" | jq -r '.result.agents[]? | .name // empty' 2>/dev/null)
   others=0
   cand=$(printf '%s' "$agents_json" | jq -r --arg p "${HERDR_PANE_ID:-}" --arg w "${HERDR_WORKSPACE_ID:-}" '.result.agents[]? | select(.pane_id != $p and ($w == "" or .workspace_id == $w)) | select((.name // "") != "" and (.agent_status // "") != "done") | "\(.agent_status // "-") \(.name)"' 2>/dev/null)
@@ -106,7 +107,7 @@ if grep -Eq ' dispatch( |$)' "$marker" 2>/dev/null; then
         [ "${others:-1}" = "0" ] || { in_flight=1; break; }
         continue
       fi
-      if [ -n "$agents_json" ] && [ "$name" != "-" ] && [ -n "$name" ] && ! printf '%s\n' "$listed" | grep -Fxq -- "$name"; then
+      if [ "$agents_ok" = 1 ] && [ "$name" != "-" ] && [ -n "$name" ] && ! printf '%s\n' "$listed" | grep -Fxq -- "$name"; then
         continue
       fi
       done_n=$(sqlite3 -readonly "$relay_db" "SELECT COUNT(*) FROM messages WHERE sender IN ($keys) AND kind='doorbell' AND ts >= '$since';" 2>/dev/null </dev/null)

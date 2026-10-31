@@ -35,7 +35,7 @@ one_agent='{"result":{"agents":[{"pane_id":"p1","name":"orch-test"}]}}'
 two_agents='{"result":{"agents":[{"pane_id":"p1","name":"orch-test"},{"pane_id":"p2","name":"w-x"}]}}'
 # The lanes the keyed cases dispatch, alive and working (0.1.7: a keyed line
 # whose agent is no longer listed is done).
-lanes_alive='{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1","agent_status":"working"},{"pane_id":"p2","name":"w-a","workspace_id":"w1","agent_status":"working"},{"pane_id":"p3","name":"w-a2","workspace_id":"w1","agent_status":"working"},{"pane_id":"p4","name":"w-b","workspace_id":"w1","agent_status":"working"}]}}'
+lanes_alive='{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1","agent_status":"working"},{"pane_id":"p2","name":"w-a","workspace_id":"w1","agent_status":"working"},{"pane_id":"p3","name":"w-a2","workspace_id":"w1","agent_status":"working"},{"pane_id":"p4","name":"w-b","workspace_id":"w1","agent_status":"working"},{"pane_id":"p5","name":"lane-n","workspace_id":"w1","agent_status":"working"}]}}'
 cat > "$tmp/bin/herdr" <<EOF
 #!/bin/sh
 case "\$1 \$2" in
