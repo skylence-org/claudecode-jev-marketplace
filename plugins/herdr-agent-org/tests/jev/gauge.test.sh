@@ -126,5 +126,13 @@ rg "$LOW"
 if [ $RC -eq 3 ] && printf '%s' "$OUT" | grep -q '^MANDATORY-REVIEW: lines=201 >= 150' && [ ! -s "$JEV_AUDIT_FILE" ]; then ok "201 lines: MANDATORY by arithmetic, Jev never asked"; else bad "lines" "rc=$RC out=$OUT audit=$(cat "$JEV_AUDIT_FILE")"; fi
 
 echo
+# A diff that cannot be computed is never a pass: unrelated history has no
+# merge base, so the three-dot diff fails (review I1).
+git -C "$REPO" checkout -q --orphan orphan
+git -C "$REPO" rm -rq --cached . >/dev/null 2>&1
+seq 1 901 | sed 's/^/orphan /' >"$REPO/orphan.txt"; git -C "$REPO" add orphan.txt && git -C "$REPO" -c user.email=t@t -c user.name=t commit -q -m "orphan history"
+OUT=$(JEV_STUB_ANSWERS="$(stub "$LOW")" sh "$RG" lane-x --cwd "$REPO" --base main --head orphan 2>/dev/null); RC=$?
+if [ $RC -ne 0 ] && ! printf '%s' "$OUT" | grep -q '^WAIVABLE'; then ok "no merge base (orphan, 901 lines): fails closed, never WAIVABLE"; else bad "no merge base" "rc=$RC out=$OUT"; fi
+
 echo "herdr-agent-org: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1
