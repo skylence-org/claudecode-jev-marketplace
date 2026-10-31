@@ -288,6 +288,8 @@ yes|sh: 1: 4242 Killed
 yes|Floating point exception: 8
 yes|Terminated
 yes|[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x10a4b2c]
+yes|Fatal Python error: Segmentation fault
+no|ok 7 - reports Fatal Python error: boom
 yes|process didn't exit successfully: `x` (signal: 11, SIGSEGV: invalid memory reference)
 no|make: *** [test] Error 2
 no|make: *** [Makefile:3: test] Error 1
