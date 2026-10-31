@@ -9,6 +9,7 @@
 # the one-line verdict it prints is filed on the lane todo as [TIER-GAUGE: ...].
 #
 #   tier-gauge (--todo SLUG | --brief-file PATH) [--model M] [--effort E] [--json] [--show-brief]
+#   tier-gauge --todo SLUG --round-only
 #
 # WHAT IS GAUGED (0.1.7): what the next worker actually receives. A todo that
 # carries a bounce comment (the 0.1.6 bounce doctrine: it opens with the
@@ -26,6 +27,11 @@
 # template lint is skipped on a bounce (a DIGEST is not a brief; the brief was
 # linted at first dispatch). The verdict line names it: source=body|bounce.
 # --show-brief prints the text that would be gauged and exits 0, no Jev call.
+# --round-only prints the round of that same latest bounce comment (r of
+# `[BOUNCE r/n]`, 4 for `[BOUNCE 4 / ESCALATION]`, nothing when there is none
+# or the lane is a review lane) and exits 0, no Jev call. dispatch-worker
+# --replacer names its round from this, so the pointer and the gauge read one
+# parser.
 #
 # Exit 0: ok or warn (warnings on stderr, verdict line on stdout).
 # Exit 3: REFUSE — a cheap tier (--model haiku, --effort low) was requested
@@ -50,12 +56,12 @@
 # report by design, so the milestone-comments lint item is skipped for it.
 set -u
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 JEV="$HERE/jev"
 [ -x "$JEV" ] || JEV="sh $HERE/jev"
 export JEV_QUESTIONS="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
 
-TODO=""; FILE=""; MODEL=""; EFFORT=""; JSON=0; SHOW=0
+TODO=""; FILE=""; MODEL=""; EFFORT=""; JSON=0; SHOW=0; ROUND_ONLY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --todo) TODO=$2; shift 2 ;;
@@ -64,6 +70,7 @@ while [ "$#" -gt 0 ]; do
     --effort) EFFORT=$2; shift 2 ;;
     --json) JSON=1; shift ;;
     --show-brief) SHOW=1; shift ;;
+    --round-only) ROUND_ONLY=1; shift ;;
     -h|--help) awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"; exit 0 ;;
     *) echo "tier-gauge: unknown argument $1" >&2; exit 2 ;;
   esac
@@ -110,6 +117,12 @@ if [ -n "$TODO" ] && [ "$REVIEW_LANE" -eq 0 ]; then
       *) SOURCE_NOTE=" bounce-without-digest" ;;
     esac
   fi
+fi
+if [ "$ROUND_ONLY" -eq 1 ]; then
+  [ -n "$TODO" ] || { echo "tier-gauge: --round-only needs --todo SLUG" >&2; exit 2; }
+  printf '%s\n' "${BOUNCE:-}" | awk 'NF { sub(/^[ \t]+/, ""); print; exit }' \
+    | sed -n -E -e 's/^(\*\*)?\[BOUNCE 0*([0-9]+)\/[0-9]+\].*/\2/p' -e 's/^(\*\*)?\[BOUNCE 4 \/ ESCALATION\].*/4/p'
+  exit 0
 fi
 if [ "$SHOW" -eq 1 ]; then
   printf '%s\n' "$BRIEF"

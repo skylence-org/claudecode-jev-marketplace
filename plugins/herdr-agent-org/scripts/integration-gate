@@ -1,0 +1,425 @@
+#!/bin/sh
+# integration-gate: the L7 merged-state gate for lanes outside build-slot's
+# Rust path (marketplace#12). Gates a lane tree's tip as it would land on the
+# current base, runs the repo's gate commands with one log each, names the
+# failing tests, and always puts the tree back where it was.
+#
+# Usage:
+#   integration-gate --slug S --cwd TREE [--base origin/main] [--cmd "CMD" ...]
+#                    [--known-fail REGEX ...] [--notify AGENT] [--comment]
+#   e.g. --known-fail 'TestFlaky \('   (anchor it: a bare TestFlaky also hides
+#        TestFlakyButRealRegression)
+#
+# 1. Refuses (exit 2) a tree with tracked modifications or a merge in
+#    progress; untracked files (a .skyrift-workspace marker, build output)
+#    do not block.
+# 2. Fetches the --base remote (a failed fetch warns and gates against the
+#    last fetched ref), then DETACHES HEAD at the tip, so no gate command can
+#    move the lane branch. When the tip already contains --base, the gate runs
+#    on the tip (merged=none). Otherwise it makes a LOCAL merge of --base on
+#    that detached HEAD (never pushed, never on a branch, repo hooks off); a
+#    conflict prints MERGE-CONFLICT, restores and exits 3; a merge that fails
+#    without a conflict (an untracked or ignored lane file in the way: the
+#    test merge never overwrites one) prints MERGE-FAILED with git's reason
+#    and exits 2.
+# 3. Runs each --cmd in order through `sh -c` in TREE (default: the lines of
+#    TREE/.herdr-gate, blank and #-comment lines skipped, read from the gated
+#    tree; else `make check` then `make test`), each logged to
+#    /tmp/gate_<slug>_<n>.log, and prints `<cmd> rc=N`. A failing command
+#    also prints its distinct lines matching --- FAIL / FAIL / panic: / not ok
+#    (leading whitespace allowed, so a nested Go subtest is named too).
+#    TRUST BOUNDARY: .herdr-gate and the Makefile come from the gated tree,
+#    which is the lane under review, and run through `sh -c` with the
+#    caller's privileges. A lane can choose its own gate. The gate warns when
+#    the tree's .herdr-gate differs from the base's (or the base has none);
+#    pass --cmd to gate with commands you chose.
+# 4. --known-fail REGEX (repeatable, grep -E) marks matching failure lines as
+#    known: printed with a `known:` prefix and not counted. A failing command
+#    counts as failed unless it printed at least one failure line and every
+#    one of them is known, and its rc is below 126: a signal or a command that
+#    could not run is never downgraded (`known-only rc=N`). Crash markers
+#    (CRASH_RE below) in a failing command's log print as `crash:` lines,
+#    and no --known-fail covers them: make exits 2 for a crashed recipe, so
+#    the rc alone cannot tell. Covered: make's `*** [target]` report of any
+#    signal or of Error 126-255 (measured on GNU make 3.81; the make 4
+#    `[Makefile:N: target]` forms are tested as strings only); a shell's job
+#    report of a crashed child, `sh: line 1: <pid> Segmentation fault: 11
+#    ./x` (bash, macOS sh), `sh: 1: <pid> Killed` (Linux spellings such as
+#    `Aborted` and `Trace/breakpoint trap` as strings only), and dash's bare
+#    `Segmentation fault: 11` line; `(core dumped)`; CPython's
+#    `Fatal Python error:` line; a runtime's `[signal SIGSEGV` or
+#    `signal: 11, SIGSEGV`. Not covered: a crash that
+#    leaves none of these in the log (a runner that swallows its child's
+#    report and prints only a FAIL line). A test name that merely mentions
+#    a signal (`ok 4 - prints Abort trap`) is not a crash line.
+#    failed= counts commands, known= counts lines.
+# 5. The gate owns the tree for its run: never gate a tree a live worker
+#    writes to. Gate commands run on a detached HEAD, so in them
+#    `git rev-parse --abbrev-ref HEAD` prints HEAD, `git symbolic-ref HEAD`
+#    fails, `git branch --show-current` prints nothing and `@{upstream}` does
+#    not resolve. On exit, and on HUP, INT and TERM (each runs the full
+#    finish: restore, GATE-DONE, --comment, --notify; exit 128+signal), it
+#    puts HEAD, the branch, the index and tracked files back exactly as found;
+#    untracked files a command creates stay, and files it deletes do not come
+#    back. One snapshot taken before anything runs is what restore puts back
+#    and what a verifier compares afterwards. Nothing found is discarded
+#    unkept: tracked changes (a merge a command left in progress included:
+#    kept first, then aborted) go to refs/integration-gate/<slug>/stash, a
+#    stash-like commit (`git stash apply <that ref>`; the gate never writes
+#    refs/stash, so a worker's own stash stays stash@{0}), a moved detached
+#    HEAD to refs/integration-gate/<slug>/head, a moved lane branch to
+#    refs/integration-gate/<slug>/moved (the branch is then reset to its
+#    SHA); each ref's reflog keeps an earlier run's value. Only the gate's
+#    own conflicted test merge is aborted unkept. Restore's update-ref and
+#    stash calls run with the lane's hooks off.
+#    `RESTORED: <found>; put back to <branch> at <sha>; kept: <...>`
+#    prints only when the verifier confirms it; otherwise
+#    `RESTORE MISMATCH: <what differs>; put <tree> back with: <command>`
+#    prints and the gate fails; the command resets a moved lane branch to
+#    its SHA before checking it out. GATE-DONE, --notify and --comment then
+#    carry restore=mismatch (restore=ok otherwise).
+# 6. --comment files `**[GATE <slug> rc=N]** ...` on todo <slug> (board CLI);
+#    --notify AGENT ends with `relay-ctl send --to AGENT --kind job` so a
+#    background gate wakes the orchestrator instead of being polled (L12). A
+#    missing board or relay-ctl only warns.
+# Last stdout line: GATE-DONE <slug> tip=<sha> merged=<sha|none|conflict|failed>
+# restore=<ok|mismatch> failed=<n> known=<n>.
+# Exit: 0 no unknown failure, 1 failures or a RESTORE MISMATCH, 2 usage or a
+# merge that failed without a conflict, 3 merge conflict, 129/130/143 on
+# HUP/INT/TERM.
+set -u
+
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+NL='
+'
+SLUG=""; CWD=""; BASE="origin/main"; CMDS=""; KNOWN=""; NOTIFY=""; COMMENT=0
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
+  exit 2
+}
+die2() { echo "integration-gate: $*" >&2; exit 2; }
+warn() { echo "integration-gate: $*" >&2; }
+need() { [ "$1" -ge 2 ] || die2 "$2 needs a value"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --slug) need "$#" "$1"; SLUG=$2; shift 2 ;;
+    --cwd) need "$#" "$1"; CWD=$2; shift 2 ;;
+    --base) need "$#" "$1"; BASE=$2; shift 2 ;;
+    --cmd) need "$#" "$1"; CMDS="$CMDS$2$NL"; shift 2 ;;
+    --known-fail) need "$#" "$1"; KNOWN="$KNOWN$2$NL"; shift 2 ;;
+    --notify) need "$#" "$1"; NOTIFY=$2; shift 2 ;;
+    --comment) COMMENT=1; shift ;;
+    -h|--help) usage ;;
+    *) warn "unknown arg $1"; usage ;;
+  esac
+done
+
+[ -n "$SLUG" ] || die2 "--slug required"
+printf '%s' "$SLUG" | LC_ALL=C grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die2 "--slug '$SLUG' must match [A-Za-z0-9][A-Za-z0-9._-]* (it names /tmp/gate_<slug>_<n>.log)"
+[ -n "$CWD" ] || die2 "--cwd required"
+[ "$(git -C "$CWD" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || die2 "--cwd '$CWD' is not a git working tree"
+cd "$CWD" || die2 "cannot cd to $CWD"
+git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null \
+  || die2 "$CWD has tracked modifications; commit or stash them first (the gate never touches uncommitted work)"
+! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || die2 "$CWD has a merge in progress"
+
+# THE snapshot (review round 2, one source of truth): restore puts back these
+# fields and the verifier compares the same fields. Tracked files are clean
+# here by construction (refused above).
+ORIG_REF=$(git symbolic-ref -q HEAD) || ORIG_REF=""
+ORIG_SHA=$(git rev-parse HEAD 2>/dev/null) || die2 "$CWD has no commit"
+ORIG_NAME=${ORIG_REF#refs/heads/}; [ -n "$ORIG_REF" ] || ORIG_NAME=detached
+KEEP="refs/integration-gate/$SLUG"
+git check-ref-format "$KEEP/head" || die2 "--slug '$SLUG' must also be a valid git ref component (it names $KEEP/)"
+
+remote=${BASE%%/*}
+if [ "$remote" != "$BASE" ] && git remote | grep -qxF "$remote"; then
+  git fetch -q "$remote" 2>/dev/null || warn "git fetch $remote failed; gating against the last fetched $BASE"
+fi
+BASE_SHA=$(git rev-parse -q --verify "$BASE^{commit}" 2>/dev/null) || die2 "cannot resolve --base $BASE"
+
+MOVED=0; RUN_SHA=""; RC=0; REPORTED=0; OWN_MERGE=0
+# gid: git with the lane's hooks off (a reference-transaction hook would run
+# lane code for every ref restore writes) and a fallback identity when none
+# is configured (the stash commit, reflog entries).
+gid() {
+  if git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then git -c core.hooksPath=/dev/null "$@"
+  else git -c core.hooksPath=/dev/null -c user.name=integration-gate -c user.email=integration-gate@localhost "$@"; fi
+}
+# keep NAME SHA: preserve SHA as $KEEP/NAME; its reflog keeps an earlier
+# run's value.
+keep() { gid update-ref --create-reflog -m "integration-gate $SLUG: found at restore" "$KEEP/$1" "$2" 2>/dev/null; }
+note() { found="${found:+$found; }$1"; }
+kept_add() { kept="${kept:+$kept, }$1"; }
+unsafe_add() { unsafe="${unsafe:+$unsafe, }$1"; }
+# restore: (1) preserve everything the put-back would discard, (2) put the
+# snapshot back only when all of it is kept, (3) verify the snapshot's
+# fields. Only the verifier writes RESTORED: or RESTORE MISMATCH:.
+restore() {
+  [ "$MOVED" -eq 1 ] || return 0
+  # The gate's own conflicted test merge holds nobody's work: abort it first.
+  # Any other merge in progress (a command's) is kept by the stash below and
+  # aborted only after that.
+  if [ "$OWN_MERGE" -eq 1 ] && git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git merge --abort >/dev/null 2>&1 || true; fi
+  found=""; kept=""; unsafe=""; inmerge=0
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then inmerge=1; note "a merge was in progress"; fi
+  now_ref=$(git symbolic-ref -q HEAD) || now_ref=""
+  now_sha=$(git rev-parse -q --verify HEAD 2>/dev/null) || now_sha=""
+  mod=$(git status --porcelain --untracked-files=no 2>/dev/null | cut -c4- | tr '\n' ' ' | sed 's/ *$//')
+  if [ -n "$mod" ]; then
+    note "tracked files changed: $mod"
+    st=$(gid stash create "integration-gate $SLUG: found at restore" 2>/dev/null) || st=""
+    if [ -n "$st" ] && keep stash "$st"; then
+      kept_add "$KEEP/stash (git stash apply $KEEP/stash)"
+    else
+      unsafe_add "the tracked changes could not be stashed"
+    fi
+  fi
+  if [ -n "$now_ref" ] && [ "$now_ref" != "$ORIG_REF" ]; then
+    note "HEAD was switched to ${now_ref#refs/heads/}"
+  elif [ -z "$now_ref" ] && [ -n "$now_sha" ] && [ "$now_sha" != "${RUN_SHA:-$ORIG_SHA}" ] && [ "$now_sha" != "$ORIG_SHA" ]; then
+    note "HEAD moved to $now_sha"
+    if keep head "$now_sha"; then kept_add "$KEEP/head"; else unsafe_add "$KEEP/head could not be written"; fi
+  fi
+  ref_sha=""
+  if [ -n "$ORIG_REF" ]; then
+    ref_sha=$(git rev-parse -q --verify "$ORIG_REF" 2>/dev/null) || ref_sha=""
+    if [ -z "$ref_sha" ]; then
+      note "$ORIG_NAME was deleted"
+    elif [ "$ref_sha" != "$ORIG_SHA" ]; then
+      note "$ORIG_NAME moved to $ref_sha"
+      if keep moved "$ref_sha"; then kept_add "$KEEP/moved"; else unsafe_add "$KEEP/moved could not be written"; fi
+    fi
+  fi
+  if [ -z "$unsafe" ]; then
+    [ "$inmerge" -eq 0 ] || git merge --abort >/dev/null 2>&1 || true
+    if [ -n "$ORIG_REF" ]; then
+      if [ -z "$ref_sha" ]; then
+        gid update-ref -m "integration-gate $SLUG: recreated" "$ORIG_REF" "$ORIG_SHA" "" 2>/dev/null
+      elif [ "$ref_sha" != "$ORIG_SHA" ]; then
+        gid update-ref -m "integration-gate $SLUG: put back" "$ORIG_REF" "$ORIG_SHA" "$ref_sha" 2>/dev/null
+      fi
+      git checkout -q -f "$ORIG_NAME" -- 2>/dev/null || git checkout -q -f "$ORIG_NAME"
+    else
+      git checkout -q -f --detach "$ORIG_SHA" 2>/dev/null
+    fi
+  fi
+  bad=""
+  have_ref=$(git symbolic-ref -q HEAD) || have_ref=""
+  have_sha=$(git rev-parse -q --verify HEAD 2>/dev/null) || have_sha=""
+  [ "$have_ref" = "$ORIG_REF" ] || bad="HEAD is ${have_ref:-detached}, want ${ORIG_REF:-detached}"
+  [ "$have_sha" = "$ORIG_SHA" ] || bad="${bad:+$bad; }HEAD at ${have_sha:-nothing}, want $ORIG_SHA"
+  have_ref_sha=""
+  if [ -n "$ORIG_REF" ]; then
+    have_ref_sha=$(git rev-parse -q --verify "$ORIG_REF" 2>/dev/null) || have_ref_sha=""
+    [ "$have_ref_sha" = "$ORIG_SHA" ] || bad="${bad:+$bad; }$ORIG_NAME at ${have_ref_sha:-nothing}, want $ORIG_SHA"
+  fi
+  have_mod=$(git status --porcelain --untracked-files=no 2>/dev/null | cut -c4- | tr '\n' ' ' | sed 's/ *$//')
+  [ -z "$have_mod" ] || bad="${bad:+$bad; }tracked files differ: $have_mod"
+  ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || bad="${bad:+$bad; }a merge is in progress"
+  [ -z "$unsafe" ] || bad="${bad:+$bad; }nothing was put back because $unsafe"
+  if [ -z "$bad" ]; then
+    MOVED=0
+    [ -z "$found" ] || printf 'RESTORED: %s; put back to %s at %s%s\n' "$found" "$ORIG_NAME" "$ORIG_SHA" "${kept:+; kept: $kept}"
+  else
+    [ "$RC" -ne 0 ] || RC=1
+    RESTORE_STATE=mismatch
+    if [ -z "$ORIG_REF" ]; then hint="git checkout $ORIG_SHA"
+    elif [ "$have_ref_sha" != "$ORIG_SHA" ]; then hint="git update-ref $ORIG_REF $ORIG_SHA && git checkout -f $ORIG_NAME"
+    else hint="git checkout $ORIG_NAME"; fi
+    printf 'RESTORE MISMATCH: %s%s%s; put %s back with: %s\n' "$bad" "${found:+ (found: $found)}" "${kept:+; kept: $kept}" "$CWD" "$hint"
+    REPORTED=1
+  fi
+}
+# A mismatch is reported once; the EXIT trap after finish does not retry it.
+trap '[ "$REPORTED" -eq 1 ] || restore' EXIT
+
+FAILED_N=0; KNOWN_N=0; MERGED=none; FINISHING=0; RESTORE_STATE=ok
+
+finish() {
+  FINISHING=1
+  restore
+  if [ "$COMMENT" -eq 1 ]; then
+    B=""
+    if command -v board >/dev/null 2>&1; then B=board; elif [ -x "$HERE/board" ]; then B="$HERE/board"; fi
+    if [ -n "$B" ]; then
+      "$B" comment "$SLUG" "**[GATE $SLUG rc=$RC]** tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N base=$BASE" >/dev/null 2>&1 \
+        || warn "--comment: board comment $SLUG failed (HERDR_ORG_ROOT=${HERDR_ORG_ROOT:-unset})"
+    else
+      warn "--comment: no board CLI found; nothing filed"
+    fi
+  fi
+  if [ -n "$NOTIFY" ]; then
+    if command -v relay-ctl >/dev/null 2>&1; then
+      relay-ctl send --to "$NOTIFY" --kind job --sender integration-gate --lane "$SLUG" \
+        --body "gate $SLUG rc=$RC tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N" >/dev/null 2>&1 \
+        || warn "--notify: relay-ctl send to $NOTIFY failed; nothing was queued"
+    else
+      warn "--notify: relay-ctl not on PATH; $NOTIFY was not woken"
+    fi
+  fi
+  echo "GATE-DONE $SLUG tip=$ORIG_SHA merged=$MERGED restore=$RESTORE_STATE failed=$FAILED_N known=$KNOWN_N"
+  exit "$RC"
+}
+# A signal runs the whole finish, so a killed background gate still restores
+# the tree and still wakes --notify. dash runs no EXIT trap on an untrapped
+# SIGHUP, so HUP needs its own trap. A signal during finish is ignored
+# (finish restores first, then reports).
+trap '[ "$FINISHING" -eq 1 ] || { RC=129; finish; }' HUP
+trap '[ "$FINISHING" -eq 1 ] || { RC=130; finish; }' INT
+trap '[ "$FINISHING" -eq 1 ] || { RC=143; finish; }' TERM
+
+# Detach first, on both paths: a gate command that commits or checks out
+# lands on this detached HEAD, never on the lane branch. MOVED is set before
+# the detach, so a signal during it still restores.
+MOVED=1
+git checkout -q --detach 2>/dev/null || { warn "cannot detach HEAD in $CWD"; RC=2; finish; }
+if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
+  # An IGNORED lane file at a path --base adds would be overwritten by the
+  # test merge and then deleted by the restore (review rounds 2 and 3, I-D
+  # and I-2). git's default ort merge (2.50) does not honour
+  # --no-overwrite-ignore, so the gate checks for that itself, from the top
+  # of the tree (paths are root-relative), over the paths --base added since
+  # the merge base (a file the lane deleted and keeps ignored is not one),
+  # read NUL-separated (a plain diff quotes a name with `"` or `\`). Refused:
+  # the path exists and is ignored, or any ANCESTOR of it exists and is not
+  # a directory (a file or a symlink, which the merge replaces with a
+  # directory). An ignored directory ancestor is safe: the merge only adds
+  # inside it. An untracked file that is not ignored is left to git, which
+  # refuses it with its own reason (MERGE-FAILED below).
+  TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=.
+  MB=$(git merge-base HEAD "$BASE_SHA" 2>/dev/null) || MB=HEAD
+  # shellcheck disable=SC2016 # the sh -c body is single-quoted on purpose
+  clobber=$(cd "$TOP" && git diff -z --name-only --no-renames --diff-filter=A "$MB" "$BASE_SHA" 2>/dev/null | xargs -0 sh -c '
+    for p; do
+      d=$p
+      while case $d in */*) d=${d%/*} ;; *) false ;; esac; do
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+          printf "%s (a file or symlink where the merge adds %s) " "$d" "$p"; continue 2
+        fi
+      done
+      if { [ -e "$p" ] || [ -L "$p" ]; } && git check-ignore -q -- "$p" 2>/dev/null; then printf "%s " "$p"; fi
+    done' sh)
+  if [ -n "$clobber" ]; then
+    MERGED=failed; RC=2
+    printf 'MERGE-FAILED %s: %s (%s) would overwrite or replace lane files the restore cannot bring back (ignored, or in the way of a directory) in tip %s, so no test merge was made: %s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${clobber% }"
+    finish
+  fi
+  OWN_MERGE=1
+  if merr=$(git -c core.hooksPath=/dev/null -c user.name=integration-gate -c user.email=integration-gate@localhost -c commit.gpgsign=false \
+       merge -q --no-ff --no-edit --no-verify -m "integration-gate $SLUG: local merge of $BASE" "$BASE_SHA" 2>&1 >/dev/null); then
+    MERGED=$(git rev-parse HEAD); RUN_SHA=$MERGED; OWN_MERGE=0
+  elif git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+    # The verdict is set and printed before finish restores, so a signal
+    # during the restore (ignored there) cannot lose it.
+    files=$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')
+    MERGED=conflict; RC=3
+    printf 'MERGE-CONFLICT %s: %s (%s) does not merge cleanly into tip %s%s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${files:+; conflicted: $files}"
+    finish
+  else
+    MERGED=failed; RC=2
+    printf 'MERGE-FAILED %s: %s (%s) did not merge into tip %s, and there is no conflict: %s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "$(printf '%s' "$merr" | tr '\n' ' ' | sed 's/ *$//')"
+    finish
+  fi
+fi
+RUN_SHA=$(git rev-parse HEAD)
+
+if [ -z "$CMDS" ]; then
+  base_has=1
+  base_gate=$(git show "$BASE_SHA:.herdr-gate" 2>/dev/null) || base_has=0
+  if [ -f .herdr-gate ]; then
+    CMDS=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' .herdr-gate | grep -v -e '^#' -e '^$')$NL
+    if [ "$base_has" -eq 0 ]; then
+      warn "the gated tree's .herdr-gate runs and $BASE has none: the lane under gate chose these commands (sh -c, your privileges); read them before trusting a pass, or pass --cmd"
+    elif [ "$(cat .herdr-gate)" != "$base_gate" ]; then
+      warn "the gated tree's .herdr-gate differs from $BASE's (git show $BASE:.herdr-gate): the lane changed its own gate commands; read the diff before trusting a pass, or pass --cmd"
+    fi
+  else
+    [ "$base_has" -eq 0 ] || warn "the gated tree has no .herdr-gate but $BASE has one: running make check, make test instead"
+    CMDS="make check${NL}make test$NL"
+  fi
+fi
+
+# CRASH_RE (review rounds 2 and 3, I-A and I-1), the one place crash markers
+# live. A failing command's log line matching it (leading whitespace
+# stripped) prints as `crash:` and no --known-fail covers it. Alternatives,
+# in order:
+#   make's `*** [target] <tail>` report whose tail is anything but
+#     `Error N` with N below 126: every strsignal make prints (Segmentation
+#     fault, Trace/BPT trap, Floating point exception, Terminated, Hangup,
+#     ...) and Error 126-255. An `(ignored)` error carries no `***`, and an
+#     `Error N (ignored)` tail is never a crash;
+#   a shell's job report of a crashed child, anchored on the pid:
+#     `[<prog>: ][line N: ]<pid> <signal>[: N]`, the command after it; bash
+#     pads the pid to five columns (`line 1:  8319 Segmentation fault`);
+#   dash's bare report, the whole line: `<signal>[: N][ (core dumped)]`;
+#   `(core dumped)` anywhere;
+#   CPython's faulthandler line, `Fatal Python error: <reason>`;
+#   a runtime's signal tag: Go `[signal SIGSEGV`, Rust `signal: 11, SIGSEGV`.
+# <signal> is the macOS and the Linux strsignal text of SEGV, BUS, ILL, ABRT,
+# FPE, TRAP, KILL and TERM. A line that merely mentions a signal name
+# ("installing SIGSEGV handler", "ok 4 - prints Abort trap") matches none.
+CRASH_RE='^[^ ]*make(\[[0-9]+\])?: \*\*\* \[[^]]*\] ([^E]|E[^r]|Er[^r]|Err[^o]|Erro[^r]|Error[^ ]|Error [^0-9]|Error (12[6-9]|1[3-9][0-9]|[2-9][0-9][0-9]|[0-9][0-9][0-9][0-9]+)$)|^(.*: )?(line [0-9]+: )? *[0-9]+ (Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?|^(Segmentation fault|Bus error|Illegal instruction|Abort trap|Aborted|Floating point exception|Trace/BPT trap|Trace/breakpoint trap|Killed|Terminated)(: [0-9]+)?( \(core dumped\))?$|\(core dumped\)|^Fatal Python error: |\[signal SIG[A-Z]+|signal: [0-9]+, SIG[A-Z]+'
+
+is_known() {
+  [ -n "$KNOWN" ] || return 1
+  printf '%s' "$KNOWN" | {
+    while IFS= read -r re; do
+      [ -n "$re" ] || continue
+      printf '%s\n' "$1" | grep -qE -- "$re" && exit 0
+    done
+    exit 1
+  }
+}
+
+if [ -z "$(printf '%s' "$CMDS" | tr -d '[:space:]')" ]; then
+  warn "no gate commands: pass --cmd or list them in $CWD/.herdr-gate"
+  RC=2; finish
+fi
+
+n=0
+while IFS= read -r cmd; do
+  [ -n "$cmd" ] || continue
+  n=$((n + 1))
+  log="/tmp/gate_${SLUG}_${n}.log"
+  sh -c "$cmd" </dev/null >"$log" 2>&1
+  rc=$?
+  # printf, never echo: a POSIX echo may expand the backslashes in a command.
+  printf '%s rc=%s\n' "$cmd" "$rc"
+  [ "$rc" -eq 0 ] && continue
+  printf '  log: %s\n' "$log"
+  crashes=$(sed 's/^[[:space:]]*//' "$log" | grep -E -- "$CRASH_RE" | awk '!seen[$0]++')
+  [ -z "$crashes" ] || printf '%s\n' "$crashes" | sed 's/^/  crash: /'
+  lines=$(grep -E '^[[:space:]]*(--- FAIL|FAIL|panic:|not ok)' "$log" | sed 's/^[[:space:]]*//' | awk '!seen[$0]++')
+  if [ -z "$lines" ]; then
+    [ -n "$crashes" ] || echo "  (no --- FAIL / FAIL / panic: / not ok line; read the log)"
+    FAILED_N=$((FAILED_N + 1))
+    continue
+  fi
+  unknown=0
+  while IFS= read -r l; do
+    if is_known "$l"; then
+      printf '  known: %s\n' "$l"; KNOWN_N=$((KNOWN_N + 1))
+    else
+      printf '  %s\n' "$l"; unknown=$((unknown + 1))
+    fi
+  done <<EOF
+$lines
+EOF
+  if [ "$unknown" -ne 0 ]; then
+    FAILED_N=$((FAILED_N + 1))
+  elif [ "$rc" -ge 126 ]; then
+    printf '  known-only rc=%s: every failure line is known, but an rc of 126 or more (a signal, or a command that could not run) is never downgraded\n' "$rc"
+    FAILED_N=$((FAILED_N + 1))
+  elif [ -n "$crashes" ]; then
+    printf '  known-only with crash: every failure line is known, but a crash: line is never downgraded\n'
+    FAILED_N=$((FAILED_N + 1))
+  fi
+done <<EOF
+$CMDS
+EOF
+
+[ "$FAILED_N" -eq 0 ] || RC=1
+finish

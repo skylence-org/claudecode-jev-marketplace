@@ -1,0 +1,100 @@
+#!/bin/sh
+# review-package: write the L10 review package to one file, so the diff never
+# transits the orchestrator's context (marketplace#13).
+#
+# Usage:
+#   review-package --slug S --cwd TREE --base B --head H [--out PATH] [--force]              (whole PR)
+#   review-package --slug S --cwd TREE --from F --to T [--round N] [--out PATH] [--force]    (delta)
+#
+# Whole PR (round 1, templates/reviewer-brief.md): `git log --oneline B..H`,
+# `git diff --stat B...H`, `git diff -U10 B...H` into /tmp/<slug>_review.diff.
+# THREE dots on both diffs, from the merge base, so a main that moved on never
+# pulls another merged PR's files into the review; two dots on the log.
+# Delta (round 2+, templates/reviewer-delta-brief.md): the same three parts
+# with TWO dots throughout (F..T: the previous round's tip to the fix tip, not
+# the merge base) into /tmp/<slug>_review<N>.diff, N = --round (default 2), so
+# each round's package survives the next. F must be an ancestor of T: after a
+# rebase F..T would drag in whatever the rebase brought, so it is refused
+# (exit 2); compare with `git range-diff`, or re-review the whole PR.
+# --out PATH overrides the file; its directory must exist. An existing
+# package is never replaced silently: refused (exit 2) unless --force.
+# Each part is headed by a `# <command>` line.
+# Refuses (exit 3, nothing written) when the tree's HEAD is not --head / --to:
+# a package of a ref the tree has moved off reviews code nobody will merge.
+# Prints `<path> <n> lines`. Exit 2 on usage errors and unresolvable refs.
+set -u
+
+SLUG=""; CWD=""; BASE=""; HEAD_REF=""; FROM=""; TO=""; OUTP=""; ROUND=""; FORCE=0
+
+usage() {
+  awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0" >&2
+  exit 2
+}
+die2() { echo "review-package: $*" >&2; exit 2; }
+need() { [ "$1" -ge 2 ] || die2 "$2 needs a value"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --slug) need "$#" "$1"; SLUG=$2; shift 2 ;;
+    --cwd) need "$#" "$1"; CWD=$2; shift 2 ;;
+    --base) need "$#" "$1"; BASE=$2; shift 2 ;;
+    --head) need "$#" "$1"; HEAD_REF=$2; shift 2 ;;
+    --from) need "$#" "$1"; FROM=$2; shift 2 ;;
+    --to) need "$#" "$1"; TO=$2; shift 2 ;;
+    --out) need "$#" "$1"; OUTP=$2; shift 2 ;;
+    --round) need "$#" "$1"; ROUND=$2; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) usage ;;
+    *) echo "review-package: unknown arg $1" >&2; usage ;;
+  esac
+done
+
+[ -n "$SLUG" ] || die2 "--slug required"
+printf '%s' "$SLUG" | LC_ALL=C grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]*$' || die2 "--slug '$SLUG' must match [A-Za-z0-9][A-Za-z0-9._-]* (it names /tmp/<slug>_review.diff)"
+[ -n "$CWD" ] || die2 "--cwd required"
+[ "$(git -C "$CWD" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || die2 "--cwd '$CWD' is not a git working tree"
+
+if [ -n "$BASE$HEAD_REF" ] && [ -n "$FROM$TO" ]; then
+  die2 "pass one range: --base/--head (whole PR) or --from/--to (delta), not both"
+elif [ -n "$BASE" ] && [ -n "$HEAD_REF" ]; then
+  [ -z "$ROUND" ] || die2 "--round names a delta package (round 2 or later); a whole-PR package is round 1"
+  A=$BASE; B=$HEAD_REF; DIFFDOTS="..."; DEFAULT="/tmp/${SLUG}_review.diff"; KIND="whole PR"; TIPFLAG="--head"
+elif [ -n "$FROM" ] && [ -n "$TO" ]; then
+  ROUND=${ROUND:-2}
+  case "$ROUND" in [2-9]|[1-9][0-9]) ;; *) die2 "--round takes a round number of 2 or more (no leading zero), got '$ROUND'" ;; esac
+  A=$FROM; B=$TO; DIFFDOTS=".."; DEFAULT="/tmp/${SLUG}_review${ROUND}.diff"; KIND="delta round $ROUND"; TIPFLAG="--to"
+else
+  die2 "pass --base B --head H (whole PR) or --from F --to T (delta)"
+fi
+OUTP=${OUTP:-$DEFAULT}
+[ ! -d "$OUTP" ] || die2 "--out $OUTP is a directory; name the package file (e.g. $OUTP/$(basename -- "$DEFAULT")). Nothing written."
+OUTDIR=$(dirname -- "$OUTP")
+[ -d "$OUTDIR" ] || die2 "the --out directory $OUTDIR does not exist; nothing written"
+
+A_SHA=$(git -C "$CWD" rev-parse -q --verify "$A^{commit}" 2>/dev/null) || die2 "cannot resolve $A"
+B_SHA=$(git -C "$CWD" rev-parse -q --verify "$B^{commit}" 2>/dev/null) || die2 "cannot resolve $B"
+HERE_SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null) || die2 "$CWD has no commit"
+if [ "$HERE_SHA" != "$B_SHA" ]; then
+  echo "review-package: HEAD of $CWD is $HERE_SHA, not $TIPFLAG $B ($B_SHA); the tree moved off the reviewed tip. Nothing written." >&2
+  exit 3
+fi
+if [ "$DIFFDOTS" = ".." ] && ! git -C "$CWD" merge-base --is-ancestor "$A_SHA" "$B_SHA" 2>/dev/null; then
+  die2 "--from $A is not an ancestor of --to $B (rebased?): $A..$B would show whatever the rebase brought, not the fixes. Compare with git range-diff, or re-review the whole PR. Nothing written."
+fi
+if [ -e "$OUTP" ] && [ "$FORCE" -ne 1 ]; then
+  die2 "$OUTP exists (an earlier round's evidence?); pass --round N for a new round, --out PATH, or --force to replace it. Nothing written."
+fi
+
+TMPF="$OUTP.tmp.$$"
+trap 'rm -f "$TMPF"' EXIT
+(
+  printf '# review package %s (%s): %s %s%s%s, tip %s\n' "$SLUG" "$KIND" "$A_SHA" "$A" "$DIFFDOTS" "$B" "$B_SHA"
+  printf '# git log --oneline %s..%s\n' "$A" "$B"
+  git -C "$CWD" log --oneline "$A_SHA..$B_SHA" || exit 1
+  printf '\n# git diff --stat %s%s%s\n' "$A" "$DIFFDOTS" "$B"
+  git -C "$CWD" diff --stat "$A_SHA$DIFFDOTS$B_SHA" || exit 1
+  printf '\n# git diff -U10 %s%s%s\n' "$A" "$DIFFDOTS" "$B"
+  git -C "$CWD" diff -U10 "$A_SHA$DIFFDOTS$B_SHA" || exit 1
+) >"$TMPF" 2>/dev/null || { echo "review-package: git failed building the package (no merge base for a three-dot diff?); nothing written." >&2; exit 1; }
+mv -f "$TMPF" "$OUTP" || { echo "review-package: cannot write $OUTP" >&2; exit 1; }
+printf '%s %s lines\n' "$OUTP" "$(wc -l <"$OUTP" | tr -d ' ')"

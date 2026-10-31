@@ -1,6 +1,7 @@
 {
   "_comment": "Every Jev question and threshold the herdr org uses, in one reviewable place. One request per EVENT (a dispatch, an accept), never per tool call; each set's questions run in parallel over the same state and a caller reads only what its branch needs. Question ids are never sent to the model. Thresholds are starting points: tune them in the overlay (~/.claude/jev-questions.json, same shape, recursively merged) after reading ~/.claude/jev-audit.jsonl, not here. The asymmetric bars follow what the doctrine measured: under-provisioning a lane (a prose-spec brief on a cheap tier) costs 2-3x the turns, over-provisioning costs tokens, so refusing a DOWN-tier needs more certainty than warning about an UP-tier.",
   "_model_note": "Written against jev-1.13.0. `tier` is a Choice over descriptions of the WORK, never model names, so a renamed model tier changes nothing here. A Choice's confidence summarises how peaked its distribution is; a Noul is the probability of YES with no separate confidence.",
+  "_calibration": "2026-10-31 two labelled sessions (skyway). Session 1: 18 briefs (4 worker, 6 bounce, 8 reviewer); labels = what the work turned out to need; tier match 11/18 uncalibrated, 13/18 with these criteria; worker briefs 1/4 to 4/4. Session 2 (these criteria active): bounce briefs risky 0.54 / 0.71 / 0.93 / 0.15 tracked the surface; tier read ordinary on all four bounce briefs, including two whose surface (a runner terminal-row invariant, encryption-key storage) the orchestrator ran on Opus; on bounces tier measures design burden, use risky for surface risk. Small samples, session 1 tuned on its own set: re-read jev-audit.jsonl after the next session.",
   "sets": {
     "tier-gauge": {
       "_used_by": "scripts/tier-gauge, called by scripts/dispatch-worker (L17 TIER BY BRIEF)",
@@ -13,22 +14,22 @@
           },
           "criteria": {
             "mechanical": {
-              "what": "Transcription-grade: complete code blocks, exact file paths and line ranges, each step one action with its command and expected output, acceptance checks as exact commands with expected counts. The worker types; it invents nothing.",
-              "not_for": "A brief that says what to build without showing how."
+              "what": "Transcription-grade: complete code blocks, exact file paths and line ranges, each step one action with its command and expected output, acceptance checks as exact commands with expected counts. The worker types; it invents nothing. A fix brief that hands over the exact replacement lines also fits here.",
+              "not_for": "A brief that says what to build without showing how, and any REVIEW lane: reviewing always needs judgment."
             },
             "ordinary": {
-              "what": "Ordinary engineering: the goal and acceptance criteria are clear and the interfaces are named, but the worker chooses the implementation, writes tests from a description, or fills in details the brief leaves open.",
-              "not_for": "A brief with every code block already written, or one whose acceptance is ambiguous."
+              "what": "Ordinary engineering: the goal and acceptance criteria are clear and the interfaces are named, but the worker chooses the implementation, writes tests from a description, or fills in details the brief leaves open. Includes: a fix round whose findings already carry file:line evidence and an explicit ruling per finding; diagnosing a reproducible failure along a stated hypothesis with a repro loop; reviewing a diff that stays inside one subsystem or is test-only or config-only.",
+              "not_for": "A brief with every code block already written, one whose acceptance is ambiguous, or one listed under hard."
             },
             "hard": {
-              "what": "Hard or high-stakes: multi-file design choices, ambiguous acceptance criteria, cross-repo blast radius, causal diagnosis of an anomaly, or a prior bounce for a wrong approach.",
-              "not_for": "A large but fully specified task."
+              "what": "Hard or high-stakes: the change spans three or more subsystems, or two or more code paths or consumers must stay consistent with each other (two surfaces computing the same verdict, a writer and a reader of a new format); security-sensitive code (secrets, encryption keys, credential storage, authentication) or concurrency and timeouts around persistent state; the brief's premise about the existing code is unverified or contested; ambiguous acceptance criteria; cross-repo blast radius; a prior round failed because the APPROACH was wrong; or reviewing a diff with any of these properties.",
+              "not_for": "A large but fully specified task, a fix round with an explicit ruling per finding, or a diagnosis with a clear repro loop."
             }
           }
         },
         "risky": {
           "type": "noul",
-          "instructions": "Does `brief` have the worker touch release or CI configuration, authentication or authorization, data integrity (migrations, schemas, money, persistence formats), parser or resolution logic, or state that cannot be undone?",
+          "instructions": "Does `brief` have the worker touch release or CI configuration, authentication or authorization, secrets, encryption keys or credential storage, data integrity (migrations, schemas, money, persistence formats), parser or resolution logic, or state that cannot be undone?",
           "criteria": {
             "true": "At least one of those surfaces is in scope for this lane.",
             "false": "The lane stays inside ordinary feature or fix code."
