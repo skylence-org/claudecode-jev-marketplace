@@ -33,6 +33,9 @@ mkdir -p "$HOME/.config/herdr/org-relay" "$tmp/bin" "$tmp/www"
 sqlite3 "$db" "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL, lane TEXT, kind TEXT NOT NULL, body TEXT NOT NULL, consumed_at TEXT);"
 one_agent='{"result":{"agents":[{"pane_id":"p1","name":"orch-test"}]}}'
 two_agents='{"result":{"agents":[{"pane_id":"p1","name":"orch-test"},{"pane_id":"p2","name":"w-x"}]}}'
+# The lanes the keyed cases dispatch, alive and working (0.1.7: a keyed line
+# whose agent is no longer listed is done).
+lanes_alive='{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1","agent_status":"working"},{"pane_id":"p2","name":"w-a","workspace_id":"w1","agent_status":"working"},{"pane_id":"p3","name":"w-a2","workspace_id":"w1","agent_status":"working"},{"pane_id":"p4","name":"w-b","workspace_id":"w1","agent_status":"working"}]}}'
 cat > "$tmp/bin/herdr" <<EOF
 #!/bin/sh
 case "\$1 \$2" in
@@ -61,7 +64,9 @@ done
 kill -0 "$srv" 2>/dev/null || { echo "org-stop-gate: FAIL (port $port answered but the stub is not running: taken by another service)"; exit 1; }
 marker="/tmp/claude-herdr-org-lanes-$sid"
 run_gate() { printf '{"session_id":"%s","stop_hook_active":false}' "$sid" | sh "$gate"; }
-reset() { rm -f "$marker" "/tmp/claude-herdr-org-sweep-$sid"; chmod 644 "$db"; sqlite3 "$db" "DELETE FROM messages;"; printf '{"awaiting":[]}' > "$tmp/www/status"; printf '%s' "$one_agent" > "$tmp/agents.json"; }
+reset() { rm -f "$marker" "/tmp/claude-herdr-org-sweep-$sid"; chmod 644 "$db"; sqlite3 "$db" "DELETE FROM messages;"; printf '{"awaiting":[]}' > "$tmp/www/status"; printf '%s' "$lanes_alive" > "$tmp/agents.json"; }
+agents() { printf '%s' "$1" > "$tmp/agents.json"; }
+run_gate_ws() { (export HERDR_WORKSPACE_ID="$1"; run_gate); }
 msg() { sqlite3 "$db" "INSERT INTO messages(ts,sender,recipient,lane,kind,body) VALUES('$1','$2','orch-test','$2','$3','x');"; }
 mark() { printf '{"session_id":"%s","tool_name":"%s","tool_input":%s}' "$sid" "$1" "$2" | sh "$markhook"; }
 pass=0
@@ -91,10 +96,30 @@ reset; printf '%s\n' "2026-10-26T10:00:00Z dispatch lane-a w-a" "2026-10-26T10:0
 expect 1 "two lanes, one done: still in flight" "$(run_gate)"
 reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"; printf '%s' "$two_agents" > "$tmp/agents.json"
 expect 1 "a keyless dispatch line counts as in flight while another agent is alive" "$(run_gate)"
-reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"; agents "$one_agent"
 expect 0 "a keyless dispatch line with no other agent alive is not in flight forever" "$(run_gate)"
 reset; printf '%s\n' "2026-10-26T10:00:00Z dispatch - -" "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"
 expect 1 "a keyless line never masks a keyed lane still in flight" "$(run_gate)"
+# --- keyless liveness counts only named, unfinished lanes in this workspace (0.1.7, review M3)
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p7","workspace_id":"w1","agent_status":"idle"}]}}'
+expect 0 "shape B: an unnamed idle operator pane does not hold a keyless line in flight" "$(run_gate_ws w1)"
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p2","name":"w-d","workspace_id":"w1","agent_status":"done"},{"pane_id":"p3","name":"w-i","workspace_id":"w1","agent_status":"idle"}]}}'
+msg 2026-10-26T10:05:00Z w-i doorbell
+expect 0 "shape C: a done worker and an idle worker past its [DONE] do not hold a keyless line" "$(run_gate_ws w1)"
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p9","name":"w-o","workspace_id":"w2","agent_status":"working"}]}}'
+expect 0 "shape D: a working lane in another workspace does not hold a keyless line" "$(run_gate_ws w1)"
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test","workspace_id":"w1"},{"pane_id":"p3","name":"w-i","workspace_id":"w1","agent_status":"idle"}]}}'
+expect 1 "control: an idle named worker with no [DONE] yet still holds a keyless line" "$(run_gate_ws w1)"
+# --- a keyed line ends when its agent is gone (0.1.7, review M4)
+reset; echo "2026-10-26T10:00:00Z dispatch - helper" > "$marker"; agents "$one_agent"
+expect 0 "shape F: herdr agent start of a non-lane agent, agent no longer listed: done" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch - helper" > "$marker"
+agents '{"result":{"agents":[{"pane_id":"p1","name":"orch-test"},{"pane_id":"p5","name":"helper","agent_status":"working"}]}}'
+expect 1 "control: the same keyed line while the agent is still listed: in flight" "$(run_gate)"
 reset; echo "2026-10-26T10:00:00Z wait" > "$marker"
 expect 0 "a lifecycle wait alone asks for no coverage" "$(run_gate)"
 reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; printf '{"awaiting":["orch-test"]}' > "$tmp/www/status"
@@ -139,6 +164,16 @@ expect_marker "dispatch-worker -h (argv form) leaves no mark" ""
 reset
 mark Bash '{"command":"herdr agent start --help"}'
 expect_marker "herdr agent start --help leaves no mark" ""
+# --- leading shell keywords (0.1.7, review M6)
+reset
+mark Bash '{"command":"for n in a b; do herdr agent start \"$n\" --pane x; done"}'
+expect_marker "for ... do herdr agent start \"\$n\": classified, a \$-name is no key" "dispatch - -;"
+reset
+mark Bash '{"command":"if true; then herdr agent start w7; else herdr agent start w8; fi"}'
+expect_marker "then/else stages are classified" "dispatch - w7;dispatch - w8;"
+reset
+mark Bash '{"command":"{ dispatch-worker --name w9 --todo lane-9; }"}'
+expect_marker "a { group } stage is classified" "dispatch lane-9 w9;"
 reset
 mark Bash '{"command":"sh /x/run-dispatch.sh"}'
 expect_marker "a script-run dispatch is invisible to the hook" ""
