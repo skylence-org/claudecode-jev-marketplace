@@ -8,7 +8,18 @@
 # comments, inlined board calls). dispatch-worker calls this once per dispatch;
 # the one-line verdict it prints is filed on the lane todo as [TIER-GAUGE: ...].
 #
-#   tier-gauge (--todo SLUG | --brief-file PATH) [--model M] [--effort E] [--json]
+#   tier-gauge (--todo SLUG | --brief-file PATH) [--model M] [--effort E] [--json] [--show-brief]
+#
+# WHAT IS GAUGED (0.1.7): what the next worker actually receives. A todo that
+# carries a `[BOUNCE n]` comment (the 0.1.6 bounce doctrine: it opens with the
+# DIGEST and carries that round's ruling) is gauged on its LATEST such comment,
+# not the original body plus the trail: 6 of 6 replacer dispatches in one
+# session got the original brief's verdict, and body plus trail reads as hard
+# even for a precise fix list. No [BOUNCE] comment: the body. A review lane
+# always gauges its body, the review brief, never an inherited trail. The
+# template lint is skipped on a bounce (a DIGEST is not a brief; the brief was
+# linted at first dispatch). The verdict line names it: source=body|bounce.
+# --show-brief prints the text that would be gauged and exits 0, no Jev call.
 #
 # Exit 0: ok or warn (warnings on stderr, verdict line on stdout).
 # Exit 3: REFUSE — a cheap tier (--model haiku, --effort low) was requested
@@ -38,7 +49,7 @@ JEV="$HERE/jev"
 [ -x "$JEV" ] || JEV="sh $HERE/jev"
 export JEV_QUESTIONS="${JEV_QUESTIONS:-$HERE/jev-questions.json}"
 
-TODO=""; FILE=""; MODEL=""; EFFORT=""; JSON=0
+TODO=""; FILE=""; MODEL=""; EFFORT=""; JSON=0; SHOW=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --todo) TODO=$2; shift 2 ;;
@@ -46,7 +57,8 @@ while [ "$#" -gt 0 ]; do
     --model) MODEL=$2; shift 2 ;;
     --effort) EFFORT=$2; shift 2 ;;
     --json) JSON=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --show-brief) SHOW=1; shift ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; s = $0; sub(/^# ?/, "", s); print s }' "$0"; exit 0 ;;
     *) echo "tier-gauge: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -66,6 +78,26 @@ else
   [ -n "$BRIEF" ] || { echo "tier-gauge: todo '$TODO' has no body (board get $TODO --json)" >&2; exit 2; }
 fi
 
+REVIEW_LANE=0
+case "$TODO" in rev-*|rev2-*) REVIEW_LANE=1 ;; esac
+case "$BRIEF" in *"You are the review lane for todo"*) REVIEW_LANE=1 ;; esac
+SOURCE=body
+if [ -n "$TODO" ] && [ "$REVIEW_LANE" -eq 0 ]; then
+  # Comments are `### <ISO stamp>` sections under `## Comments`; keep the last
+  # one that carries a [BOUNCE marker, so later filings never displace it.
+  BOUNCE=$("$BOARD" get "$TODO" 2>/dev/null | awk '
+    /^## Comments$/ { inc = 1; next }
+    !inc { next }
+    /^### [0-9][0-9][0-9][0-9]-[0-9][0-9]-/ { if (cur ~ /\[BOUNCE/) last = cur; cur = ""; next }
+    { cur = cur $0 "\n" }
+    END { if (cur ~ /\[BOUNCE/) last = cur; printf "%s", last }') || BOUNCE=""
+  if [ -n "$(printf '%s' "$BOUNCE" | tr -d '[:space:]')" ]; then BRIEF=$BOUNCE; SOURCE=bounce; fi
+fi
+if [ "$SHOW" -eq 1 ]; then
+  printf '%s\n' "$BRIEF"
+  exit 0
+fi
+
 # Requested tier from the dispatch args: cheap / default / top.
 REQ=default
 case "$MODEL" in *haiku*) REQ=cheap ;; *opus*) REQ=top ;; esac
@@ -78,8 +110,8 @@ MODEL_ID="${JEV_MODEL:-jev-1.13.0}"
 ANSWERS=$(jq -nc --arg b "$(printf '%s' "$BRIEF" | head -c 80000)" '{brief: $b}' | $JEV ask tier-gauge 2>/dev/null) || ANSWERS=""
 if [ -z "$ANSWERS" ]; then
   echo "tier-gauge: Jev gave no answer (no key, timeout, or disabled); lane dispatches ungauged" >&2
-  [ "$JSON" -eq 1 ] && { jq -nc --arg r "$REQ" '{verdict:"ungauged", requested:$r}'; exit 0; }
-  echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ"
+  [ "$JSON" -eq 1 ] && { jq -nc --arg r "$REQ" --arg s "$SOURCE" '{verdict:"ungauged", requested:$r, source:$s}'; exit 0; }
+  echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ source=$SOURCE"
   exit 0
 fi
 
@@ -89,7 +121,7 @@ RISKY=$(printf '%s' "$ANSWERS" | jq -r '.risky.noul // 0')
 L_TREE=$(printf '%s' "$ANSWERS" | jq -r '.names_lane_tree.noul // 1')
 L_MILE=$(printf '%s' "$ANSWERS" | jq -r '.orders_milestones.noul // 1')
 L_SNIP=$(printf '%s' "$ANSWERS" | jq -r '.inlines_board_snippets.noul // 1')
-[ -n "$TIER" ] || { echo "tier-gauge: reply lacked a tier; ungauged" >&2; echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ"; exit 0; }
+[ -n "$TIER" ] || { echo "tier-gauge: reply lacked a tier; ungauged" >&2; echo "TIER-GAUGE: $MODEL_ID verdict=ungauged requested=$REQ source=$SOURCE"; exit 0; }
 
 T_DOWN=$($JEV threshold tier-gauge downgrade_bar); T_UP=$($JEV threshold tier-gauge upgrade_bar)
 T_RISK=$($JEV threshold tier-gauge risky); T_LINT=$($JEV threshold tier-gauge lint)
@@ -106,13 +138,12 @@ if ge "$RISKY" "$T_RISK"; then
   [ "$VERDICT" = ok ] && VERDICT=warn
   WARN="${WARN:+$WARN; }risky=$RISKY >= $T_RISK: expect L10 MANDATORY-REVIEW at accept"
 fi
-REVIEW_LANE=0
-case "$TODO" in rev-*|rev2-*) REVIEW_LANE=1 ;; esac
-case "$BRIEF" in *"You are the review lane for todo"*) REVIEW_LANE=1 ;; esac
 LINT=""
-lt "$L_TREE" "$T_LINT" && LINT="${LINT:+$LINT,}lane-tree-path"
-[ "$REVIEW_LANE" -eq 0 ] && lt "$L_MILE" "$T_LINT" && LINT="${LINT:+$LINT,}milestone-comments"
-lt "$L_SNIP" "$T_LINT" && LINT="${LINT:+$LINT,}board-snippets"
+if [ "$SOURCE" = body ]; then
+  lt "$L_TREE" "$T_LINT" && LINT="${LINT:+$LINT,}lane-tree-path"
+  [ "$REVIEW_LANE" -eq 0 ] && lt "$L_MILE" "$T_LINT" && LINT="${LINT:+$LINT,}milestone-comments"
+  lt "$L_SNIP" "$T_LINT" && LINT="${LINT:+$LINT,}board-snippets"
+fi
 if [ -n "$LINT" ]; then
   [ "$VERDICT" = ok ] && VERDICT=warn
   WARN="${WARN:+$WARN; }brief template items look missing: $LINT (brief template 2/4/7)"
@@ -121,10 +152,10 @@ fi
 [ -n "$WARN" ] && echo "tier-gauge: $WARN" >&2
 
 if [ "$JSON" -eq 1 ]; then
-  jq -nc --arg v "$VERDICT" --arg r "$REQ" --arg t "$TIER" --argjson c "$CONF" --argjson k "$RISKY" --arg l "$LINT" --arg m "$MODEL_ID" --arg a "$ADVISED" \
-    '{verdict:$v, requested:$r, tier:$t, confidence:$c, risky:$k, lint_missing:($l|split(",")|map(select(length>0))), upgrade_advised:($a == "1"), model:$m}'
+  jq -nc --arg v "$VERDICT" --arg r "$REQ" --arg t "$TIER" --argjson c "$CONF" --argjson k "$RISKY" --arg l "$LINT" --arg m "$MODEL_ID" --arg a "$ADVISED" --arg s "$SOURCE" \
+    '{verdict:$v, requested:$r, tier:$t, confidence:$c, risky:$k, lint_missing:($l|split(",")|map(select(length>0))), upgrade_advised:($a == "1"), source:$s, model:$m}'
 else
-  echo "TIER-GAUGE: $MODEL_ID tier=$TIER conf=$CONF risky=$RISKY requested=$REQ verdict=$VERDICT${ADVISED:+ upgrade=advised}${LINT:+ lint=$LINT}"
+  echo "TIER-GAUGE: $MODEL_ID tier=$TIER conf=$CONF risky=$RISKY requested=$REQ verdict=$VERDICT source=$SOURCE${ADVISED:+ upgrade=advised}${LINT:+ lint=$LINT}"
 fi
 
 if [ "$VERDICT" = refuse ]; then
