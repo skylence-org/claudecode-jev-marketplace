@@ -100,6 +100,26 @@ if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'source=body' && printf '%s' "$
 bd comment rev2-i9-lane "**[BOUNCE 1/3]** DIGEST: a trail the review lane inherited"
 tgt rev2-i9-lane --show-brief
 if printf '%s' "$OUT" | grep -q 'Implement the thing' && ! printf '%s' "$OUT" | grep -q 'inherited'; then ok "review lane with a [BOUNCE] comment: its brief is gauged, never the inherited trail"; else bad "review source" "out=$OUT"; fi
+# PR #9 review: only an orchestrator-formatted [BOUNCE r/n] comment counts.
+bdin() { slug=$1; shift; printf "$@" | PATH="$PLUGIN/scripts:$PATH" HERDR_ORG_ROOT="$TMP/org" sh "$PLUGIN/scripts/board" comment "$slug" --stdin >/dev/null 2>&1; }
+bd create lane-t --title "t" --body-file "$TMP/orig.md"
+bdin lane-t '**[BOUNCE 2/3]**\nDIGEST\n- tip: abc1234\n\nRULING: fix F2 and F3.\n'
+bd comment lane-t "**[BOUNCE 2/3 FIXES]** F2 F3 fixed, 14 passed"
+bd comment lane-t "Orchestrator note: the lane is in [BOUNCE 2/3] now, verifying"
+tgt lane-t --show-brief
+if printf '%s' "$OUT" | grep -q 'RULING: fix F2' && ! printf '%s' "$OUT" | grep -q 'FIXES'; then ok "T1/T2: a worker milestone or a note quoting [BOUNCE never replaces the ruling"; else bad "T1/T2" "rc=$RC out=$OUT err=$(cat "$TMP/err")"; fi
+bd create lane-u --title "u" --body-file "$TMP/orig.md"
+bdin lane-u '**[BOUNCE 1/3]**\nDIGEST\n- tip: abc1234\n### 2026-10-26 pasted log header\nRULING: keep going past the pasted header.\n'
+tgt lane-u --show-brief
+if printf '%s' "$OUT" | grep -q 'keep going past' && printf '%s' "$OUT" | grep -q 'DIGEST'; then ok "T3: a pasted ### 2026-... line inside a bounce does not split it"; else bad "T3" "out=$OUT"; fi
+bd create lane-v --title "v" --body-file "$TMP/orig.md"
+bd comment lane-v "**[BOUNCE 1/3]** fix F1, no digest written"
+tgt lane-v --model sonnet
+if printf '%s' "$OUT" | grep -q 'source=body bounce-without-digest'; then ok "T4: a bounce without a DIGEST falls back to the body and says so"; else bad "T4" "out=$OUT"; fi
+printf 'Implement it.\n## Comments\n### 2026-10-26T10:00:00Z\n\n**[BOUNCE 1/3]** DIGEST quoted in the body\n' >"$TMP/quoting.md"
+bd create lane-w --title "w" --body-file "$TMP/quoting.md"
+tgt lane-w --model sonnet
+if printf '%s' "$OUT" | grep -q 'source=body' && ! printf '%s' "$OUT" | grep -q 'bounce-without'; then ok "T5: a body quoting ## Comments and [BOUNCE is still the body"; else bad "T5" "out=$OUT"; fi
 
 OUT=$(sh "$TG" --brief-file "$TMP/brief.md" --model haiku 2>"$TMP/err"); RC=$?
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | grep -q 'verdict=ungauged'; then ok "no key: ungauged, exit 0, never refuses"; else bad "ungauged" "rc=$RC out=$OUT"; fi
