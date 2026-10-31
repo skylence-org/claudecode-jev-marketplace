@@ -134,7 +134,8 @@ fn tool_defs() -> Value {
     let inbox_out = json!({"type": "object", "properties": {
         "agent": {"type": "string"}, "count": {"type": "integer"},
         "messages": {"type": "array", "items": msg_schema},
-        "timed_out": {"type": "boolean"}, "note": {"type": "string"}}});
+        "timed_out": {"type": "boolean"}, "note": {"type": "string"},
+        "after_id": {"type": "integer"}, "deferred": {"type": "integer"}}});
     json!([
         {"name": "relay_guide",
          "description": "The relay guide (same text as resource relay://guide). Reading it unlocks the messaging tools for this session: the guide is the wake-plane contract (task-backed awaiting, arm-as-last-call, inbox-first turn entry, consume-after-acting).",
@@ -147,7 +148,7 @@ fn tool_defs() -> Value {
              "sender": s("your agent name"),
              "to": s("recipient agent name (e.g. orch-<feature>)"),
              "lane": s("optional lane/todo slug for context"),
-             "kind": s("doorbell | ring | blocker | incident | peer | operator | other"),
+             "kind": s("doorbell | ring | blocker | incident | peer | operator | question | answer | job | other"),
              "body": s("the message; stored verbatim, no shell interpolation hazards")}},
          "outputSchema": {"type": "object", "properties": {
              "id": {"type": "integer"}, "queued_for": {"type": "string"},
@@ -156,7 +157,8 @@ fn tool_defs() -> Value {
          "description": "List messages queued for an agent (unconsumed only unless include_consumed). The first bus action of any turn entered while lanes are in flight.",
          "inputSchema": {"type": "object", "required": ["agent"], "properties": {
              "agent": s("agent name"),
-             "include_consumed": {"type": "boolean", "description": "default false"}}},
+             "include_consumed": {"type": "boolean", "description": "default false"},
+             "peek": {"type": "boolean", "description": "default false; true when reading ANOTHER agent's queue (triage of an orphan): it then neither counts as that agent being seen nor stamps delivery"}}},
          "outputSchema": inbox_out},
         {"name": "relay_consume",
          "description": "Mark handled message ids consumed, AFTER acting on them. Explicit on purpose: a crash between reading and acting loses nothing.",
@@ -166,10 +168,11 @@ fn tool_defs() -> Value {
          "outputSchema": {"type": "object", "properties": {
              "consumed": {"type": "integer"}, "of": {"type": "integer"}}}},
         {"name": "relay_await",
-         "description": "Task-backed coverage: wait until a message arrives for agent, then return the unconsumed inbox. Arm it ONLY while you expect a message (an orchestrator with lanes in flight, a worker with a blocker pending), ONE await with a LONG timeout as the LAST call of the turn; an idle role arms nothing and is woken by a native ping or the nudge net (marketplace#1: every timeout of an idle await is a wasted turn). Clients declaring the MCP tasks extension (io.modelcontextprotocol/tasks) get a task handle back immediately and poll tasks/get; other clients hold the call open (Claude Code >= 2.1.212 auto-backgrounds the held call at ~2 minutes into a native background task, freeing the turn — the result arrives as a task notification). timeout_s default 1800, max 3600; a timeout returns cleanly with retry:true — re-arm one new await only if you still expect a message, never a tight loop.",
+         "description": "Task-backed coverage: wait until a message arrives for agent, then return the unconsumed inbox. Arm it ONLY while you expect a message (an orchestrator with lanes in flight, a worker with a blocker pending), ONE await with a LONG timeout as the LAST call of the turn; an idle role arms nothing and is woken by a native ping or the nudge net (marketplace#1: every timeout of an idle await is a wasted turn). Clients declaring the MCP tasks extension (io.modelcontextprotocol/tasks) get a task handle back immediately and poll tasks/get; other clients hold the call open (Claude Code >= 2.1.212 auto-backgrounds the held call at ~2 minutes into a native background task, freeing the turn — the result arrives as a task notification). timeout_s default 1800, max 3600; a timeout returns cleanly with retry:true — re-arm one new await only if you still expect a message, never a tight loop. after_id (optional): wake only for message ids above it; pass the highest id you have already seen to DEFER queued messages you cannot act on yet (a verify job still running) without consuming them — they stay in relay_inbox, and `deferred` counts them.",
          "inputSchema": {"type": "object", "required": ["agent"], "properties": {
              "agent": s("agent name"),
-             "timeout_s": {"type": "integer", "description": "1..3600, default 1800; one long await per idle period"}}},
+             "timeout_s": {"type": "integer", "description": "1..3600, default 1800; one long await per idle period"},
+             "after_id": {"type": "integer", "description": "optional; only ids above this wake the await (default 0: any unconsumed message)"}}},
          "outputSchema": inbox_out},
         {"name": "relay_audit_tail",
          "description": "Last N events from an observability stream. audit = message lifecycle (send / await_start / await_wake with waited_ms and oldest_msg_age_ms / await_timeout / consume). access = one record per MCP tool call. nudge = one record per watchdog turn-starter ring (recipient, outcome, backlog age).",
@@ -192,14 +195,33 @@ fn tool_defs() -> Value {
          "outputSchema": {"type": "object", "properties": {
              "audit": {"type": "object"}, "access": {"type": "object"},
              "max_log_bytes": {"type": "integer"}}}},
+        {"name": "relay_stats",
+         "description": "Session numbers for retrospectives, read-only and never guide-gated: for messages TO agent (all recipients when omitted) stamped at or after since (an ISO stamp or Ns|Nm|Nh|Nd; omitted = everything the db still holds), the total, counts by kind (sent / delivered / consumed / unconsumed), and send-to-deliver and send-to-consume latency in seconds (n, median, max). delivered = handed over by relay_inbox or a waking relay_await, stamped from 1.5.0 on; consumed rows older than ORG_RELAY_RETAIN_DAYS (default 7) are pruned.",
+         "inputSchema": {"type": "object", "properties": {
+             "agent": s("optional recipient to scope to"),
+             "since": s("optional ISO stamp (2026-10-31T06:00:00Z) or relative Ns|Nm|Nh|Nd")}},
+         "outputSchema": {"type": "object", "properties": {
+             "agent": {"type": ["string", "null"]}, "since": {"type": ["string", "null"]},
+             "total": {"type": "integer"}, "delivered": {"type": "integer"},
+             "consumed": {"type": "integer"}, "unconsumed": {"type": "integer"},
+             "by_kind": {"type": "object"},
+             "send_to_deliver_s": {"type": "object"}, "send_to_consume_s": {"type": "object"},
+             "note": {"type": "string"}}}},
         {"name": "relay_status",
-         "description": "Unconsumed message counts per recipient, the db path, which recipients currently hold live await coverage in this daemon (awaiting; in-call and task-backed holds both count), and the nudge watchdog state. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for. Never guide-gated.",
+         "description": "Per recipient queue: unconsumed count, oldest message stamp and age (oldest_age_s), whether that recipient holds live await coverage right now (awaiting), whether the herdr live-agent snapshot lists it (agent_live; null = no fresh evidence), and seconds since this daemon last heard from it (last_seen_s; in-memory, null since a restart). Plus the db path, the awaiting list (in-call and task-backed holds both count), the nudge watchdog state, and the daemon's own build (version, git sha, dirty flag, origin remote, source dir) so an installed binary can be matched to the repo that built it. Non-empty queues with an empty awaiting list is the deaf-org shape the nudge watchdog exists for; an old queue with awaiting false, agent_live false and no recent last_seen_s is an orphan (relay-ctl purge, operator-only). Never guide-gated.",
          "inputSchema": {"type": "object", "properties": {}},
          "outputSchema": {"type": "object", "properties": {
              "db": {"type": "string"},
              "queues": {"type": "array", "items": {"type": "object", "properties": {
-                 "recipient": {"type": "string"}, "unconsumed": {"type": "integer"}}}},
+                 "recipient": {"type": "string"}, "unconsumed": {"type": "integer"},
+                 "oldest_ts": {"type": "string"}, "oldest_age_s": {"type": ["integer", "null"]},
+                 "awaiting": {"type": "boolean"}, "agent_live": {"type": ["boolean", "null"]},
+                 "last_seen_s": {"type": ["integer", "null"]}}}},
              "awaiting": {"type": "array", "items": {"type": "string"}},
+             "build": {"type": "object", "properties": {
+                 "version": {"type": "string"}, "sha": {"type": "string"},
+                 "dirty": {"type": "boolean"}, "built_at": {"type": "string"},
+                 "remote": {"type": "string"}, "source_dir": {"type": "string"}}},
              "nudge": {"type": "object", "properties": {
                  "enabled": {"type": "boolean"}, "helper": {"type": ["string", "null"]}}}}}}
     ])
@@ -449,12 +471,14 @@ mod tests {
         "relay_audit_tail",
         "relay_observability_set",
         "relay_observability_status",
+        "relay_stats",
     ];
 
     #[test]
     fn tool_defs_deserialize_into_rmcp_tools() {
         let tools = build_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
+        assert!(tools.iter().any(|t| t.name == "relay_stats"));
         assert!(tools.iter().any(|t| t.name == "relay_guide"));
     }
 

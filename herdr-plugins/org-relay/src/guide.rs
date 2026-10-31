@@ -64,6 +64,28 @@ Rules that keep the org deaf-proof:
    means durably queued, not read. The recipient's await (or the nudge net,
    or your ping (when live_await is false, or always for a sender whose turn
    ends with the send)) is what turns it into a mind reading it.
+5. DEFER WITHOUT CONSUMING (1.5.0). When you must not act on a queued
+   message yet (its verify job is still running), do not consume it early
+   and do not spin on an await that returns at once: re-arm with
+   `relay_await(agent=<you>, after_id=<highest id seen>)`, which wakes only
+   for newer ids. The deferred rows stay unconsumed and in relay_inbox; act
+   and consume them when the job's own message arrives. Left deferred with
+   no await armed, they are backlog, and the nudge net rings you for them.
+
+## Job wakes (1.5.0)
+
+A long local job (a gate run, a CI watch) wakes its orchestrator by
+ENDING with a send, never by the orchestrator spending short-timeout awaits
+as a timer (each timeout replays a whole turn):
+
+  <job>; relay-ctl send --to <orchestrator> --kind job --body "job <id> rc=$?"
+
+`relay-ctl` is on PATH once `relay-ctl install-daemon` has linked it into
+~/.local/bin; otherwise use the absolute path `relay-ctl status` prints on
+its `cli` line.
+
+`relay-ctl send` enqueues exactly as relay_send does (same validation, same
+in-process wake of a live await) over the daemon's plain POST /send.
 
 ## The nudge net (last resort, not the primary)
 
@@ -112,14 +134,25 @@ queue, never instead of it:
 
 - relay_send(sender, to, kind, body, lane?) — durable enqueue + in-process
   wake of any live awaiter. kind: doorbell | ring | blocker | incident |
-  peer | operator | other. Returns {id, queued_for, live_await}: a sender
+  peer | operator | question | answer | job | other. Returns {id, queued_for, live_await}: a sender
   that stays awake pings ONCE when live_await is false or absent; a sender
   whose turn ends with the send pings once regardless.
-- relay_inbox(agent, include_consumed?) — list queued messages.
+- relay_inbox(agent, include_consumed?, peek?) — list queued messages. Your
+  own read counts as being seen and as delivery; to triage SOMEONE ELSE's
+  queue (an orphan), pass peek=true so relay_status and relay_stats stay
+  true.
 - relay_consume(agent, ids) — mark handled AFTER acting.
-- relay_await(agent, timeout_s?) — task-backed coverage; see the wake model.
-- relay_status() — queues per recipient + `awaiting` (live coverage) +
-  nudge state. Non-empty queues with empty awaiting = deaf org, right now.
+- relay_await(agent, timeout_s?, after_id?) — task-backed coverage; see the
+  wake model. after_id defers known messages (rule 5).
+- relay_status() — queues per recipient (count, oldest_age_s, awaiting,
+  agent_live, last_seen_s) + `awaiting` (live coverage) + nudge state +
+  the daemon's build. Non-empty queues with empty awaiting = deaf org, right
+  now; an old queue nobody awaits, herdr does not list and the daemon has
+  not seen is an orphan: the OPERATOR purges it with `relay-ctl purge`
+  (lists first, deletes only with --delete), never a role, never on a timer.
+- relay_stats(agent?, since?) — retrospective numbers, never gated: counts
+  by kind, delivered vs consumed, send-to-deliver and send-to-consume
+  seconds (median, max) for messages to agent since an ISO stamp or Nd|Nh|Nm.
 - relay_guide() — this text; reading it (or the relay://guide resource)
   unlocks the messaging tools for this session.
 - relay_audit_tail(stream?, limit?) — audit = message lifecycle with wake
@@ -178,6 +211,11 @@ mod tests {
             "WAKE accelerator",
             "SendMessage",
             "io.modelcontextprotocol/tasks",
+            "DEFER WITHOUT CONSUMING",
+            "after_id",
+            "relay-ctl send",
+            "relay_stats",
+            "relay-ctl purge",
         ] {
             assert!(GUIDE_RESOURCE.contains(phrase), "guide must contain {phrase:?}");
         }

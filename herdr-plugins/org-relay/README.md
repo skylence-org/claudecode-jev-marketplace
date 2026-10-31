@@ -7,6 +7,24 @@ orchestrator's turn (operator prompts queued behind a listener that re-armed
 every 50s) and still died with every turn end. The wake plane is TASK-DRIVEN
 as of 1.0.
 
+**Source of truth (1.5.0):** this directory, `herdr-plugins/org-relay` in
+skylence-org/claudecode-jev-marketplace. The multi-llm-marketplace copy
+stopped at 1.4.1 (commit 965ec72, 2026-09-19); this repo then changed the
+crate (df40d17, `relay_send` live_await) under the same 1.4.1, so two
+different builds carried one version. From 1.5.0 on, every change to `src/`
+or `build.rs` bumps the crate version, and `tools/check-parity.sh` fails a
+change that does not; it also keeps `Cargo.toml`, `Cargo.lock` and
+`herdr-plugin.toml` on the same version.
+
+**Install from this repo:** `cd herdr-plugins/org-relay && cargo build
+--release && sh relay-ctl install-daemon`. install-daemon refuses a dirty
+build, copies the binary to a versioned slot under
+`~/.local/libexec/org-relay/`, repoints `current`, restarts launchd, and
+verifies the served sha. Then `sh relay-ctl status`: its first line names
+the build (`org-relay: build 1.5.0 sha <sha> built <ts> from <origin remote>
+<source dir>`); the same `build` object is in `relay_status` and `GET
+/status`. A daemon whose build has no `remote` predates 1.5.0.
+
 **Design (settled):** data plane = SQLite queue — ONE box-wide db for every
 org (`~/.config/herdr/org-relay/relay.db`, set as ORG_RELAY_DB by the launchd
 plist; the `$HERDR_ORG_ROOT/relay.db` fallback only applies to ad-hoc runs
@@ -70,15 +88,41 @@ Client-side env worth exporting in org pane shells (Board bootstrap):
 idle-aborted before the harness backgrounds it.
 
 Tools: `relay_guide / relay_send / relay_inbox / relay_consume / relay_await /
-relay_status`, plus `relay_audit_tail / relay_observability_set /
+relay_status / relay_stats`, plus `relay_audit_tail / relay_observability_set /
 relay_observability_status` over the audit / access / nudge JSONL streams.
 
-Layout: `src/queue.rs` (data plane + awaiter registry + ack ledger),
+**1.5.0 additions:**
+
+- `relay-ctl send --to <agent> --kind <kind> --body <text> [--sender <name>]
+  [--lane <slug>]`: the same enqueue as `relay_send`, over POST /send, so a
+  long job ends with `...; relay-ctl send --to <orch> --kind job --body "job
+  <id> rc=$?"` and wakes its orchestrator. Never a short-timeout await as a
+  timer.
+- `relay_await(after_id=N)`: wake only for ids above N, so queued messages
+  you cannot act on yet stay unconsumed (consume-after-acting holds) without
+  the await returning at once. Chosen over a `relay_defer(ids, reason)` tool:
+  stateless, no deadlines to expire, nothing for the nudge net to reconcile.
+- `relay_status` per queue: `oldest_ts`, `oldest_age_s`, `awaiting`,
+  `agent_live`, `last_seen_s` (in-memory, resets on restart), plus the
+  daemon's `build`. Orphans are removed by the operator only:
+  `relay-ctl purge --recipient <name> --older-than <N>s|m|h|d` lists, and
+  deletes only with `--delete` (exactly the listed ids; audited).
+- `relay_stats(agent?, since?)`: counts by kind, delivered vs consumed,
+  send-to-deliver / send-to-consume seconds (n, median, max). Delivery is a
+  new nullable `delivered_at` column (added on open when missing; a 1.4
+  daemon on the same db is unaffected), stamped when relay_inbox or a waking
+  relay_await first hands a row over.
+
+Layout: `src/queue.rs` (data plane + awaiter and last-seen registries + stats),
 `src/server.rs` (rmcp handler + guide gate + SEP-2663 tasks), `src/guide.rs`
 (guide text + pinned refusal), `src/nudge.rs` (watchdog), `src/main.rs`
-(axum serve + /health + /status).
+(axum serve + /health + /status + /send), `relay-ctl` (daemon control,
+`send`, `purge`), `test/` (concurrency smoke, nudge classify, relay-ctl
+send and purge suites).
 
-Status: 1.0.0 — compiled, `cargo test` green (gate transitions, pinned
+Status: 1.5.0 — gate: `cargo test` and the concurrency smoke in the
+org-relay CI job, plus the relay-ctl send and purge suites. History,
+1.0.0 — compiled, `cargo test` green (gate transitions, pinned
 refusal text, nudge predicate incl. task-backed suppression, guide hash,
 tool-def deserialization), wire-smoked end to end (gate refusal → unlock →
 send → task handle → tasks/get result → gate re-arms for a fresh session →

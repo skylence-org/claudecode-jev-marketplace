@@ -5,6 +5,9 @@
 
 use std::process::Command;
 
+// redact_remote(): shared with the crate, which unit-tests it.
+include!("src/remote.rs");
+
 fn git(args: &[&str]) -> Option<String> {
     let dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let out = Command::new("git").arg("-C").arg(&dir).args(args).output().ok()?;
@@ -31,16 +34,29 @@ fn main() {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".into());
+    // Which repo built this binary: two repos have carried this crate under
+    // the same version (1.4.1 from multi-llm-marketplace 965ec72 and from
+    // claudecode-jev-marketplace), so the daemon names its source, not just
+    // its sha. Userinfo is stripped first: an https remote can carry a token
+    // (`https://user:PAT@host/...`), and this string is served publicly.
+    let remote = git(&["remote", "get-url", "origin"])
+        .filter(|s| !s.is_empty())
+        .map(|s| redact_remote(&s))
+        .unwrap_or_else(|| "unknown".into());
 
     println!("cargo:rustc-env=ORG_RELAY_GIT_SHA={sha}");
     println!("cargo:rustc-env=ORG_RELAY_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=ORG_RELAY_BUILT_AT={built_at}");
+    println!("cargo:rustc-env=ORG_RELAY_GIT_REMOTE={remote}");
 
     // Re-run when the commit or index moves, so the baked SHA cannot go stale
     // behind a cargo cache: point at the enclosing repo's actual git dir.
     if let Some(gitdir) = git(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={gitdir}/HEAD");
         println!("cargo:rerun-if-changed={gitdir}/index");
+        // A remote change (git remote set-url) rebakes the remote.
+        println!("cargo:rerun-if-changed={gitdir}/config");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/remote.rs");
 }
