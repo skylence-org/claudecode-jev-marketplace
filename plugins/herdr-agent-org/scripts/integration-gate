@@ -258,16 +258,33 @@ MOVED=1
 git checkout -q --detach 2>/dev/null || { warn "cannot detach HEAD in $CWD"; RC=2; finish; }
 if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
   # An IGNORED lane file at a path --base adds would be overwritten by the
-  # test merge and then deleted by the restore (review round 2, I-D). git's
-  # default ort merge (2.50) does not honour --no-overwrite-ignore, so the
-  # gate checks for that itself. An untracked file that is not ignored is left
-  # to git, which refuses it with its own reason (MERGE-FAILED below).
-  clobber=$(git -c core.quotePath=false diff --name-only --no-renames --diff-filter=A HEAD "$BASE_SHA" 2>/dev/null | while IFS= read -r p; do
-    if { [ -e "$p" ] || [ -L "$p" ]; } && git check-ignore -q -- "$p" 2>/dev/null; then printf '%s ' "$p"; fi
-  done)
+  # test merge and then deleted by the restore (review rounds 2 and 3, I-D
+  # and I-2). git's default ort merge (2.50) does not honour
+  # --no-overwrite-ignore, so the gate checks for that itself, from the top
+  # of the tree (paths are root-relative), over the paths --base added since
+  # the merge base (a file the lane deleted and keeps ignored is not one),
+  # read NUL-separated (a plain diff quotes a name with `"` or `\`). Refused:
+  # the path exists and is ignored, or any ANCESTOR of it exists and is not
+  # a directory (a file or a symlink, which the merge replaces with a
+  # directory). An ignored directory ancestor is safe: the merge only adds
+  # inside it. An untracked file that is not ignored is left to git, which
+  # refuses it with its own reason (MERGE-FAILED below).
+  TOP=$(git rev-parse --show-toplevel 2>/dev/null) || TOP=.
+  MB=$(git merge-base HEAD "$BASE_SHA" 2>/dev/null) || MB=HEAD
+  # shellcheck disable=SC2016 # the sh -c body is single-quoted on purpose
+  clobber=$(cd "$TOP" && git diff -z --name-only --no-renames --diff-filter=A "$MB" "$BASE_SHA" 2>/dev/null | xargs -0 sh -c '
+    for p; do
+      d=$p
+      while case $d in */*) d=${d%/*} ;; *) false ;; esac; do
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+          printf "%s (a file or symlink where the merge adds %s) " "$d" "$p"; continue 2
+        fi
+      done
+      if { [ -e "$p" ] || [ -L "$p" ]; } && git check-ignore -q -- "$p" 2>/dev/null; then printf "%s " "$p"; fi
+    done' sh)
   if [ -n "$clobber" ]; then
     MERGED=failed; RC=2
-    printf 'MERGE-FAILED %s: %s (%s) would overwrite ignored lane files in tip %s, so no test merge was made: %s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${clobber% }"
+    printf 'MERGE-FAILED %s: %s (%s) would overwrite or replace lane files the restore cannot bring back (ignored, or in the way of a directory) in tip %s, so no test merge was made: %s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${clobber% }"
     finish
   fi
   if merr=$(git -c core.hooksPath=/dev/null -c user.name=integration-gate -c user.email=integration-gate@localhost -c commit.gpgsign=false \

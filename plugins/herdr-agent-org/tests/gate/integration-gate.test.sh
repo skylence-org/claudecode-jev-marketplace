@@ -338,6 +338,58 @@ move_main r16 local.cfg "main default"
 ig --slug "$SLUG" --cwd "$TMP/r16" --cmd true
 if [ $RC -eq 2 ] && printf '%s' "$OUT" | grep -q 'MERGE-FAILED' && [ "$(cat "$TMP/r16/local.cfg" 2>&1)" = 'MY LOCAL SECRET CONFIG' ] && ! printf '%s' "$OUT" | grep -q '^true rc='; then ok "main starts tracking an ignored lane file: MERGE-FAILED, exit 2, the lane's file intact"; else bad "ignored file" "rc=$RC out=$OUT err=$ERR local.cfg=$(cat "$TMP/r16/local.cfg" 2>&1)"; fi
 
+echo "--- round 3: ignored lane files at an ancestor, quoted names, a subdir (I-2 m-4) --"
+# gate_refused NAME LABEL CHECK...: MERGE-FAILED, exit 2, nothing run, and
+# the command CHECK (the lane's ignored file is intact) succeeds.
+gate_refused() {
+  local n=$1 label=$2; shift 2
+  if [ $RC -eq 2 ] && printf '%s' "$OUT" | grep -q '^MERGE-FAILED' && ! printf '%s' "$OUT" | grep -q '^true rc=' && "$@"; then ok "$label"; else bad "$n" "rc=$RC out=$OUT err=$ERR"; fi
+}
+mkrepos r22; commit_in "$TMP/r22" .gitignore 'cfg\n'; printf 'SECRET FILE CFG\n' >"$TMP/r22/cfg"
+mkdir -p "$TMP/r22-seed/cfg"; move_main r22 cfg/local.cfg "main default"
+ig --slug "$SLUG" --cwd "$TMP/r22" --cmd true
+gate_refused "B3 ancestor file" "B3: an ignored FILE cfg where main adds cfg/local.cfg: MERGE-FAILED naming cfg, exit 2, the file intact" \
+  sh -c '[ -f "$1/cfg" ] && [ "$(cat "$1/cfg")" = "SECRET FILE CFG" ] && printf "%s" "$2" | grep -q "^MERGE-FAILED.*: cfg"' sh "$TMP/r22" "$OUT"
+mkrepos r23; commit_in "$TMP/r23" .gitignore 'data\n'; mkdir -p "$TMP/r23-real"; printf 'REAL\n' >"$TMP/r23-real/secret.txt"; ln -s "$TMP/r23-real" "$TMP/r23/data"
+mkdir -p "$TMP/r23-seed/data"; move_main r23 data/new.txt new
+ig --slug "$SLUG" --cwd "$TMP/r23" --cmd true
+gate_refused "B4b ancestor symlink" "B4b: an ignored symlink data (to a directory) where main adds data/new.txt: MERGE-FAILED, the symlink intact" \
+  sh -c '[ -L "$1/data" ] && [ "$(readlink "$1/data")" = "$2" ] && [ ! -e "$2/new.txt" ]' sh "$TMP/r23" "$TMP/r23-real"
+mkrepos r24; commit_in "$TMP/r24" .gitignore 'local.cfg\n'; ln -s "$TMP/no-such-target" "$TMP/r24/local.cfg"
+move_main r24 local.cfg "main default"
+ig --slug "$SLUG" --cwd "$TMP/r24" --cmd true
+gate_refused "B4 dangling leaf symlink" "B4: an ignored dangling symlink at the path main adds: MERGE-FAILED, the symlink intact" \
+  sh -c '[ -L "$1/local.cfg" ] && [ "$(readlink "$1/local.cfg")" = "$2" ]' sh "$TMP/r24" "$TMP/no-such-target"
+mkrepos r25; commit_in "$TMP/r25" .gitignore 'q*\n'; printf 'SECRET Q\n' >"$TMP/r25/q\"local.cfg"
+move_main r25 'q"local.cfg' "main q"
+ig --slug "$SLUG" --cwd "$TMP/r25" --cmd true
+gate_refused "B8 quoted name" "B8: an ignored file named q\"local.cfg (git quotes it in a plain diff): MERGE-FAILED, the file intact" \
+  sh -c '[ "$(cat "$1/q\"local.cfg")" = "SECRET Q" ]' sh "$TMP/r25"
+mkrepos r26; commit_in "$TMP/r26" .gitignore 'local.cfg\n'; printf 'SECRET\n' >"$TMP/r26/local.cfg"
+mkdir -p "$TMP/r26/sub"; commit_in "$TMP/r26" sub/s.txt 's\n'
+move_main r26 local.cfg "main default"
+ig --slug "$SLUG" --cwd "$TMP/r26/sub" --cmd true
+gate_refused "B9 subdir cwd" "B9: --cwd a subdirectory, the ignored file at the tree root: MERGE-FAILED, the file intact" \
+  sh -c '[ "$(cat "$1/local.cfg")" = SECRET ]' sh "$TMP/r26"
+mkrepos r27; commit_in "$TMP/r27" .gitignore 'local.cfg\n'; printf 'SECRET\n' >"$TMP/r27/local.cfg"
+git -C "$TMP/r27-seed" mv a.txt local.cfg; git -C "$TMP/r27-seed" commit -q -m rename; git -C "$TMP/r27-seed" push -q origin main 2>/dev/null
+ig --slug "$SLUG" --cwd "$TMP/r27" --cmd true
+gate_refused "B7 rename in base" "B7: main renames a.txt to the ignored lane file's path: MERGE-FAILED, the file intact" \
+  sh -c '[ "$(cat "$1/local.cfg")" = SECRET ]' sh "$TMP/r27"
+mkrepos r28; commit_in "$TMP/r28" .gitignore 'build/\n'; mkdir -p "$TMP/r28/build"; printf 'BUILD\n' >"$TMP/r28/build/out.bin"
+mkdir -p "$TMP/r28-seed/build"; move_main r28 build/keep.txt kept
+ig --slug "$SLUG" --cwd "$TMP/r28" --cmd 'test -f build/keep.txt'
+M=$(merged_of)
+if [ $RC -eq 0 ] && [ -n "$M" ] && [ "$M" != none ] && [ "$M" != failed ] && [ "$(cat "$TMP/r28/build/out.bin")" = BUILD ]; then ok "B2: an ignored DIRECTORY build/ where main adds build/keep.txt still merges, build/out.bin intact"; else bad "B2 ignored dir" "rc=$RC out=$OUT err=$ERR"; fi
+mkrepos r29
+printf 'base x\n' >"$TMP/r29-seed/x.cfg"; git -C "$TMP/r29-seed" add x.cfg; git -C "$TMP/r29-seed" commit -q -m x; git -C "$TMP/r29-seed" push -q origin main 2>/dev/null
+git -C "$TMP/r29" pull -q --no-rebase --no-edit origin main 2>/dev/null; git -C "$TMP/r29" rm -q x.cfg; git -C "$TMP/r29" commit -q -m 'lane drops x.cfg'
+commit_in "$TMP/r29" .gitignore 'x.cfg\n'; printf 'LANE LOCAL X\n' >"$TMP/r29/x.cfg"
+move_main r29 m.txt main
+ig --slug "$SLUG" --cwd "$TMP/r29" --cmd 'test -f m.txt'
+M=$(merged_of)
+if [ $RC -eq 0 ] && [ -n "$M" ] && [ "$M" != none ] && [ "$M" != failed ] && [ "$(cat "$TMP/r29/x.cfg")" = 'LANE LOCAL X' ]; then ok "B5 (m-4): a file the lane deleted and holds ignored, unchanged on main since the merge base: merges, the file intact"; else bad "B5 lane-deleted ignored" "rc=$RC out=$OUT err=$ERR"; fi
+
 echo "--- round 2: signal races and the verifier (m-c, ruling A) ----------------"
 mkrepos r17; move_main r17 m.txt "from main"; before=$(snap "$TMP/r17")
 gitwrap "$TMP/slow-detach" '"checkout -q --detach"' 'sleep 1.5'
