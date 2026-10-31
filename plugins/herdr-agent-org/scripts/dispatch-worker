@@ -260,13 +260,13 @@ case "$GAUGE" in
 esac
 [ -n "$KEEP_TIER" ] && MARKERS="${MARKERS:+$MARKERS }[TIER-KEPT: ${KEPT_TIER:-$MODEL}, $KEEP_TIER]"
 
-# The worker's board writes silently fall back to ~/.herdr-org/default when
-# this is missing, which reads downstream as "board unavailable" and loses
-# milestones (marketplace#125): fail at spawn time instead. Skyline-routed
+# Without it the worker's board calls fail (board has no default org since
+# 0.1.6; before that they silently landed in ~/.herdr-org/default and lost
+# milestones, marketplace#125): fail at spawn time instead. Skyline-routed
 # shells drop the pane env; measure yours once (ps eww -p <claude-pid> |
 # grep '^HERDR_') and pass it via the tool call's env parameter.
 [ -n "${HERDR_ORG_ROOT:-}" ] || {
-  echo "dispatch-worker: HERDR_ORG_ROOT is not set in this process; refusing to spawn a worker whose board writes would land in ~/.herdr-org/default (marketplace#125)." >&2
+  echo "dispatch-worker: HERDR_ORG_ROOT is not set in this process; refusing to spawn a worker that could not reach its board (marketplace#125)." >&2
   exit 1
 }
 

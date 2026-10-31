@@ -3,7 +3,10 @@
 # Root resolution (first hit):
 #   1. $HERDR_ORG_ROOT
 #   2. $PWD/.herdr-org  if it exists
-#   3. $HOME/.herdr-org/default
+#   otherwise every command but `init` fails with one line naming the fix.
+#   There is no ~/.herdr-org/default fallback any more (0.1.6): it turned a
+#   missing env into a silent "no todo" against the wrong org, and 6 of 6
+#   workers in one session lost 2-4 calls to it before finding their root.
 #
 # Usage:
 #   board init [org-name]
@@ -36,8 +39,6 @@ board_root() {
     printf '%s\n' "$PWD/.herdr-org"
     return
   fi
-  echo "board: HERDR_ORG_ROOT unset; using ${HOME}/.herdr-org/default (wrong org? export it in the pane shell before your agent starts)" >&2
-  printf '%s\n' "${HOME}/.herdr-org/default"
 }
 
 ROOT=$(board_root)
@@ -45,16 +46,15 @@ TODOS="$ROOT/todos"
 PADS="$ROOT/pads"
 META="$ROOT/meta"
 
+no_root() {
+  echo "board: HERDR_ORG_ROOT is unset and $PWD has no .herdr-org, so there is no board to use (never a guessed default): export HERDR_ORG_ROOT=~/.herdr-org/<org>, or run the absolute board command from your dispatch pointer (env HERDR_ORG_ROOT=<root> <abs>/board)." >&2
+  exit 1
+}
+
 need_root() {
+  [ -n "$ROOT" ] || no_root
   if [ ! -d "$TODOS" ]; then
-    if [ -z "${HERDR_ORG_ROOT:-}" ] && [ "$ROOT" = "${HOME}/.herdr-org/default" ]; then
-      echo "board: HERDR_ORG_ROOT is UNSET and the fallback $ROOT does not exist." >&2
-      echo "board: almost always a missing env in THIS pane, not an uninitialized org (marketplace#125)." >&2
-      echo "board: find your org:  ls ~/.herdr-org/   or   grep -rl '<todo-slug>' ~/.herdr-org/*/todos/" >&2
-      echo "board: then export HERDR_ORG_ROOT=~/.herdr-org/<org> (pane shell, before the agent starts) or pass it per call." >&2
-    else
-      echo "board: no board at $ROOT (run: board init)" >&2
-    fi
+    echo "board: no board at $ROOT (run: board init)" >&2
     exit 1
   fi
 }
@@ -587,7 +587,7 @@ usage() {
 cmd=$1; shift
 case "$cmd" in
   init) cmd_init "${1:-default}" ;;
-  path) printf '%s\n' "$ROOT" ;;
+  path) [ -n "$ROOT" ] || no_root; printf '%s\n' "$ROOT" ;;
   list) cmd_list "$@" ;;
   ready) cmd_ready "$@" ;;
   get) [ "$#" -ge 1 ] || usage; cmd_get "$@" ;;

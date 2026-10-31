@@ -111,6 +111,16 @@ HERDR_STUB_TRUST=stuck dw --name lane-a --todo lane-a --no-gauge --accept-trust 
 keys=$(grep 'send-keys' "$HERDR_STUB_LOG" | awk '{print $NF}' | tr '\n' ' ')
 if [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.trust == "unconfirmed" and .state == "trust-prompt"' >/dev/null && [ "$keys" = "down " ]; then ok "--accept-trust, Yes never selected: enter NOT sent, trust=unconfirmed"; else bad "trust stuck" "rc=$RC out=$OUT keys=$keys"; fi
 
+echo "--- board root, no silent default (item 11) --------------------------"
+mkdir -p "$TMP/nowhere"
+OUT=$(cd "$TMP/nowhere" && env -u HERDR_ORG_ROOT sh "$PLUGIN/scripts/board" get lane-a 2>"$TMP/err"); RC=$?
+if [ $RC -ne 0 ] && [ "$(wc -l <"$TMP/err" | tr -d ' ')" = 1 ] && grep -q 'export HERDR_ORG_ROOT=' "$TMP/err" && [ ! -e "$HOME/.herdr-org/default" ]; then ok "no HERDR_ORG_ROOT, no ./.herdr-org: one-line error naming the fix, non-zero, nothing created"; else bad "board no root" "rc=$RC out=$OUT err=$(cat "$TMP/err")"; fi
+OUT=$(cd "$TMP/nowhere" && env -u HERDR_ORG_ROOT sh "$PLUGIN/scripts/board" path 2>/dev/null); RC=$?
+[ $RC -ne 0 ] && [ -z "$OUT" ] && ok "board path with no root: fails, prints no guessed path" || bad "board path" "rc=$RC out=$OUT"
+sh "$PLUGIN/scripts/board" init "$TMP/here/.herdr-org" >/dev/null 2>&1
+OUT=$(cd "$TMP/here" && env -u HERDR_ORG_ROOT sh "$PLUGIN/scripts/board" list 2>&1); RC=$?
+[ $RC -eq 0 ] && ok "explicit ./.herdr-org still resolves without HERDR_ORG_ROOT" || bad "board pwd root" "rc=$RC out=$OUT"
+
 echo "--- hard brief below the top tier (item 9) ----------------------------"
 JEV_STUB_ANSWERS="$(stub "$ANS_HARD")" dw --name lane-a --todo lane-a -- --permission-mode bypassPermissions
 if [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--keep-tier' && [ "$(printf '%s\n' "$ERR" | grep -c 'dispatch-worker:')" = 1 ] && ! grep -q 'pane split' "$HERDR_STUB_LOG"; then ok "hard brief, no choice: one-line refusal before any pane"; else bad "hard no choice" "rc=$RC err=$ERR log=$(cat "$HERDR_STUB_LOG")"; fi
