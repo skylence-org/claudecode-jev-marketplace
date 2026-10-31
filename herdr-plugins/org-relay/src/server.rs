@@ -134,7 +134,8 @@ fn tool_defs() -> Value {
     let inbox_out = json!({"type": "object", "properties": {
         "agent": {"type": "string"}, "count": {"type": "integer"},
         "messages": {"type": "array", "items": msg_schema},
-        "timed_out": {"type": "boolean"}, "note": {"type": "string"}}});
+        "timed_out": {"type": "boolean"}, "note": {"type": "string"},
+        "after_id": {"type": "integer"}, "deferred": {"type": "integer"}}});
     json!([
         {"name": "relay_guide",
          "description": "The relay guide (same text as resource relay://guide). Reading it unlocks the messaging tools for this session: the guide is the wake-plane contract (task-backed awaiting, arm-as-last-call, inbox-first turn entry, consume-after-acting).",
@@ -166,10 +167,11 @@ fn tool_defs() -> Value {
          "outputSchema": {"type": "object", "properties": {
              "consumed": {"type": "integer"}, "of": {"type": "integer"}}}},
         {"name": "relay_await",
-         "description": "Task-backed coverage: wait until a message arrives for agent, then return the unconsumed inbox. Arm it ONLY while you expect a message (an orchestrator with lanes in flight, a worker with a blocker pending), ONE await with a LONG timeout as the LAST call of the turn; an idle role arms nothing and is woken by a native ping or the nudge net (marketplace#1: every timeout of an idle await is a wasted turn). Clients declaring the MCP tasks extension (io.modelcontextprotocol/tasks) get a task handle back immediately and poll tasks/get; other clients hold the call open (Claude Code >= 2.1.212 auto-backgrounds the held call at ~2 minutes into a native background task, freeing the turn — the result arrives as a task notification). timeout_s default 1800, max 3600; a timeout returns cleanly with retry:true — re-arm one new await only if you still expect a message, never a tight loop.",
+         "description": "Task-backed coverage: wait until a message arrives for agent, then return the unconsumed inbox. Arm it ONLY while you expect a message (an orchestrator with lanes in flight, a worker with a blocker pending), ONE await with a LONG timeout as the LAST call of the turn; an idle role arms nothing and is woken by a native ping or the nudge net (marketplace#1: every timeout of an idle await is a wasted turn). Clients declaring the MCP tasks extension (io.modelcontextprotocol/tasks) get a task handle back immediately and poll tasks/get; other clients hold the call open (Claude Code >= 2.1.212 auto-backgrounds the held call at ~2 minutes into a native background task, freeing the turn — the result arrives as a task notification). timeout_s default 1800, max 3600; a timeout returns cleanly with retry:true — re-arm one new await only if you still expect a message, never a tight loop. after_id (optional): wake only for message ids above it; pass the highest id you have already seen to DEFER queued messages you cannot act on yet (a verify job still running) without consuming them — they stay in relay_inbox, and `deferred` counts them.",
          "inputSchema": {"type": "object", "required": ["agent"], "properties": {
              "agent": s("agent name"),
-             "timeout_s": {"type": "integer", "description": "1..3600, default 1800; one long await per idle period"}}},
+             "timeout_s": {"type": "integer", "description": "1..3600, default 1800; one long await per idle period"},
+             "after_id": {"type": "integer", "description": "optional; only ids above this wake the await (default 0: any unconsumed message)"}}},
          "outputSchema": inbox_out},
         {"name": "relay_audit_tail",
          "description": "Last N events from an observability stream. audit = message lifecycle (send / await_start / await_wake with waited_ms and oldest_msg_age_ms / await_timeout / consume). access = one record per MCP tool call. nudge = one record per watchdog turn-starter ring (recipient, outcome, backlog age).",

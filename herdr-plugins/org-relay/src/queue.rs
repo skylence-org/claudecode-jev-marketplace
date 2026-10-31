@@ -589,12 +589,27 @@ pub fn op_sync(name: &str, args: &Value) -> Result<Value, String> {
     }
 }
 
+/// DEFER WITHOUT CONSUMING (1.5.0): a caller that must not act on queued
+/// messages yet (a verify job still running) passes `after_id` = the highest
+/// id it has already seen; the await then wakes only for newer ids, and the
+/// deferred rows stay unconsumed, visible to relay_inbox, and protected by
+/// consume-after-acting. Returns the newer rows and how many were held back.
+pub fn filter_after(msgs: Vec<Value>, after_id: i64) -> (Vec<Value>, usize) {
+    let total = msgs.len();
+    let kept: Vec<Value> = msgs
+        .into_iter()
+        .filter(|m| m.get("id").and_then(|v| v.as_i64()).unwrap_or(0) > after_id)
+        .collect();
+    let deferred = total - kept.len();
+    (kept, deferred)
+}
+
 /// The await: hold until a message lands for `agent`, a timeout passes, or the
 /// caller goes away. Runs as an in-call hold (`direct_cover: true` — the
 /// AwaitGuard held here registers coverage) or as the future backing a task
 /// (`direct_cover: false` — the caller holds a TaskCoverGuard keyed by task
 /// id, so coverage tracks tasks/get poll liveness instead of this future's
-/// mere existence).
+/// mere existence). Only ids above `after_id` (default 0: all) wake it.
 pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String> {
     let agent = req_str(args, "agent")?;
     let timeout_s = args
@@ -602,9 +617,10 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
         .and_then(|v| v.as_u64())
         .unwrap_or(AWAIT_DEFAULT_S)
         .clamp(1, AWAIT_MAX_S);
+    let after_id = args.get("after_id").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
     let _guard = direct_cover.then(|| AwaitGuard::new(&agent));
     log_event("audit", json!({"event":"await_start","agent":agent,"timeout_s":timeout_s,
-        "mode": if direct_cover { "hold" } else { "task" }}));
+        "after_id":after_id, "mode": if direct_cover { "hold" } else { "task" }}));
     let notify = notifier_for(&agent);
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_s);
@@ -619,6 +635,7 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
         })
         .await
         .map_err(|e| format!("await poll task failed: {e}"))??;
+        let (msgs, deferred) = filter_after(msgs, after_id);
         if !msgs.is_empty() {
             // Wake LATENCY: how long this agent was covered, and how old the
             // oldest delivered message was.
@@ -629,9 +646,10 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
                 "waited_ms":started.elapsed().as_millis() as u64,
                 "count":msgs.len(),
                 "ids": msgs.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>(),
-                "oldest_msg_age_ms": oldest_age}));
+                "oldest_msg_age_ms": oldest_age, "after_id": after_id, "deferred": deferred}));
             return Ok(json!({
                 "agent": agent, "count": msgs.len(), "messages": msgs,
+                "after_id": after_id, "deferred": deferred,
                 "note": "messages are NOT auto-consumed; act, then relay_consume the ids"
             }));
         }
@@ -640,7 +658,7 @@ pub async fn op_await(args: &Value, direct_cover: bool) -> Result<Value, String>
             log_event("audit", json!({"event":"await_timeout","agent":agent,
                 "waited_ms":started.elapsed().as_millis() as u64,"timeout_s":timeout_s}));
             return Ok(json!({"agent": agent, "count": 0, "messages": [],
-                "timed_out": true, "retry": true,
+                "timed_out": true, "retry": true, "after_id": after_id, "deferred": deferred,
                 "note": "no messages within timeout_s; re-arm one long relay_await as the last call of this turn"}));
         }
         let poll_in = std::cmp::min(deadline - now, Duration::from_secs(2));
@@ -725,6 +743,16 @@ mod tests {
         assert!(awaiter_active("ghost-filter-probe"));
         // Clear so parallel tests never see a filtering snapshot.
         set_live_agents(None);
+    }
+
+    #[test]
+    fn filter_after_keeps_only_ids_above_after_id() {
+        let msgs = vec![json!({"id": 3}), json!({"id": 5}), json!({"id": 9})];
+        let (kept, deferred) = filter_after(msgs.clone(), 5);
+        assert_eq!(deferred, 2, "ids 3 and 5 are held back, not consumed");
+        assert_eq!(kept, vec![json!({"id": 9})]);
+        let (all, none) = filter_after(msgs, 0);
+        assert_eq!((all.len(), none), (3, 0), "after_id 0 is the 1.4 behaviour");
     }
 
     #[test]

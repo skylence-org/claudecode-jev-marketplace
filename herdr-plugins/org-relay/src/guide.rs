@@ -64,6 +64,13 @@ Rules that keep the org deaf-proof:
    means durably queued, not read. The recipient's await (or the nudge net,
    or your ping (when live_await is false, or always for a sender whose turn
    ends with the send)) is what turns it into a mind reading it.
+5. DEFER WITHOUT CONSUMING (1.5.0). When you must not act on a queued
+   message yet (its verify job is still running), do not consume it early
+   and do not spin on an await that returns at once: re-arm with
+   `relay_await(agent=<you>, after_id=<highest id seen>)`, which wakes only
+   for newer ids. The deferred rows stay unconsumed and in relay_inbox; act
+   and consume them when the job's own message arrives. Left deferred with
+   no await armed, they are backlog, and the nudge net rings you for them.
 
 ## Job wakes (1.5.0)
 
@@ -128,7 +135,8 @@ queue, never instead of it:
   whose turn ends with the send pings once regardless.
 - relay_inbox(agent, include_consumed?) — list queued messages.
 - relay_consume(agent, ids) — mark handled AFTER acting.
-- relay_await(agent, timeout_s?) — task-backed coverage; see the wake model.
+- relay_await(agent, timeout_s?, after_id?) — task-backed coverage; see the
+  wake model. after_id defers known messages (rule 5).
 - relay_status() — queues per recipient + `awaiting` (live coverage) +
   nudge state. Non-empty queues with empty awaiting = deaf org, right now.
 - relay_guide() — this text; reading it (or the relay://guide resource)
@@ -189,6 +197,9 @@ mod tests {
             "WAKE accelerator",
             "SendMessage",
             "io.modelcontextprotocol/tasks",
+            "DEFER WITHOUT CONSUMING",
+            "after_id",
+            "relay-ctl send",
         ] {
             assert!(GUIDE_RESOURCE.contains(phrase), "guide must contain {phrase:?}");
         }
