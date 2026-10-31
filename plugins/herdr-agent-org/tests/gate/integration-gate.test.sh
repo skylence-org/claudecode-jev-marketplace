@@ -324,11 +324,38 @@ printf 'uncommitted worker edit\n' >>"$TMP/r15/b.txt"
 wait $gp; RC=$?; OUT=$(cat "$TMP/bg.out"); ERR=$(cat "$TMP/bg.err")
 if [ $RC -eq 0 ] && [ "$(snap "$TMP/r15")" = "$before" ] && [ "$(git -C "$TMP/r15" rev-parse feat)" = "$FEAT" ] \
    && git -C "$TMP/r15" merge-base --is-ancestor "$WC" "refs/integration-gate/$SLUG/head" \
-   && git -C "$TMP/r15" show 'stash@{0}:b.txt' 2>/dev/null | grep -q 'uncommitted worker edit' \
-   && git -C "$TMP/r15" stash list | grep -q "integration-gate $SLUG: found at restore" \
-   && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*kept: .*refs/integration-gate/$SLUG/head" && printf '%s\n' "$OUT" | grep -q '^RESTORED: .*kept: .*stash'; then
-  ok "a writer commits and edits during an in-place run: nothing lost (commit under refs/integration-gate/<slug>/head, edit in a stash), both named"
+   && git -C "$TMP/r15" show "refs/integration-gate/$SLUG/stash:b.txt" 2>/dev/null | grep -q 'uncommitted worker edit' \
+   && [ -z "$(git -C "$TMP/r15" stash list)" ] \
+   && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*kept: .*refs/integration-gate/$SLUG/head" && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*kept: .*git stash apply refs/integration-gate/$SLUG/stash"; then
+  ok "a writer commits and edits during an in-place run: nothing lost (commit under refs/integration-gate/<slug>/head, edit under refs/integration-gate/<slug>/stash), both named"
 else bad "preserve before discard" "rc=$RC WC=$WC head=$(git -C "$TMP/r15" rev-parse -q --verify "refs/integration-gate/$SLUG/head") stash=$(git -C "$TMP/r15" stash list) snap=$(snap "$TMP/r15") before=$before out=$OUT err=$ERR"; fi
+
+echo "--- round 3: a command's merge is kept before it is aborted; the stash ref; hooks off (I-3 m-2 m-7) --"
+# prep_other NAME: a lane clone with a branch other that adds o.txt.
+prep_other() { mkrepos "$1"; git -C "$TMP/$1" branch other; git -C "$TMP/$1" checkout -q other; commit_in "$TMP/$1" o.txt 'other\n'; git -C "$TMP/$1" checkout -q feat; }
+prep_other r30; before=$(snap "$TMP/r30")
+ig --slug "$SLUG" --cwd "$TMP/r30" --cmd 'git merge -q --no-ff --no-commit other >/dev/null 2>&1; echo "hand edit" >> o.txt; git add o.txt'
+if [ $RC -eq 0 ] && [ "$(snap "$TMP/r30")" = "$before" ] && [ ! -e "$TMP/r30/.git/MERGE_HEAD" ] \
+   && git -C "$TMP/r30" show "refs/integration-gate/$SLUG/stash:o.txt" 2>/dev/null | grep -q 'hand edit' \
+   && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*a merge was in progress.*kept: .*refs/integration-gate/$SLUG/stash"; then
+  ok "A3: a command leaves a --no-commit merge plus a staged hand edit: the edit is kept under refs/integration-gate/<slug>/stash before the abort, RESTORED names the merge and the ref, tree restored"
+else bad "A3 merge kept before abort" "rc=$RC snap=$(snap "$TMP/r30") before=$before stash=$(git -C "$TMP/r30" show "refs/integration-gate/$SLUG/stash:o.txt" 2>&1) out=$OUT err=$ERR"; fi
+mkrepos r31; printf 'worker wip\n' >>"$TMP/r31/b.txt"; git -C "$TMP/r31" stash -q; WS=$(git -C "$TMP/r31" rev-parse refs/stash)
+for i in 1 2; do ig --slug "$SLUG" --cwd "$TMP/r31" --cmd "echo gate$i >> a.txt"; done
+if [ $RC -eq 0 ] && [ "$(git -C "$TMP/r31" rev-parse refs/stash)" = "$WS" ] && [ "$(git -C "$TMP/r31" stash list | wc -l | tr -d ' ')" = 1 ] \
+   && git -C "$TMP/r31" show "refs/integration-gate/$SLUG/stash:a.txt" | grep -q gate2 && git -C "$TMP/r31" show "refs/integration-gate/$SLUG/stash@{1}:a.txt" | grep -q gate1 \
+   && git -C "$TMP/r31" stash apply -q "refs/integration-gate/$SLUG/stash" && grep -q gate2 "$TMP/r31/a.txt"; then
+  ok "m-2: the gate never writes refs/stash (a worker's own stash stays stash@{0}); its finds stack in the reflog of refs/integration-gate/<slug>/stash and git stash apply takes the ref"
+else bad "m-2 stash ref" "rc=$RC stash=$(git -C "$TMP/r31" stash list) ref=$(git -C "$TMP/r31" reflog show "refs/integration-gate/$SLUG/stash" 2>&1) out=$OUT err=$ERR"; fi
+git -C "$TMP/r31" checkout -q -f feat
+mkrepos r32
+printf '#!/bin/sh\ncat >>"%s/rt.log"\n' "$TMP/r32" >"$TMP/r32/.git/hooks/reference-transaction"; chmod +x "$TMP/r32/.git/hooks/reference-transaction"
+: >"$TMP/r32/rt.log"
+ig --slug "$SLUG" --cwd "$TMP/r32" --cmd 'git -c core.hooksPath=/dev/null checkout -q feat && git -c core.hooksPath=/dev/null commit -q --allow-empty -m x && echo y >> a.txt'
+RT=$(awk '$3 ~ /^refs\/(heads\/feat$|integration-gate\/)/' "$TMP/r32/rt.log")
+if [ $RC -eq 0 ] && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*refs/integration-gate/$SLUG/moved" && printf '%s\n' "$OUT" | grep -q "^RESTORED: .*refs/integration-gate/$SLUG/stash" && [ -z "$RT" ]; then
+  ok "m-7: restore's update-ref and stash calls run no lane reference-transaction hook (nothing under refs/heads/feat or refs/integration-gate/ reached it)"
+else bad "m-7 hooks off in restore" "rc=$RC hook-saw=$RT out=$OUT err=$ERR"; fi
 
 echo "--- round 2: ignored lane files survive the test merge (I-D) -------------"
 mkrepos r16

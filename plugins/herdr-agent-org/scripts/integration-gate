@@ -62,10 +62,16 @@
 #    untracked files a command creates stay, and files it deletes do not come
 #    back. One snapshot taken before anything runs is what restore puts back
 #    and what a verifier compares afterwards. Nothing found is discarded
-#    unkept: tracked changes go to a stash, a moved detached HEAD to
-#    refs/integration-gate/<slug>/head, a moved lane branch to
+#    unkept: tracked changes (a merge a command left in progress included:
+#    kept first, then aborted) go to refs/integration-gate/<slug>/stash, a
+#    stash-like commit (`git stash apply <that ref>`; the gate never writes
+#    refs/stash, so a worker's own stash stays stash@{0}), a moved detached
+#    HEAD to refs/integration-gate/<slug>/head, a moved lane branch to
 #    refs/integration-gate/<slug>/moved (the branch is then reset to its
-#    SHA). `RESTORED: <found>; put back to <branch> at <sha>; kept: <...>`
+#    SHA); each ref's reflog keeps an earlier run's value. Only the gate's
+#    own conflicted test merge is aborted unkept. Restore's update-ref and
+#    stash calls run with the lane's hooks off.
+#    `RESTORED: <found>; put back to <branch> at <sha>; kept: <...>`
 #    prints only when the verifier confirms it; otherwise
 #    `RESTORE MISMATCH: <what differs>` prints and the gate fails.
 # 6. --comment files `**[GATE <slug> rc=N]** ...` on todo <slug> (board CLI);
@@ -130,12 +136,13 @@ if [ "$remote" != "$BASE" ] && git remote | grep -qxF "$remote"; then
 fi
 BASE_SHA=$(git rev-parse -q --verify "$BASE^{commit}" 2>/dev/null) || die2 "cannot resolve --base $BASE"
 
-MOVED=0; RUN_SHA=""; RC=0; REPORTED=0
-# gid: git with a fallback identity when none is configured (the stash commit,
-# reflog entries); the caller's own identity otherwise.
+MOVED=0; RUN_SHA=""; RC=0; REPORTED=0; OWN_MERGE=0
+# gid: git with the lane's hooks off (a reference-transaction hook would run
+# lane code for every ref restore writes) and a fallback identity when none
+# is configured (the stash commit, reflog entries).
 gid() {
-  if git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then git "$@"
-  else git -c user.name=integration-gate -c user.email=integration-gate@localhost "$@"; fi
+  if git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then git -c core.hooksPath=/dev/null "$@"
+  else git -c core.hooksPath=/dev/null -c user.name=integration-gate -c user.email=integration-gate@localhost "$@"; fi
 }
 # keep NAME SHA: preserve SHA as $KEEP/NAME; its reflog keeps an earlier
 # run's value.
@@ -148,16 +155,20 @@ unsafe_add() { unsafe="${unsafe:+$unsafe, }$1"; }
 # fields. Only the verifier writes RESTORED: or RESTORE MISMATCH:.
 restore() {
   [ "$MOVED" -eq 1 ] || return 0
-  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git merge --abort >/dev/null 2>&1 || true; fi
-  found=""; kept=""; unsafe=""
+  # The gate's own conflicted test merge holds nobody's work: abort it first.
+  # Any other merge in progress (a command's) is kept by the stash below and
+  # aborted only after that.
+  if [ "$OWN_MERGE" -eq 1 ] && git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then git merge --abort >/dev/null 2>&1 || true; fi
+  found=""; kept=""; unsafe=""; inmerge=0
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then inmerge=1; note "a merge was in progress"; fi
   now_ref=$(git symbolic-ref -q HEAD) || now_ref=""
   now_sha=$(git rev-parse -q --verify HEAD 2>/dev/null) || now_sha=""
   mod=$(git status --porcelain --untracked-files=no 2>/dev/null | cut -c4- | tr '\n' ' ' | sed 's/ *$//')
   if [ -n "$mod" ]; then
     note "tracked files changed: $mod"
     st=$(gid stash create "integration-gate $SLUG: found at restore" 2>/dev/null) || st=""
-    if [ -n "$st" ] && gid stash store -m "integration-gate $SLUG: found at restore" "$st" 2>/dev/null; then
-      kept_add "stash $st (git stash list)"
+    if [ -n "$st" ] && keep stash "$st"; then
+      kept_add "$KEEP/stash (git stash apply $KEEP/stash)"
     else
       unsafe_add "the tracked changes could not be stashed"
     fi
@@ -179,6 +190,7 @@ restore() {
     fi
   fi
   if [ -z "$unsafe" ]; then
+    [ "$inmerge" -eq 0 ] || git merge --abort >/dev/null 2>&1 || true
     if [ -n "$ORIG_REF" ]; then
       if [ -z "$ref_sha" ]; then
         gid update-ref -m "integration-gate $SLUG: recreated" "$ORIG_REF" "$ORIG_SHA" "" 2>/dev/null
@@ -287,9 +299,10 @@ if ! git merge-base --is-ancestor "$BASE_SHA" HEAD 2>/dev/null; then
     printf 'MERGE-FAILED %s: %s (%s) would overwrite or replace lane files the restore cannot bring back (ignored, or in the way of a directory) in tip %s, so no test merge was made: %s\n' "$SLUG" "$BASE" "$BASE_SHA" "$ORIG_SHA" "${clobber% }"
     finish
   fi
+  OWN_MERGE=1
   if merr=$(git -c core.hooksPath=/dev/null -c user.name=integration-gate -c user.email=integration-gate@localhost -c commit.gpgsign=false \
        merge -q --no-ff --no-edit --no-verify -m "integration-gate $SLUG: local merge of $BASE" "$BASE_SHA" 2>&1 >/dev/null); then
-    MERGED=$(git rev-parse HEAD); RUN_SHA=$MERGED
+    MERGED=$(git rev-parse HEAD); RUN_SHA=$MERGED; OWN_MERGE=0
   elif git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
     # The verdict is set and printed before finish restores, so a signal
     # during the restore (ignored there) cannot lose it.
