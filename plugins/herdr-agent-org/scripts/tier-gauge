@@ -23,10 +23,14 @@
 #
 # Policy lives HERE, in code, so a threshold change is a one-line diff:
 #   requested cheap  AND tier != mechanical AND conf >= downgrade_bar  -> refuse
-#   tier == hard AND conf >= upgrade_bar AND requested != top          -> warn
+#   tier == hard AND conf >= upgrade_bar AND requested != top          -> warn, upgrade=advised
 #   risky >= thresholds.risky                                          -> warn (L10 review gate likely mandatory)
 #   any lint noul < thresholds.lint                                    -> warn (brief template item missing)
-# Never auto-upgrades: an upgrade is an explicit, filed act (L17).
+# Never auto-upgrades: an upgrade is an explicit, filed act (L17). The verdict
+# line carries `upgrade=advised` on the hard-brief warning, and dispatch-worker
+# stops there until the orchestrator chooses --upgrade-reason or --keep-tier.
+# A review lane (the reviewer-brief header, or a rev-/rev2- todo) posts ONE
+# report by design, so the milestone-comments lint item is skipped for it.
 set -u
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -92,19 +96,22 @@ T_RISK=$($JEV threshold tier-gauge risky); T_LINT=$($JEV threshold tier-gauge li
 ge() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'; }
 lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a < b) }'; }
 
-VERDICT=ok; WARN=""
+VERDICT=ok; WARN=""; ADVISED=""
 if [ "$REQ" = cheap ] && [ "$TIER" != mechanical ] && ge "$CONF" "$T_DOWN"; then
   VERDICT=refuse
 elif [ "$TIER" = hard ] && ge "$CONF" "$T_UP" && [ "$REQ" != top ]; then
-  VERDICT=warn; WARN="brief reads as HARD (conf $CONF >= $T_UP) and the lane is not on the top tier; consider --model opus --upgrade-reason \"...\" (L17)"
+  VERDICT=warn; ADVISED=1; WARN="brief reads as HARD (conf $CONF >= $T_UP) and the lane is not on the top tier; dispatch-worker stops here: pass --model opus --upgrade-reason \"...\" or --keep-tier \"<why>\" (L17)"
 fi
 if ge "$RISKY" "$T_RISK"; then
   [ "$VERDICT" = ok ] && VERDICT=warn
   WARN="${WARN:+$WARN; }risky=$RISKY >= $T_RISK: expect L10 MANDATORY-REVIEW at accept"
 fi
+REVIEW_LANE=0
+case "$TODO" in rev-*|rev2-*) REVIEW_LANE=1 ;; esac
+case "$BRIEF" in *"You are the review lane for todo"*) REVIEW_LANE=1 ;; esac
 LINT=""
 lt "$L_TREE" "$T_LINT" && LINT="${LINT:+$LINT,}lane-tree-path"
-lt "$L_MILE" "$T_LINT" && LINT="${LINT:+$LINT,}milestone-comments"
+[ "$REVIEW_LANE" -eq 0 ] && lt "$L_MILE" "$T_LINT" && LINT="${LINT:+$LINT,}milestone-comments"
 lt "$L_SNIP" "$T_LINT" && LINT="${LINT:+$LINT,}board-snippets"
 if [ -n "$LINT" ]; then
   [ "$VERDICT" = ok ] && VERDICT=warn
@@ -114,10 +121,10 @@ fi
 [ -n "$WARN" ] && echo "tier-gauge: $WARN" >&2
 
 if [ "$JSON" -eq 1 ]; then
-  jq -nc --arg v "$VERDICT" --arg r "$REQ" --arg t "$TIER" --argjson c "$CONF" --argjson k "$RISKY" --arg l "$LINT" --arg m "$MODEL_ID" \
-    '{verdict:$v, requested:$r, tier:$t, confidence:$c, risky:$k, lint_missing:($l|split(",")|map(select(length>0))), model:$m}'
+  jq -nc --arg v "$VERDICT" --arg r "$REQ" --arg t "$TIER" --argjson c "$CONF" --argjson k "$RISKY" --arg l "$LINT" --arg m "$MODEL_ID" --arg a "$ADVISED" \
+    '{verdict:$v, requested:$r, tier:$t, confidence:$c, risky:$k, lint_missing:($l|split(",")|map(select(length>0))), upgrade_advised:($a == "1"), model:$m}'
 else
-  echo "TIER-GAUGE: $MODEL_ID tier=$TIER conf=$CONF risky=$RISKY requested=$REQ verdict=$VERDICT${LINT:+ lint=$LINT}"
+  echo "TIER-GAUGE: $MODEL_ID tier=$TIER conf=$CONF risky=$RISKY requested=$REQ verdict=$VERDICT${ADVISED:+ upgrade=advised}${LINT:+ lint=$LINT}"
 fi
 
 if [ "$VERDICT" = refuse ]; then

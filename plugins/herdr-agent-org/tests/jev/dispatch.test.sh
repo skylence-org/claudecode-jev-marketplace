@@ -47,8 +47,11 @@ case "$1 $2" in
   *)             exit 0 ;;
 esac
 EOF
-chmod +x "$STUBBIN/herdr"
-export HERDR_BIN_PATH="$STUBBIN/herdr" HERDR_STUB_LOG="$TMP/herdr.log" HERDR_ENV=1 HERDR_PANE_ID=w1:p1
+# A pane id no live pane carries: dispatch-worker resolves its session from the
+# pane map /tmp/claude-herdr-org-pane-<id>, and a real-shaped id could arm a
+# live session's stop gate.
+export HERDR_BIN_PATH="$STUBBIN/herdr" HERDR_STUB_LOG="$TMP/herdr.log" HERDR_ENV=1 HERDR_PANE_ID="dwtest-$$:p1"
+trap 'rm -rf "$TMP" "/tmp/claude-herdr-org-pane-dwtest-$$_p1"' EXIT
 export HERDR_ORG_ROOT="$TMP/org"
 export PATH="$PLUGIN/scripts:$PATH"
 sh "$PLUGIN/scripts/board" init "$HERDR_ORG_ROOT" >/dev/null 2>&1

@@ -1,6 +1,6 @@
 # Reviewer-lane dispatch contract (L10)
 
-Orchestrator usage, binding: fill every `<placeholder>`; generate the review package FIRST (`git log --oneline <base>..<head>`, `git diff --stat <base>..<head>`, `git diff -U10 <base>..<head>`, all teed to `/tmp/<slug>_review.diff` so the diff never transits your context); dispatch the reviewer as its own lane (`rev-i<nr>-<slug>`, read-only, same board, herdr-worker conduct applies); NEVER pre-judge — a dispatch containing "do not flag X", "at most Minor", or "the plan chose this" is you sparing yourself a loop; let the reviewer flag, then adjudicate per the bounce loop. Reviewer tier per TIER BY BRIEF: sonnet default, above it only with an L17 filing.
+Orchestrator usage, binding: fill every `<placeholder>`; generate the review package FIRST (`git log --oneline <base>..<head>`, `git diff --stat <base>...<head>`, `git diff -U10 <base>...<head>`, all teed to `/tmp/<slug>_review.diff` so the diff never transits your context; THREE dots on both diffs, from the merge base, so a `main` that moved on never pulls another merged PR's files into the review, two dots on the log); dispatch the reviewer as its own lane (`rev-i<nr>-<slug>`, read-only, same board, herdr-worker conduct applies); NEVER pre-judge — a dispatch containing "do not flag X", "at most Minor", or "the plan chose this" is you sparing yourself a loop; let the reviewer flag, then adjudicate per the bounce loop. Reviewer tier per TIER BY BRIEF: sonnet default, above it only with an L17 filing.
 
 The todo body for the reviewer lane is the block below, placeholders filled:
 
@@ -19,4 +19,4 @@ VERDICT, forced, exactly one: `READY: yes` | `READY: with-fixes` | `READY: no`, 
 
 REPORT: the full report is ONE milestone comment on `<slug>` (`**[REVIEW-OK]**` when READY: yes, otherwise `**[REVIEW-FINDINGS]**`), then the [DONE] footer per worker conduct, then the doorbell to `<orchestrator-agent>` over `relay_send` (durable, composer-free), with the native ping follow-up whenever the dispatch handshake gave you an address, whatever `live_await` the result carries (the send is your turn's last act, so a true is a prediction you can never re-check).
 
-NEVER: "looks good" without the requirement map; nitpicks ranked Critical; findings on code you did not read; vague fixes ("improve error handling"); withholding the verdict.
+NEVER: "looks good" without the requirement map; nitpicks ranked Critical; findings on code you did not read; vague fixes ("improve error handling"); withholding the verdict; deleting a path you did not create, or any path you have not listed first (`ls -la <path>` before any `rm`).
