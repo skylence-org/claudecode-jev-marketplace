@@ -5,6 +5,9 @@
 # the box's real relay-ctl can never be reached.
 #
 # Run: bash plugins/herdr-agent-org/tests/gate/integration-gate.test.sh
+# IG_SH=dash (or bash) runs the gate under that shell instead of sh; the
+# hangup case always runs under dash when it is installed (dash runs no EXIT
+# trap on SIGHUP, so it is the shell that proves the HUP trap).
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -57,8 +60,23 @@ mkrepos() {
 move_main() { printf '%s\n' "$3" >"$TMP/$1-seed/$2"; git -C "$TMP/$1-seed" add "$2"; git -C "$TMP/$1-seed" commit -q -m "main moved: $2"; git -C "$TMP/$1-seed" push -q origin main 2>/dev/null; }
 commit_in() { printf '%b' "$3" >"$1/$2"; git -C "$1" add "$2"; git -C "$1" commit -q -m "add $2"; }
 snap() { printf '%s %s %s' "$(git -C "$1" rev-parse HEAD)" "$(git -C "$1" symbolic-ref -q HEAD || echo detached)" "$(git -C "$1" status --porcelain | tr '\n' ';')"; }
-ig() { OUT=$(PATH="$STUBBIN:$BASEPATH" sh "$IG" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
-ig_norelay() { OUT=$(PATH="$BASEPATH" sh "$IG" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
+IG_SH=${IG_SH:-sh}
+ig() { OUT=$(PATH="$STUBBIN:$BASEPATH" $IG_SH "$IG" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
+ig_norelay() { OUT=$(PATH="$BASEPATH" $IG_SH "$IG" "$@" 2>"$TMP/err"); RC=$?; ERR=$(cat "$TMP/err"); }
+# ig_bg SHELL SIG ARGS...: run the gate in the background, wait until its first
+# command is running (its log exists), send SIG once, collect the exit.
+ig_bg() {
+  local shell=$1 sig=$2 log1="/tmp/gate_${SLUG}_1.log" pid i=0
+  shift 2
+  [ -e "$log1" ] && ls -la "$log1" >/dev/null && rm -f "$log1"
+  PATH="$STUBBIN:$BASEPATH" "$shell" "$IG" "$@" >"$TMP/bg.out" 2>"$TMP/bg.err" &
+  pid=$!
+  while [ ! -e "$log1" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  sleep 0.3
+  kill -"$sig" "$pid"
+  wait "$pid"; RC=$?
+  OUT=$(cat "$TMP/bg.out"); ERR=$(cat "$TMP/bg.err")
+}
 merged_of() { printf '%s\n' "$OUT" | sed -n 's/^GATE-DONE .* merged=\([^ ]*\) .*/\1/p'; }
 
 echo "--- integration-gate ---------------------------------------------------"
@@ -136,6 +154,64 @@ ig --slug "$SLUG" --cwd "$TMP/r1" --base origin/no-such --cmd true
 printf 'dirty\n' >>"$TMP/r1/b.txt"
 ig --slug "$SLUG" --cwd "$TMP/r1" --cmd true
 [ $RC -eq 2 ] && grep -q dirty "$TMP/r1/b.txt" && ok "tracked modifications: refused (exit 2), working tree untouched" || bad "dirty" "rc=$RC err=$ERR"
+
+echo "--- signals (review I1) -------------------------------------------------"
+mkrepos r6
+move_main r6 m.txt "from main"
+before=$(snap "$TMP/r6")
+: >"$TMP/relay.log"
+ig_bg "$IG_SH" TERM --slug "$SLUG" --cwd "$TMP/r6" --cmd 'sleep 3' --notify orch-x
+if [ "$(snap "$TMP/r6")" = "$before" ] && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG " && grep -q -- '--to orch-x' "$TMP/relay.log" && grep -q 'rc=143' "$TMP/relay.log" && [ $RC -eq 143 ]; then ok "TERM mid-command on a merged run: tree restored, GATE-DONE printed, relay notified, exit 143"; else bad "term finish" "rc=$RC snap=$(snap "$TMP/r6") before=$before out=$OUT relay=$(cat "$TMP/relay.log")"; fi
+if command -v dash >/dev/null 2>&1; then
+  : >"$TMP/relay.log"
+  ig_bg dash HUP --slug "$SLUG" --cwd "$TMP/r6" --cmd 'sleep 3' --notify orch-x
+  if [ "$(snap "$TMP/r6")" = "$before" ] && printf '%s\n' "$OUT" | tail -1 | grep -q "^GATE-DONE $SLUG " && grep -q 'rc=129' "$TMP/relay.log" && [ $RC -eq 129 ]; then ok "HUP under dash mid-command: tree restored, GATE-DONE printed, relay notified, exit 129"; else bad "hup dash" "rc=$RC snap=$(snap "$TMP/r6") before=$before out=$OUT relay=$(cat "$TMP/relay.log")"; fi
+else
+  echo "skip HUP under dash: dash not installed"
+fi
+
+echo "--- in place, restored too (review I2) ----------------------------------"
+mkrepos r7
+before=$(snap "$TMP/r7"); FEAT=$(git -C "$TMP/r7" rev-parse feat)
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd 'git checkout -q main'
+[ $RC -eq 0 ] && [ "$(snap "$TMP/r7")" = "$before" ] && printf '%s' "$OUT" | grep -q '^RESTORED:' && ok "in place: a command that checks out main is undone, RESTORED: names it" || bad "in-place checkout" "rc=$RC snap=$(snap "$TMP/r7") before=$before out=$OUT"
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd 'echo x >> a.txt'
+[ $RC -eq 0 ] && [ "$(snap "$TMP/r7")" = "$before" ] && printf '%s' "$OUT" | grep -q '^RESTORED:.*a.txt' && ok "in place: a command that edits a tracked file is undone, RESTORED: names the file" || bad "in-place dirty" "rc=$RC snap=$(snap "$TMP/r7") before=$before out=$OUT"
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd 'git commit -q --allow-empty -m gate-made'
+[ $RC -eq 0 ] && [ "$(snap "$TMP/r7")" = "$before" ] && [ "$(git -C "$TMP/r7" rev-parse feat)" = "$FEAT" ] && ok "in place: a command that commits never moves the lane branch" || bad "in-place commit" "rc=$RC feat=$(git -C "$TMP/r7" rev-parse feat) want=$FEAT out=$OUT"
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd true
+! printf '%s' "$OUT" | grep -q '^RESTORED:' && ok "in place, nothing changed: no RESTORED: line" || bad "restored noise" "out=$OUT"
+
+echo "--- known-fail never hides a crash (review I3) --------------------------"
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd 'echo "--- FAIL: TestFlaky (1.0s)"; echo "Segmentation fault"; exit 139' --known-fail 'TestFlaky \('
+[ $RC -eq 1 ] && printf '%s' "$OUT" | grep -q 'known-only rc=139' && printf '%s' "$OUT" | grep -q 'failed=1 known=1$' && ok "known failure line plus exit 139: counted failed, known-only rc=139 printed" || bad "known crash" "rc=$RC out=$OUT"
+ig --slug "$SLUG" --cwd "$TMP/r7" --cmd 'echo "--- FAIL: TestFlakyButRealRegression (1.0s)"; exit 1' --known-fail 'TestFlaky \('
+[ $RC -eq 1 ] && printf '%s' "$OUT" | grep -q '^  --- FAIL: TestFlakyButRealRegression' && ok "the documented anchored form 'TestFlaky \\(' does not hide TestFlakyButRealRegression" || bad "anchored known" "rc=$RC out=$OUT"
+grep -q "TestFlaky \\\\(" "$IG" && ok "usage text shows the anchored --known-fail form" || bad "usage anchor" "$(grep -n 'known-fail' "$IG" | head -5)"
+
+echo "--- test merge: hooks, non-conflict failure, gate-file trust (m1 m2 m3) --"
+mkrepos r9
+move_main r9 m.txt "from main"
+for h in post-merge prepare-commit-msg; do printf '#!/bin/sh\ntouch "%s/hook-%s"\n' "$TMP" "$h" >"$TMP/r9/.git/hooks/$h"; chmod +x "$TMP/r9/.git/hooks/$h"; done
+ig --slug "$SLUG" --cwd "$TMP/r9" --cmd true
+[ $RC -eq 0 ] && [ ! -e "$TMP/hook-post-merge" ] && [ ! -e "$TMP/hook-prepare-commit-msg" ] && ok "the test merge runs no repo hook (post-merge, prepare-commit-msg)" || bad "hooks ran" "rc=$RC $(echo "$TMP"/hook-*)"
+mkrepos r10
+move_main r10 main-only.txt "from main"
+printf 'lane copy\n' >"$TMP/r10/main-only.txt"
+before=$(snap "$TMP/r10")
+ig --slug "$SLUG" --cwd "$TMP/r10" --cmd true
+if [ $RC -eq 2 ] && printf '%s' "$OUT" | grep -q 'MERGE-FAILED' && ! printf '%s' "$OUT" | grep -q 'MERGE-CONFLICT' && printf '%s%s' "$OUT" "$ERR" | grep -q 'main-only.txt' && [ "$(snap "$TMP/r10")" = "$before" ] && ! printf '%s' "$OUT" | grep -q '^true rc='; then ok "a merge that fails without a conflict: MERGE-FAILED plus git's reason, exit 2, tree as before"; else bad "merge failed" "rc=$RC out=$OUT err=$ERR snap=$(snap "$TMP/r10") before=$before"; fi
+ig --slug "$SLUG" --cwd "$TMP/r2"
+[ $RC -eq 0 ] && printf '%s' "$ERR" | grep -q '\.herdr-gate.*has none' && ok ".herdr-gate the base lacks: warned (the gated tree chose its own commands)" || bad "gate file trust none" "rc=$RC err=$ERR"
+mkrepos r8
+move_main r8 .herdr-gate 'true'
+git -C "$TMP/r8" fetch -q && git -C "$TMP/r8" merge -q --no-edit origin/main
+ig --slug "$SLUG" --cwd "$TMP/r8"
+[ $RC -eq 0 ] && ! printf '%s' "$ERR" | grep -q 'herdr-gate' && ok ".herdr-gate equal to the base's: no warning" || bad "gate file same" "rc=$RC err=$ERR"
+commit_in "$TMP/r8" .herdr-gate 'true\necho lane-added\n'
+ig --slug "$SLUG" --cwd "$TMP/r8"
+[ $RC -eq 0 ] && printf '%s' "$ERR" | grep -q '\.herdr-gate.*differs' && ok ".herdr-gate that differs from the base's: warned" || bad "gate file differs" "rc=$RC err=$ERR"
+grep -qi 'trust' "$IG" && grep -q 'sh -c' "$IG" && grep -qi 'privileges' "$IG" && ok "the script header states the gate-file trust boundary" || bad "header trust" "no trust boundary text"
 
 echo
 echo "integration-gate: $PASS passed, $FAIL failed"
