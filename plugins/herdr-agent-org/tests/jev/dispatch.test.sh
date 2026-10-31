@@ -239,6 +239,32 @@ done
 dw --name lane-r --todo lane-r --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
 S=$(startline)
 [ -n "$RNAME" ] && printf '%s' "$S" | grep -qF "replacer skill ($RNAME)" && ! printf '%s' "$S" | grep -q 'herdr-worker skill' && ok "pointer says 'replacer skill ($RNAME)' (name from skills/replacer/SKILL.md) and never 'herdr-worker skill'" || bad "skill phrase" "name=$RNAME start=$S"
+
+echo "--- round 2: last bounce wins, a bad round warns (m-f m-g m-h) ---------"
+# m-h: a later [BOUNCE 1/3] after a [BOUNCE 2/3] is the round (LAST, not
+# highest), from both surfaces.
+bd create lane-h --title "h" --body-file "$TMP/brief.md"
+printf '**[BOUNCE 2/3]**\nDIGEST\n- fix F2\n' | bd comment lane-h --stdin
+printf '**[BOUNCE 1/3]**\nDIGEST\n- restarted at round 1\n' | bd comment lane-h --stdin
+tg=$(sh "$TGS" --todo lane-h --round-only 2>/dev/null)
+dw --name lane-h --todo lane-h --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+S=$(startline)
+[ "$tg" = 1 ] && [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == 1' >/dev/null && printf '%s' "$S" | grep -qF 'bounce 1/3' && ok "m-h: [BOUNCE 2/3] then [BOUNCE 1/3]: round 1 from tier-gauge --round-only and from --replacer (last, not highest)" || bad "m-h last bounce" "tg=$tg rc=$RC out=$OUT start=$S"
+# m-g: a detected round outside 1-4 warns and is omitted.
+for r in 0 5; do
+  bd create "lane-g$r" --title "g$r" --body-file "$TMP/brief.md"
+  printf '**[BOUNCE %s/3]**\nDIGEST\n- odd round\n' "$r" | bd comment "lane-g$r" --stdin
+  dw --name "lane-g$r" --todo "lane-g$r" --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+  S=$(startline)
+  [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == null' >/dev/null && ! printf '%s' "$S" | grep -qi 'bounce' && printf '%s' "$ERR" | grep -q "round '$r'" && ok "m-g: a detected [BOUNCE $r/3] is outside 1-4: warned, the pointer has no round" || bad "m-g round $r" "rc=$RC out=$OUT err=$ERR start=$S"
+done
+# m-f: tier-gauge --round-only failing (an empty-body todo exits 2) warns.
+: >"$TMP/empty.md"
+bd create lane-f --title "f" --body-file "$TMP/empty.md"
+printf '**[BOUNCE 2/3]**\nDIGEST\n- fix F2\n' | bd comment lane-f --stdin
+sh "$TGS" --todo lane-f --round-only >/dev/null 2>&1; tgrc=$?
+dw --name lane-f --todo lane-f --cwd "$RLANE" --replacer --no-gauge -- --permission-mode bypassPermissions
+[ $tgrc -ne 0 ] && [ $RC -eq 0 ] && printf '%s' "$OUT" | jq -e '.bounce == null' >/dev/null && printf '%s' "$ERR" | grep -q "round-only exited $tgrc" && ok "m-f: tier-gauge --round-only exiting $tgrc warns (the pointer omits the round; pass --bounce N)" || bad "m-f gauge failure" "tgrc=$tgrc rc=$RC out=$OUT err=$ERR"
 echo
 echo "dispatch-worker: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ] || exit 1

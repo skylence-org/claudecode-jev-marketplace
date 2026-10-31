@@ -87,7 +87,8 @@
 # `tier-gauge --todo <slug> --round-only`, the parser the gauge itself uses:
 # the LAST comment whose first line starts with `**[BOUNCE r/n]` or
 # `[BOUNCE 4 / ESCALATION]`, after the board's own `## Comments`. Round 4
-# points at the ESCALATION comment. No bounce comment omits the clause.
+# points at the ESCALATION comment. No bounce comment omits the clause; a
+# failing tier-gauge or a detected round outside 1-4 warns and omits it.
 # Every other flag applies unchanged; the JSON summary adds replacer, tip,
 # bounce.
 # The lane is also appended to this session's org-stop-gate marker, so a
@@ -236,8 +237,17 @@ if [ "$REPLACER" -eq 1 ]; then
     # One parser (review I4): the round comes from tier-gauge, never a second
     # reading of the trail here.
     if [ -x "$HERE/tier-gauge" ]; then
-      BOUNCE_N=$("$HERE/tier-gauge" --todo "$TODO" --round-only 2>/dev/null) || BOUNCE_N=""
-      case "$BOUNCE_N" in *[!0-9]*) BOUNCE_N="" ;; esac
+      tg_rc=0
+      BOUNCE_N=$("$HERE/tier-gauge" --todo "$TODO" --round-only 2>/dev/null) || tg_rc=$?
+      if [ "$tg_rc" -ne 0 ]; then
+        echo "dispatch-worker: --replacer: tier-gauge --round-only exited $tg_rc; the pointer omits the round (pass --bounce N)." >&2
+        BOUNCE_N=""
+      fi
+      # Empty is a lane with no bounce; anything but 1-4 is a misread round.
+      case "$BOUNCE_N" in
+        ""|1|2|3|4) ;;
+        *) echo "dispatch-worker: --replacer: detected round '$BOUNCE_N' is outside 1-4; the pointer omits it (pass --bounce N)." >&2; BOUNCE_N="" ;;
+      esac
     else
       echo "dispatch-worker: --replacer: no scripts/tier-gauge to read the bounce round with; the pointer omits it (pass --bounce N)." >&2
     fi
