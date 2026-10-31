@@ -35,7 +35,7 @@ cat >"$STUBBIN/herdr" <<'EOF'
 echo "$*" >>"$HERDR_STUB_LOG"
 case "$1 $2" in
   "pane list")   if [ -n "${HERDR_STUB_PANES:-}" ]; then echo "$HERDR_STUB_PANES"; else echo '{"result":{"panes":[]}}'; fi ;;
-  "pane split")  echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
+  "pane split")  [ -n "${HERDR_STUB_SPLIT_FAIL:-}" ] && { echo 'split refused' >&2; exit 1; }; echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;
   "agent start") echo '{"result":{"ok":true}}' ;;
   "agent wait")  [ -n "${HERDR_STUB_TRUST:-}" ] && ! grep -q 'send-keys .* enter$' "$HERDR_STUB_LOG" && exit 1; exit 0 ;;
   "agent read")
@@ -125,7 +125,7 @@ echo "--- hard brief below the top tier (item 9) ----------------------------"
 JEV_STUB_ANSWERS="$(stub "$ANS_HARD")" dw --name lane-a --todo lane-a -- --permission-mode bypassPermissions
 if [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--keep-tier' && [ "$(printf '%s\n' "$ERR" | grep -c 'dispatch-worker:')" = 1 ] && ! grep -q 'pane split' "$HERDR_STUB_LOG"; then ok "hard brief, no choice: one-line refusal before any pane"; else bad "hard no choice" "rc=$RC err=$ERR log=$(cat "$HERDR_STUB_LOG")"; fi
 JEV_STUB_ANSWERS="$(stub "$ANS_HARD")" dw --name lane-a --todo lane-a --keep-tier "long, not hard" -- --permission-mode bypassPermissions
-if [ $RC -eq 0 ] && sh "$PLUGIN/scripts/board" get lane-a | grep -q 'TIER-KEPT: hard, long, not hard'; then ok "--keep-tier: dispatched, [TIER-KEPT: hard, <why>] filed"; else bad "keep-tier" "rc=$RC err=$ERR"; fi
+if [ $RC -eq 0 ] && sh "$PLUGIN/scripts/board" get lane-a | grep -q 'TIER-KEPT: model=sonnet brief_tier=hard, long, not hard'; then ok "--keep-tier: dispatched, [TIER-KEPT: model=<m> brief_tier=hard, <why>] filed"; else bad "keep-tier" "rc=$RC err=$ERR"; fi
 JEV_STUB_ANSWERS="$(stub "$ANS_HARD")" dw --name lane-a --todo lane-a --upgrade-reason "design work" -- --model opus --permission-mode bypassPermissions
 if [ $RC -eq 0 ] && ! printf '%s' "$OUT" | jq -e '.gauge | test("upgrade=advised")' >/dev/null; then ok "--model opus --upgrade-reason: top tier, no stop"; else bad "hard opus" "rc=$RC out=$OUT err=$ERR"; fi
 
@@ -140,9 +140,18 @@ sh "$PLUGIN/scripts/board" get lane-a | grep -q 'MODEL: opus, needs design' && s
 dw --relaunch lane-a --model sonnet --no-gauge
 [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q -- '--keep-tier' && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch downgrade without --keep-tier: refused, nothing closed" || bad "relaunch no reason" "rc=$RC err=$ERR"
 dw --relaunch lane-a --model sonnet --keep-tier "opus not needed" --no-gauge
-[ $RC -eq 0 ] && sh "$PLUGIN/scripts/board" get lane-a | grep -q 'TIER-KEPT: sonnet, opus not needed' && ok "--relaunch downgrade with --keep-tier: [TIER-KEPT] filed" || bad "relaunch keep" "rc=$RC err=$ERR"
+[ $RC -eq 0 ] && sh "$PLUGIN/scripts/board" get lane-a | grep -q 'TIER-KEPT: model=sonnet brief_tier=ungauged, opus not needed' && ok "--relaunch downgrade with --keep-tier: [TIER-KEPT: model=sonnet brief_tier=ungauged, <why>] filed" || bad "relaunch keep" "rc=$RC err=$ERR"
 HERDR_STUB_CWD=/nonexistent dw --relaunch lane-a --model opus --upgrade-reason x --no-gauge
 [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'lane tree' && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch with the lane tree missing: refused" || bad "relaunch no tree" "rc=$RC err=$ERR"
+# Target guard (review I2): never close a pane that is not this lane's.
+HERDR_STUB_PANES='{"result":{"panes":[{"pane_id":"w1:p5","label":"other-x: other-todo"}]}}' dw --relaunch lane-a --todo lane-a --model opus --upgrade-reason x --no-gauge
+[ $RC -eq 2 ] && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch R1: pane labelled for another lane is refused, nothing closed" || bad "relaunch R1" "rc=$RC err=$ERR log=$(cat "$HERDR_STUB_LOG")"
+HERDR_PANE_ID=w1:p5 dw --relaunch lane-a --model opus --upgrade-reason x --no-gauge
+[ $RC -eq 2 ] && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch R2: the caller's own pane is refused, nothing closed" || bad "relaunch R2" "rc=$RC err=$ERR"
+# Reap before split (review I3): a failed split leaves a board record and the exact re-dispatch.
+HERDR_STUB_SPLIT_FAIL=1 dw --relaunch lane-a --model opus --upgrade-reason "split probe" --no-gauge
+trail=$(sh "$PLUGIN/scripts/board" get lane-a)
+if [ $RC -ne 0 ] && printf '%s' "$trail" | grep -q 'RELAUNCH: w1:p5 reaped, split probe' && printf '%s' "$trail" | grep -q 'RELAUNCH-FAILED' && printf '%s' "$ERR" | grep -q 'dispatch-worker --name lane-a --todo lane-a'; then ok "--relaunch R3: failed split after the reap files the reap and the failure, names the re-dispatch"; else bad "relaunch R3" "rc=$RC err=$ERR trail=$(printf '%s' "$trail" | tail -4)"; fi
 sh "$PLUGIN/scripts/board" set-status lane-a verified >/dev/null 2>&1
 dw --relaunch lane-a --model opus --upgrade-reason x --no-gauge
 [ $RC -eq 2 ] && printf '%s' "$ERR" | grep -q 'is verified' && ! grep -q 'pane close' "$HERDR_STUB_LOG" && ok "--relaunch on a verified todo: refused, nothing closed" || bad "relaunch verified" "rc=$RC err=$ERR"

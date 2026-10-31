@@ -125,7 +125,7 @@ dispatch-worker --name impl-a --todo impl-a --cwd /abs/lane-tree \
 
 `dispatch-worker` fills in the doctrinal default itself (`--model sonnet` for a Claude worker, `--effort medium` for a grok one) when you pass none, so silence at dispatch cannot resolve to whatever the box is installed at. Going above that default requires `--upgrade-reason "<why>"`, which the script refuses to skip and files on the lane todo as `[MODEL: ...]` or `[EFFORT: ...]`. A bare `herdr agent start` has no such protection, so pass the setting yourself there. Both rules come from [issue #32](https://github.com/skylence-org/multi-llm-marketplace/issues/32).
 
-A brief `tier-gauge` reads as HARD below the top tier (`upgrade=advised`) stops the dispatch before any pane exists: pass `-- --model opus --upgrade-reason "<why>"` or `--keep-tier "<why>"`, filed as `[TIER-KEPT: <tier>, <why>]`. To change a just-started worker's model, `dispatch-worker --relaunch <name> --model <m>` (with `--upgrade-reason` or `--keep-tier`) closes its pane and starts the same name in the same lane tree with the same todo, filing `[RELAUNCH: <old pane> -> <new pane>, <why>]`.
+A brief `tier-gauge` reads as HARD below the top tier (`upgrade=advised`) stops the dispatch before any pane exists: pass `-- --model opus --upgrade-reason "<why>"` or `--keep-tier "<why>"`, filed as `[TIER-KEPT: model=<m> brief_tier=<tier>, <why>]`. To change a just-started worker's model, `dispatch-worker --relaunch <name> --model <m>` (with `--upgrade-reason` or `--keep-tier`) closes its pane and starts the same name in the same lane tree with the same todo, filing `[RELAUNCH: <old pane> -> <new pane>, <why>]`.
 
 ## The Herdr substrate at a glance
 

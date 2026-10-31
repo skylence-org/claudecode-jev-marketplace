@@ -75,7 +75,7 @@ herdr agent get reviewer
 
 The first prompt rides the launch arguments (the trailing quoted string after `--` above): Claude Code auto-submits it as the first message, so nothing is ever typed into the composer.
 
-Messaging a live CLAUDE session: the native ping only (`SendMessage`, target resolved from a `ListAgents` row; CC >= 2.1.224); it touches no composer, arrives attributed, and starts a turn in an idle session. Anything that must be on the record goes over the org-relay (`relay_send`). `herdr agent prompt` and text-bearing `send-keys` are banned in this org for communication (orchestrator L11); `send-keys <name> esc` stays as the content-free interrupt.
+Messaging a live CLAUDE session: the native ping only (`SendMessage`, target resolved from a `ListAgents` row; CC >= 2.1.224); it touches no composer, arrives attributed, and starts a turn in an idle session. Anything that must be on the record goes over the org-relay (`relay_send`). `herdr agent prompt` and text-bearing `send-keys` are banned in this org for communication (orchestrator L11); `send-keys <name> esc` stays as the content-free interrupt, and the one other exception is `down` then `enter` on a STARTUP folder-trust dialog, only after the frame shows the selected `❯ ... Yes, I trust this folder` line (`dispatch-worker --accept-trust`).
 
 Ordinary commands (tests, servers) go through the pane, not the agent:
 
