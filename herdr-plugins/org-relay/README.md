@@ -120,10 +120,8 @@ Layout: `src/queue.rs` (data plane + awaiter and last-seen registries + stats),
 `send`, `purge`), `test/` (concurrency smoke, nudge classify, relay-ctl
 send and purge suites).
 
-Status: 1.5.0 is written but NOT yet compiled: the change set was authored
-under the org's compile monopoly, so its first `cargo test` is the
-orchestrator's integration gate. The shell suites and every new SQL
-statement were run; the Rust unit tests were written, not run. History,
+Status: 1.5.0 — gate: `cargo test` and the concurrency smoke in the
+org-relay CI job, plus the relay-ctl send and purge suites. History,
 1.0.0 — compiled, `cargo test` green (gate transitions, pinned
 refusal text, nudge predicate incl. task-backed suppression, guide hash,
 tool-def deserialization), wire-smoked end to end (gate refusal → unlock →
