@@ -292,7 +292,7 @@ Every OTHER board subcommand (`get`, `list`, `comment`, `set-status`, ...) reads
 ```bash
 test -n "$HERDR_ORG_ROOT"
 ```
-Unset means stop and redo the bootstrap above; never improvise with ad-hoc exports inside the Claude session, since they die with the current shell call. Left unset, the board CLI silently falls back to `~/.herdr-org/default`, quietly sending this org's milestones to the wrong board.
+Unset means stop and redo the bootstrap above; never improvise with ad-hoc exports inside the Claude session, since they die with the current shell call. Left unset, every board call fails with a one-line error naming the fix (0.1.6; it used to fall back silently to `~/.herdr-org/default`, quietly sending this org's milestones to the wrong board).
 
 **Read that guard with the harness Bash tool, not `skyline_run`.** `skyline_run` children inherit the skyline daemon's environment (a LaunchAgent, cwd `/`), where `HERDR_*` is stale or unset regardless of what your pane has — so a `skyline_run` read of `HERDR_ORG_ROOT` is not evidence about your own process. Measured 2026-07-30: it reported `HERDR_ORG_ROOT` unset and `HERDR_PANE_ID=w5:p1` while the real pane was `wG:p1` in a different workspace. Filesystem checks (`ls ~/.herdr-org/<org>`) are daemon-independent and settle it either way.
 

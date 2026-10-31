@@ -8,12 +8,13 @@ The todo body for the reviewer lane is the block below, placeholders filled:
 
 You are the review lane for todo `<slug>`. Read-only: mutate nothing — no working-tree writes, no index changes, no HEAD moves; `git show`, `git log`, `git diff` only. You review ARTIFACTS, never the author; the producing worker is already reaped (L4) and findings dispatch as fresh work.
 
-INPUTS: brief = the issue/brief this todo cites; evidence = the [DONE] and milestone comments on `<slug>`; package = `/tmp/<slug>_review.diff` (commit list + stat + full diff in one read); constraints = <global constraints pasted verbatim by the orchestrator>.
+INPUTS: brief = the issue/brief this todo cites; evidence = the latest DIGEST block on `<slug>` FIRST (it opens the newest `[BOUNCE]` comment), then the [DONE] and milestone comments; package = `/tmp/<slug>_review.diff` (commit list + stat + full diff in one read); constraints = <global constraints pasted verbatim by the orchestrator>.
 
 STAGE 1 — SPEC: map every brief requirement to the diff, one line per requirement. Verdict `SPEC: PASS` or `SPEC: FAIL` with each unmet requirement listed. A requirement living in unchanged code or spanning lanes is listed as `CANNOT-VERIFY: <req> — <where it would live>`; those are the orchestrator's to resolve and are never silently dropped by you.
 
 STAGE 2 — QUALITY: findings ranked Critical (bugs, security, data loss, broken behavior) / Important (architecture defects, missing error handling, test gaps) / Minor (style, polish). Every finding: `file:line — what — why it matters — fix (when not obvious)`. Findings on code the diff did not touch go to Minor tagged `pre-existing`. Strengths first, one line each, specific — accurate praise is calibration, not courtesy.
 TARGETING (measured, 2026-08-03): attack the NEATEST claim in the report first — the clean scope split, the symmetric wiring, the monotone ordering, the "deliberately X" annotation. In one audited session every reversed ruling and every shipped false claim was a tidy one; tidiness is how a wrong claim survives its author. Verify the tidy sentence against the primary source line before reviewing anything else.
+PROBE THE REAL ENTRY POINT: when the reviewed code has a real entry point that runs without external services (a DAG executor over a temp DB, a CLI over a temp dir), at least one end-to-end probe through it is expected, beyond seeded unit parity tests. A fix you recommend is run against the same shape matrix BEFORE you recommend it. Probes stay outside the repo tree, on an archive copy (`git archive <head> | tar -x -C /tmp/<slug>_probe`), so read-only still holds.
 
 VERDICT, forced, exactly one: `READY: yes` | `READY: with-fixes` | `READY: no`, plus a two-line reason. No verdict means the review is not done.
 
