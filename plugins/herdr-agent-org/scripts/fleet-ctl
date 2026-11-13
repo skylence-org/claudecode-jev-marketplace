@@ -134,7 +134,7 @@ case "$CMD" in
     # never touches the composer. The old path typed a slash command into
     # the palette and empty-submitted it; it parked live twice on 2026-08-05.
     # SessionStart's ORG CONDUCT PRIME reinforces the skill-first order.
-    POINTER="You are this org's conductor. Invoke the herdr-agent-org-claude:orchestrator skill FIRST, before any org action - it is your role contract - then run ORIENT."
+    POINTER="You are this org's conductor. Invoke the herdr-agent-org:orchestrator skill FIRST, before any org action - it is your role contract - then run ORIENT."
     $HERDR pane run "$PANE" "conduct $ORG \"$POINTER\"" >/dev/null 2>&1
     sleep 2
 

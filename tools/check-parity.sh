@@ -36,6 +36,15 @@ need "$ORG/scripts/tier-gauge" "exit 3" "ungauged" "downgrade_bar"
 need "$ORG/scripts/review-gate-check" "MANDATORY-REVIEW" "WAIVABLE-UNGAUGED" "gate_lines"
 need "$ORG/skills/orchestrator/SKILL.md" "TIER-GAUGE" "review-gate-check" "TIER BY BRIEF" "ACCEPT SEQUENCE" "CONTRACT, NOT A MENU"
 need "$ORG/tests/conduct/run-conduct.sh" "self-test"
+# This plugin was forked from herdr-agent-org-claude and renamed. A pointer or
+# snippet that still carries the old name resolves to nothing on a box that
+# has only this plugin: fleet-ctl tells the conductor to invoke a skill that
+# does not exist, and the setup rc block's glob matches no scripts dir.
+need "$ORG/scripts/fleet-ctl" "herdr-agent-org:orchestrator"
+need "$ORG/skills/herdr-setup/SKILL.md" 'herdr-agent-org/*/scripts(N/om)' "plugin:herdr-agent-org:relay"
+for f in "$ORG/scripts/fleet-ctl" "$ORG/skills/herdr-setup/SKILL.md"; do
+  grep -qF 'herdr-agent-org-claude' "$f" && err "$f still names the pre-fork plugin herdr-agent-org-claude"
+done
 
 for f in "$CORE/scripts/jev" "$CORE/hooks/judge-hook.sh" "$CORE/hooks/writing-guard.sh" "$CORE/hooks/jev-intent-gate.sh" "$CORE/hooks/jev-research-nudge.sh" "$CORE/statusline/core-hud.sh" \
          "$ORG/scripts/jev" "$ORG/scripts/tier-gauge" "$ORG/scripts/review-gate-check" "$ORG/scripts/dispatch-worker"; do

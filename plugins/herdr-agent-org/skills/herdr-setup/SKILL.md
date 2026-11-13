@@ -17,7 +17,7 @@ This skill was authored and measured against **0.7.5**. Anything older is unveri
 ```bash
 herdr agent start --help
 ```
-Read the `--kind` possible-values list. It must include both `claude` and `grok`, the two runtimes this org dispatches (`herdr-agent-org-claude` / `herdr-agent-org-grok`). Missing either means that plugin variant has nothing to start against on this box; reinstall or upgrade herdr.
+Read the `--kind` possible-values list. It must include both `claude` and `grok`, the two runtimes this org dispatches. Missing either means workers of that runtime have nothing to start against on this box; reinstall or upgrade herdr.
 
 ```bash
 command -v jq && jq --version
@@ -59,10 +59,10 @@ HERDR_BIN_PATH, and the nudge-helper path, which launchd cannot resolve
 itself.
 
 The CLIENT connection needs no manual step on a box running the
-herdr-agent-org-claude Claude plugin: the plugin ships `.mcp.json`
+herdr-agent-org Claude plugin: the plugin ships `.mcp.json`
 (`relay -> http://127.0.0.1:7431/mcp`, same one-file pattern as
 skyline-claude), so every session surfaces the tools as
-`plugin:herdr-agent-org-claude:relay` automatically after a plugin
+`plugin:herdr-agent-org:relay` automatically after a plugin
 reload. Manual wiring is ONLY for a box using the relay without that
 plugin: `claude mcp add --scope user --transport http relay
 http://127.0.0.1:7431/mcp` — and if a box has both, remove the
@@ -118,7 +118,7 @@ for t in herdr-plugins/org-waker/test/*.sh; do sh "$t"; done
 ```
 Each suite prints its own `<name>.sh: OK` line at the end when every case passes. Don't hardcode a suite count or name list here — the set grows (8 suites measured 2026-08-16: ack_path, classify_composer, coalesce_hold, drain_sent_preserve, parked_retry, pasted_placeholder, sent_no_resend, verify_clear_gate, up from 6 at waker 0.3.0). Instead grep the run's combined output for `\.sh: (OK|FAIL)` and confirm every matched line says `OK`. Anything else means stop before dispatching: the wake mechanism's classification, dedup, or retry logic is broken, and lanes will hang silently or ring stale bursts instead of waking the orchestrator cleanly.
 
-**Consumer box (no repo checkout):** you cannot run those suites from a path that does not exist. Either clone `skylence-org/multi-llm-marketplace` long enough to run them from its root, or treat the doctor action above plus the S5 live probe as your gate. Do not invent a substitute shell check.
+**Consumer box (no repo checkout):** you cannot run those suites from a path that does not exist. Either clone `skylence-org/claudecode-jev-marketplace` long enough to run them from its root, or treat the doctor action above plus the S5 live probe as your gate. Do not invent a substitute shell check.
 
 ## S2c Native session-ping wiring (Claude <-> Claude, the composer-free wake)
 
@@ -256,7 +256,7 @@ Install it once by putting the plugin's `scripts/` dir on `PATH` from your shell
 
 ```zsh
 # >>> herdr-org >>>
-typeset -a _horg=( "$HOME"/.claude/plugins/cache/*/herdr-agent-org-claude/*/scripts(N/om) )
+typeset -a _horg=( "$HOME"/.claude/plugins/cache/*/herdr-agent-org/*/scripts(N/om) )
 (( ${#_horg} )) && path=( "${_horg[1]}" $path )
 unset _horg
 # <<< herdr-org <<<
