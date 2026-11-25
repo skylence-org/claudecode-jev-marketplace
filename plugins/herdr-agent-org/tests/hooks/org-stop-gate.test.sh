@@ -68,6 +68,7 @@ reset() { rm -f "$marker" "/tmp/claude-herdr-org-sweep-$sid"; chmod 644 "$db"; s
 agents() { printf '%s' "$1" > "$tmp/agents.json"; }
 run_gate_ws() { (export HERDR_WORKSPACE_ID="$1"; run_gate); }
 msg() { sqlite3 "$db" "INSERT INTO messages(ts,sender,recipient,lane,kind,body) VALUES('$1','$2','orch-test','$2','$3','x');"; }
+msgc() { msg "$@"; sqlite3 "$db" "UPDATE messages SET consumed_at='2026-10-26T23:00:00Z';"; }
 mark() { printf '{"session_id":"%s","tool_name":"%s","tool_input":%s}' "$sid" "$1" "$2" | sh "$markhook"; }
 pass=0
 fail=0
@@ -241,5 +242,107 @@ reset
 rm -f /tmp/claude-herdr-org-pane-p1
 run_dw
 expect_marker "no session env and no pane map: nothing recorded, nothing guessed" ""
+# --- quiet gate (0.1.10): output contract first; a DRAINED fingerprint (nothing
+# in flight, backlog a known number) keys on the dispatch lines at backlog 0 and
+# on the whole marker above 0, so the in-flight-to-done edge blocks once and
+# only repeat drained stops (and wait lines at backlog 0) are quiet.
+# Multi-stop cases: each starts from reset and runs every stop through the gate
+# (audit-herdr-pr20 C1: a quiet stop must still write its fingerprint).
+expect_out() { # expect_out <1 = output non-empty | 0 = empty> <case name> <gate output>
+  if [ -n "$3" ]; then got=1; else got=0; fi
+  if [ "$got" = "$1" ]; then pass=$((pass + 1)); echo "ok   $2"; else fail=$((fail + 1)); echo "FAIL $2 (blocked=$got, expected $1)"; fi
+}
+expect_has() { # expect_has <fixed string> <case name> <gate output>
+  if printf '%s' "$3" | jq -r '.reason // empty' | grep -Fq -- "$1"; then pass=$((pass + 1)); echo "ok   $2"; else fail=$((fail + 1)); echo "FAIL $2 (reason lacks: $1)"; fi
+}
+cover() { printf '{"awaiting":[%s]}' "$1" > "$tmp/www/status"; }
+consume_all() { sqlite3 "$db" "UPDATE messages SET consumed_at='2026-10-26T23:00:00Z' WHERE consumed_at IS NULL;"; }
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; out=$(run_gate)
+expect_out 1 "in flight: still blocks" "$out"
+[ "$(printf '%s' "$out" | jq -r '.reason' | grep -o 'OUTPUT CONTRACT' | head -1)" = "OUTPUT CONTRACT" ] && [ "$(printf '%s' "$out" | jq -r '.reason' | cut -c1-16)" = "OUTPUT CONTRACT:" ] && { pass=$((pass + 1)); echo "ok   reason starts with the one-line output contract"; } || { fail=$((fail + 1)); echo "FAIL reason does not start with the output contract"; }
+expect_has "reply in chat with one status line" "contract asks for one status line" "$out"
+expect_has "<fixes, ;-joined>" "contract lets the status line carry every fix" "$out"
+expect_has "plus the **Questions** block or the question tool when check (4) applies" "contract keeps the Questions block for check (4)" "$out"
+expect_has "plus any incident line the skill requires" "contract keeps required incident lines" "$out"
+expect_has "settle lane tree + branch per merge state (L5)" "check (2) keeps per merge state (L5)" "$out"
+expect_has "register, arm, or write it (L6)" "check (3) keeps or write it" "$out"
+expect_has "WAKE, ACCEPT SEQUENCE and L4-L6" "detail pointer names WAKE, ACCEPT SEQUENCE, L4-L6" "$out"
+expect_has "(5) anything you are about to assert" "checklist kept after the contract" "$out"
+expect_has "NO AWAIT COVERAGE" "no-coverage block unchanged" "$out"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msgc 2026-10-26T10:05:00Z lane-a doorbell
+expect_out 1 "lane done, backlog 0, first evaluation: blocks (the drain edge is never skipped)" "$(run_gate)"
+expect_out 0 "lane done, backlog 0, repeat stop: quiet" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msg 2026-10-26T10:05:00Z lane-a doorbell; msg 2026-10-26T10:06:00Z lane-a blocker
+out=$(run_gate)
+expect_out 1 "lane done but backlog queued: blocks" "$out"
+expect_has "RELAY BACKLOG" "backlog block unchanged" "$out"
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"; agents "$one_agent"
+expect_out 1 "keyless dispatch, no other agent alive, first evaluation: blocks" "$(run_gate)"
+expect_out 0 "keyless dispatch, no other agent alive, repeat stop: quiet" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; cover '"orch-test"'; run_gate >/dev/null
+expect_out 0 "in flight and covered: settled fingerprint re-stop does not block" "$(run_gate)"
+# (a) the last lane rang [DONE] and was consumed in-turn; its agent is still alive (unreaped)
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; cover '"orch-test"'; run_gate >/dev/null
+cover ""; msgc 2026-10-26T10:05:00Z lane-a doorbell; out=$(run_gate)
+expect_out 1 "(a) last lane DONE and consumed, agent alive: the drain stop blocks once" "$out"
+expect_has "(2) live agent whose lane todo is verified or complete?" "(a) the drain sweep carries the reap check" "$out"
+expect_out 0 "(a) repeat drained stop, nothing new: quiet" "$(run_gate)"
+# (b) every lane done and reaped; lane tree/branch still open (L5)
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; cover '"orch-test"'; run_gate >/dev/null
+cover ""; msgc 2026-10-26T10:05:00Z lane-a doorbell; agents "$one_agent"
+expect_out 1 "(b) all lanes done and reaped, tree/branch open: the drain stop blocks once" "$(run_gate)"
+expect_out 0 "(b) repeat drained stop, nothing new: quiet" "$(run_gate)"
+# (m3) crashed lane: in flight and covered, then the agent is gone with no doorbell
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; cover '"orch-test"'; run_gate >/dev/null
+agents "$one_agent"
+expect_out 1 "(m3) crashed lane (agent gone, no doorbell): blocks" "$(run_gate)"
+expect_out 0 "(m3) repeat drained stop, nothing new: quiet" "$(run_gate)"
+# (m1) nothing in flight; backlog 1 -> 0 -> 1 (a later job wake, peer message or late blocker)
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msg 2026-10-26T10:05:00Z lane-a doorbell
+expect_out 1 "(m1) drained with the [DONE] queued: blocks" "$(run_gate)"
+consume_all
+expect_out 1 "(m1) backlog consumed (1 -> 0): blocks, as 0.1.9 did" "$(run_gate)"
+msg 2026-10-26T12:00:00Z gate-job job; out=$(run_gate)
+expect_out 1 "(m1) a later job wake (backlog 0 -> 1): blocks again" "$out"
+expect_has "RELAY BACKLOG" "(m1) the re-block carries RELAY BACKLOG" "$out"
+# (m2) keyless line in flight -> not -> in flight again, uncovered
+reset; echo "2026-10-26T10:00:00Z dispatch - -" > "$marker"; agents "$two_agents"; run_gate >/dev/null
+agents "$one_agent"
+expect_out 1 "(m2) keyless lane finished: the drain stop blocks" "$(run_gate)"
+agents "$two_agents"
+expect 1 "(m2) keyless lane back in flight, uncovered: NO AWAIT COVERAGE again" "$(run_gate)"
+# (c1) / (c4) backlog unknown (herdr unreadable / HERDR_PANE_ID unset): the 0.1.9 fingerprint, so any marker change blocks
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; printf 'not json' > "$tmp/agents.json"; msg 2026-10-26T10:05:00Z lane-a doorbell
+expect_out 1 "(c1) herdr unreadable, lane DONE unconsumed: blocks" "$(run_gate)"
+echo "2026-10-26T11:00:00Z wait" >> "$marker"
+expect_out 1 "(c1) backlog unknown: a wait line still moves the fingerprint (0.1.9 behaviour)" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msg 2026-10-26T10:05:00Z lane-a doorbell
+expect_out 1 "(c4) HERDR_PANE_ID unset, lane DONE unconsumed: blocks" "$(export HERDR_PANE_ID=""; run_gate)"
+echo "2026-10-26T11:00:00Z wait" >> "$marker"
+expect_out 1 "(c4) backlog unknown: a wait line still moves the fingerprint (0.1.9 behaviour)" "$(export HERDR_PANE_ID=""; run_gate)"
+# (d1) / (m4) lifecycle wait lines while drained with a known backlog: the 0.1.10 saving
+reset; echo "2026-10-26T10:00:00Z wait" > "$marker"
+expect_out 1 "(d1) lifecycle waits only, first evaluation: blocks (as 0.1.9)" "$(run_gate)"
+echo "2026-10-26T11:00:00Z wait" >> "$marker"
+expect_out 0 "(d1) another wait line while drained: quiet (0.1.10 change)" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msgc 2026-10-26T10:05:00Z lane-a doorbell; run_gate >/dev/null
+echo "2026-10-26T11:00:00Z wait" >> "$marker"
+expect_out 0 "(m4) a wait line appended after the drain sweep: quiet (0.1.10 change)" "$(run_gate)"
+echo "2026-10-26T11:30:00Z dispatch lane-b w-gone" >> "$marker"
+expect_out 1 "a new dispatch line while drained (its agent already gone): blocks" "$(run_gate)"
+# (X3) / (X7) drained with a NON-ZERO backlog: wait lines still move the fingerprint (quiet only at backlog 0; round-2 review F1)
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msg 2026-10-26T10:05:00Z lane-a doorbell; run_gate >/dev/null
+echo "2026-10-26T11:00:00Z wait" >> "$marker"
+expect_has "RELAY BACKLOG" "(X3) drained, backlog 1, a wait line appended: re-blocks with RELAY BACKLOG" "$(run_gate)"
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"; msg 2026-10-26T10:05:00Z lane-a doorbell; run_gate >/dev/null
+consume_all; echo "2026-10-26T11:00:00Z wait" >> "$marker"; msg 2026-10-26T11:05:00Z lane-a blocker
+expect_has "RELAY BACKLOG" "(X7) backlog consumed in the continuation, wait line, then a new message: RELAY BACKLOG" "$(run_gate)"
+# (E1) /status dead throughout: the drain edge still blocks once (0.1.9 was silent here; the d- prefix carries it)
+run_gate_dead() { (export ORG_RELAY_PORT=1; run_gate); }
+reset; echo "2026-10-26T10:00:00Z dispatch lane-a w-a" > "$marker"
+expect_out 1 "(E1) /status dead, lane in flight: blocks" "$(run_gate_dead)"
+msgc 2026-10-26T10:05:00Z lane-a doorbell
+expect_out 1 "(E1) /status dead, last lane DONE and consumed: the drain stop blocks" "$(run_gate_dead)"
+expect_out 0 "(E1) /status dead, repeat drained stop: quiet" "$(run_gate_dead)"
 echo "org-stop-gate: $pass passed, $fail failed"
 [ "$fail" = 0 ]

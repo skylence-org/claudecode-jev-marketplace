@@ -180,7 +180,7 @@ Also: `herdr integration install claude` installs a session-identity hook for pa
 
    TRANSITION — legacy waker rings: a prompt tagged `[RING g<gen>]` arriving on the composer is pre-relay traffic from a lane still waker-registered. It is a stale pointer: board first, drop it after the read, and `waker-ctl unregister --lane <slug>` so it is the last. The relay carries every live signal; no new lane is waker-registered. A `[RELAY-NUDGE]` is NOT in this class: it is the live net (L6), never a stale pointer — inbox first, then act.
 
-5. The Stop hook runs the anti-idle fingerprint sweep on your first attempt to idle, and it is backlog-aware: a stop attempted while unconsumed relay messages sit queued for your agent name re-blocks once per backlog change, naming the count. Run the sweep for real against live reads, drain the named backlog, and only then stop.
+5. The Stop hook runs the anti-idle fingerprint sweep on your first attempt to idle after each change in org state (with nothing in flight and nothing queued, new lifecycle waits alone are not a change), and it is backlog-aware: a stop attempted while unconsumed relay messages sit queued for your agent name re-blocks once per backlog change, naming the count. Run the sweep for real against live reads, drain the named backlog, and only then stop.
 
 ### Bounce loop (bounded)
 
