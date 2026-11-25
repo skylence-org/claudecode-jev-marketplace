@@ -1,7 +1,8 @@
 #!/bin/sh
 # Stop hook: anti-idle gate. A session that put Herdr org state in flight may
-# not end its turn without confirming follow-up. Blocks the FIRST stop only
-# (stop_hook_active passes the second), so it costs one extra turn, not a loop.
+# not end its turn without confirming follow-up. Blocks the first stop after
+# each fingerprint change (stop_hook_active passes the stop right after a
+# block), so it costs one extra turn per change, not a loop.
 #
 # Two rules, both field-driven (2026-07-21):
 #   PREMISE FOLLOWS EVIDENCE. org-lane-mark.sh records dispatch and wait
@@ -39,6 +40,19 @@
 #     trusted for either rule; a partial one (herdr rehydrating) is unknown.
 #     Fail-open: an unreachable daemon never blocks a stop; an unreadable
 #     relay DB counts every dispatch as in flight.
+#   QUIET (0.1.10): the block reason opens with an output contract (one status
+#     line in chat, never the checklist). DRAINED = nothing in flight and a
+#     KNOWN backlog (this pane's agent named, relay DB read): at backlog 0 the
+#     fingerprint is the dispatch lines only, so a stop that only follows new
+#     lifecycle `wait` lines settles; at backlog > 0 it is the whole marker,
+#     so a wait line still re-blocks with RELAY BACKLOG (quiet only at
+#     backlog 0). The in-flight-to-done edge still blocks once (its
+#     fingerprint differs from every in-flight one: the drain sweep, where an
+#     unreaped agent, an unposted verdict or a crashed lane shows), a new
+#     dispatch line or any backlog change still blocks, and an unknown
+#     backlog keeps the 0.1.9 fingerprint. Every evaluated stop writes its
+#     fingerprint before comparing (audit-herdr-pr20 C1); a stop_hook_active
+#     stop exits before that and records nothing (issue #21).
 command -v jq >/dev/null 2>&1 || exit 0
 input=$(cat)
 active=$(printf '%s' "$input" | jq -r '.stop_hook_active // false')
@@ -136,10 +150,19 @@ fi
 [ -n "${ORG_STOP_GATE_DEBUG:-}" ] && echo "org-stop-gate: in_flight=$in_flight others=${others:-unknown} agents_ok=$agents_ok ws=${ws:-all}" >&2
 cov_fp=""
 [ "$in_flight" = "1" ] && cov_fp="${covered:+-c$covered}"
-fp="$(cksum < "$marker" | awk '{print $1 "-" $2}')${backlog:+-b$backlog}$cov_fp"
+case "$backlog" in ''|*[!0-9]*) backlog_known=0 ;; *) backlog_known=1 ;; esac
+if [ "$in_flight" = "0" ] && [ -n "$me" ] && [ "$backlog_known" = 1 ]; then
+  # DRAINED: at backlog 0, wait lines leave this fingerprint unchanged; at
+  # backlog > 0 the whole marker keys it. Dispatch lines and the backlog count
+  # always move it. The `d-` prefix never equals an in-flight one.
+  fp="d-$({ if [ "$backlog" = 0 ]; then grep -E ' dispatch( |$)' "$marker"; else cat "$marker"; fi; } 2>/dev/null | cksum | awk '{print $1 "-" $2}')-b$backlog"
+else
+  fp="$(cksum < "$marker" | awk '{print $1 "-" $2}')${backlog:+-b$backlog}$cov_fp"
+fi
 seen="/tmp/claude-herdr-org-sweep-$sid"
-[ -f "$seen" ] && [ "$(cat "$seen" 2>/dev/null)" = "$fp" ] && exit 0
+prev=$(cat "$seen" 2>/dev/null)
 printf '%s' "$fp" > "$seen"
+[ "$prev" = "$fp" ] && exit 0
 
 if grep -Eq ' dispatch( |$)' "$marker" 2>/dev/null; then
   premise="this session dispatched Herdr workers"
@@ -155,7 +178,8 @@ if [ "$covered" = "0" ] && [ "$in_flight" = "1" ]; then
   relay_line="${relay_line}NO AWAIT COVERAGE: a dispatched lane has sent no [DONE] doorbell yet and '$me' holds no live relay_await — arm ONE long relay_await(agent: $me, timeout_s: 1800) as the LAST call before idling (L6); with every lane done this line does not appear and an idle session arms nothing. "
 fi
 
-reason="ANTI-IDLE FINGERPRINT SWEEP ($premise; post-compaction: re-invoke your role skill FIRST). Run it against live reads, not memory, meaning board list + herdr agent list: (1) an idle/done/blocked worker with no verdict? read it (herdr agent read --source visible for the current frame, --source recent --lines N to reach back through scrollback; either way its board comments are what outlive the pane) and post the verdict on its lane todo NOW; (2) a live agent whose lane todo is verified or complete? unregister then reap it NOW (waker-ctl unregister --lane <lane>, L6, then L4) and settle lane tree + branch per merge state (L5); (3) a working agent with neither a waker registration (waker-ctl list) nor an armed herdr agent wait nor a written re-check plan? register or arm or write it (L6); (4) a blocking operator question still unposted? inbox pad plus one line under Questions; (5) anything you are about to assert that a board list / herdr agent list read would contradict? correct it (L15). Then stop."
+contract="OUTPUT CONTRACT: do this sweep with tool calls, then reply in chat with one status line (\`Sweep clean.\` or \`Sweep: <fixes, ;-joined>\`), plus the **Questions** block or the question tool when check (4) applies, plus any incident line the skill requires; never print the checklist or its answers. "
+reason="ANTI-IDLE FINGERPRINT SWEEP ($premise; post-compaction: re-invoke your role skill FIRST), against live reads (board list + herdr agent list), not memory: (1) idle/done/blocked worker with no verdict? read it, post the verdict on its lane todo; (2) live agent whose lane todo is verified or complete? unregister and reap it (L6, L4), settle lane tree + branch per merge state (L5); (3) working agent with no waker registration, armed wait, or written re-check plan? register, arm, or write it (L6); (4) blocking operator question unposted? inbox pad plus one line under Questions; (5) anything you are about to assert that a board/agent read would contradict? correct it (L15). Detail: the orchestrator skill's WAKE, ACCEPT SEQUENCE and L4-L6."
 # jq builds the payload so the reason is JSON-escaped rather than hand-quoted.
-jq -n --arg r "${relay_line}${reason}" '{decision:"block", reason:$r}'
+jq -n --arg r "${contract}${relay_line}${reason}" '{decision:"block", reason:$r}'
 exit 0

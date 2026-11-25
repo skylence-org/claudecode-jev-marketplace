@@ -53,7 +53,7 @@ Herdr is the agent multiplexer: real terminal panes, semantic agent state (`work
   - `waker-ctl` is the org-side client of the org-waker herdr plugin (register, unregister, list, drain, doctor)
 - **Hooks** (`hooks/hooks.json`, wired on install):
   - `org-lane-mark.sh` (PreToolUse on Bash and skyline_run) records one line per org event, `dispatch` or `wait`
-  - `org-stop-gate.sh` (Stop) blocks a marked session's FIRST stop with the anti-idle sweep
+  - `org-stop-gate.sh` (Stop) blocks a marked session's first stop after each org-state change with the anti-idle sweep, and asks for a one-line reply in chat
   - `org-conduct-refresh.sh` (SessionStart, matchers `startup|resume|compact`) primes the role-skill contract in fresh sessions and re-injects the re-read order after compaction
 - **templates/claude-md.md**: worker guidance to paste into `~/.claude/CLAUDE.md` on a machine that runs lane workers.
 - **templates/reviewer-brief.md**: the L10 reviewer-lane dispatch contract — two-stage verdict (spec compliance and artifact quality), severity-ranked findings, forced `READY:` verdict, review-package-as-file.
@@ -178,7 +178,7 @@ A brief `tier-gauge` reads as HARD below the top tier (`upgrade=advised`) stops 
 ## Notes
 
 - Hook markers live at `/tmp/claude-herdr-org-lanes-<session_id>`, one file per session.
-- The stop gate follows two rules, both field-driven (2026-07-21): the premise follows recorded evidence (a session that only armed waits is not told it dispatched workers), and an answered sweep settles until org state actually moves.
+- The stop gate follows two rules, both field-driven (2026-07-21): the premise follows recorded evidence (a session that only armed waits is not told it dispatched workers), and an answered sweep settles until org state actually moves. Since 0.1.10, with nothing in flight and a known relay backlog of 0, new lifecycle `wait` lines alone are not a move (at a backlog above 0 they still re-block); the in-flight-to-done edge, a new dispatch line and any backlog change still block once.
 - Prefer `${HERDR_BIN_PATH:-herdr}`; Herdr injects that variable inside managed panes.
 - Pair with `core-claude` for the baseline guidelines and judge-hook, and with `skyline-claude` for hash-guarded edits.
 - `tests/conduct/` pressure-tests the role skills' conduct clauses on a live model (superpowers-style RED/GREEN doctrine testing): `sh tests/conduct/run-conduct.sh` is BILLED; `--self-test` (stubbed, free) runs in CI; `--without-skill` captures baseline rationalizations to close in the skills' tables.
